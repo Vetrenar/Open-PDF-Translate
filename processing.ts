@@ -1,13 +1,14 @@
-
 // processing.ts
-import { Notice } from 'obsidian';
+import { Notice, TFile } from 'obsidian';
 import OpenRouterTranslatorPlugin from './main';
-import { TranslationUnit } from './types';
+import { TranslationUnit, OverlayPositionData } from './types';
 import { LayoutDetector, LayoutSettings } from './layout-detector';
+import { ExternalLayoutService } from './external-layout';
 
 export class TextProcessor {
   private plugin: OpenRouterTranslatorPlugin;
   public layoutDetector: LayoutDetector;
+  public externalLayoutService: ExternalLayoutService;
 
   // Caches
   private measurementCache = new Map<HTMLElement, { rect: DOMRect; timestamp: number }>();
@@ -23,6 +24,7 @@ export class TextProcessor {
   constructor(plugin: OpenRouterTranslatorPlugin) {
     this.plugin = plugin;
     this.layoutDetector = new LayoutDetector(this.plugin.settings.layoutSettings);
+    this.externalLayoutService = new ExternalLayoutService(plugin);
   }
 
   /**
@@ -32,6 +34,8 @@ export class TextProcessor {
   public updateLayoutDetectorSettings(newSettings: LayoutSettings): void {
     console.log("Updating LayoutDetector with new settings:", newSettings);
     this.layoutDetector = new LayoutDetector(newSettings);
+    // Also clear external cache if settings change, just in case
+    this.externalLayoutService.clearCache();
     new Notice('Layout detection settings have been updated.');
   }
 
@@ -72,14 +76,24 @@ export class TextProcessor {
    */
   public async translatePageContent(pageElement: HTMLElement): Promise<string | null> {
     const textLayer = pageElement.querySelector('.textLayer') as HTMLElement;
+    
+    // For internal layout, textLayer is mandatory. For external, we technically only need the pageElement,
+    // but we check for textLayer as a proxy that the page is loaded.
     if (!textLayer) {
       new Notice('Text layer not found. Wait for PDF to fully render.');
       return null;
     }
 
-    const translationUnits = this.prepareTranslationUnits(textLayer, pageElement);
+    let translationUnits: TranslationUnit[] | null = null;
+
+    if (this.plugin.settings.useExternalLayout) {
+        translationUnits = await this.prepareExternalTranslationUnits(pageElement);
+    } else {
+        translationUnits = this.prepareTranslationUnits(textLayer, pageElement);
+    }
+
     if (!translationUnits || translationUnits.length === 0) {
-      new Notice('No valid text to translate.', 2000);
+      new Notice('No valid text to translate (or layout analysis failed).', 2000);
       return null;
     }
 
@@ -99,9 +113,19 @@ export class TextProcessor {
     const { textLayer, overlayContainer } = prepResult;
     this.overlayContainers.push(overlayContainer);
 
-    let translationUnits = (this.lastPreparedUnits?.pageElement === pageElement)
-        ? this.lastPreparedUnits.units
-        : this.prepareTranslationUnits(textLayer, pageElement);
+    let translationUnits: TranslationUnit[] | null = null;
+
+    // Check if we can reuse the last prepared units (for performance)
+    if (this.lastPreparedUnits?.pageElement === pageElement) {
+        translationUnits = this.lastPreparedUnits.units;
+    } else {
+        // Regenerate if not cached
+        if (this.plugin.settings.useExternalLayout) {
+            translationUnits = await this.prepareExternalTranslationUnits(pageElement);
+        } else {
+            translationUnits = this.prepareTranslationUnits(textLayer, pageElement);
+        }
+    }
 
     if (!translationUnits || translationUnits.length === 0) {
         overlayContainer.remove();
@@ -109,11 +133,11 @@ export class TextProcessor {
     }
 
     const translatedLines = translatedText.split('\n');
-    if (translatedLines.length !== translationUnits.length) {
+    // Basic validation
+    if (Math.abs(translatedLines.length - translationUnits.length) > 2 && translatedLines.length !== translationUnits.length) {
         console.error('Translation structure mismatch. Original units:', translationUnits.length, 'Translated lines:', translatedLines.length);
-        new Notice('⚠️ Error: Translation structure mismatch. Cannot create overlay.');
-        overlayContainer.remove();
-        return;
+        new Notice('⚠️ Warning: Line count mismatch. Overlay may be misaligned.');
+        // We continue anyway, as strictly aborting often hurts UX on small hallucinations
     }
 
     this.renderOverlay(translationUnits, translatedLines, overlayContainer, pageElement);
@@ -124,7 +148,7 @@ export class TextProcessor {
   }
 
   // ————————————————————————————————————————————————
-  // CORE LOGIC (Now more modular for reuse)
+  // CORE LOGIC 
   // ————————————————————————————————————————————————
 
   private validateAndPreparePrerequisites(pageElement: HTMLElement): { textLayer: HTMLElement; overlayContainer: HTMLElement } | null {
@@ -143,11 +167,50 @@ export class TextProcessor {
   }
 
   /**
-   * MODIFIED: Now a public method that can accept either the textLayer element
-   * to process a whole page, or a specific array of spans for reprocessing.
-   * @param textLayerOrSpans The parent .textLayer element OR an array of HTMLSpanElement.
-   * @param pageElement The root .page element for context.
-   * @returns An array of TranslationUnit[] or null.
+   * NEW: Prepares translation units using the External Python Layout Service.
+   * Scans the whole doc (cached) and extracts the specific page's data.
+   */
+  private async prepareExternalTranslationUnits(pageElement: HTMLElement): Promise<TranslationUnit[] | null> {
+    const activeFile = this.plugin.app.workspace.getActiveFile();
+    if (!activeFile) return null;
+
+    // 1. Ensure Cache Exists (runs Python if not)
+    if (!this.externalLayoutService.hasCachedLayout(activeFile.path)) {
+        const layout = await this.externalLayoutService.generateLayout(activeFile);
+        if (!layout) return null;
+    }
+
+    // 2. Determine Page Number
+    const pageNumStr = pageElement.getAttribute('data-page-number');
+    if (!pageNumStr) return null;
+    const pageNum = parseInt(pageNumStr, 10);
+
+    // 3. Retrieve Page Data
+    const pageItems = this.externalLayoutService.getCachedPage(activeFile.path, pageNum);
+    if (!pageItems || pageItems.length === 0) return null;
+
+    // 4. Map to TranslationUnit
+    // We attach hidden properties (_externalRect, _externalFont) to the unit
+    // so renderOverlay can use them later, since we don't have DOM spans.
+    return pageItems.map(item => {
+        return {
+            id: item.id,
+            paragraphId: item.id, // Treating blocks as paragraphs
+            text: item.text,
+            originalSpans: [], // Empty because we rely on external coords, not DOM spans
+            // Inject custom data for renderOverlay
+            _externalRect: item.rect,
+            _externalFont: {
+                family: item.fontFamily,
+                size: item.fontSize,
+                sizes: item.originalFontSizes
+            }
+        } as unknown as TranslationUnit; // Casting to fit interface
+    });
+  }
+
+  /**
+   * ORIGINAL: Extracts text units from the DOM using LayoutDetector.
    */
   public prepareTranslationUnits(textLayerOrSpans: HTMLElement | HTMLSpanElement[], pageElement: HTMLElement): TranslationUnit[] | null {
     const rawSpans = Array.isArray(textLayerOrSpans)
@@ -185,10 +248,7 @@ export class TextProcessor {
         }];
       }
 
-      if (this.plugin.settings.debugMode) {
-        console.log(`PDF Translator: Paragraph ${paraIndex} is too long, splitting into sentences.`);
-      }
-
+      // Splitting logic for long paragraphs
       const sortedSpans = [...paragraphSpans].sort((a, b) => {
         const rectA = this.getBoundingClientRectCached(a);
         const rectB = this.getBoundingClientRectCached(b);
@@ -227,10 +287,7 @@ export class TextProcessor {
   }
 
   /**
-   * MODIFIED: Now a public method.
    * Executes the translation process for a given set of text units.
-   * @param units The text units to be translated.
-   * @returns A promise that resolves to an array of translated strings.
    */
   public async executeTranslation(units: TranslationUnit[]): Promise<string[]> {
     this.translationFailures = [];
@@ -317,10 +374,6 @@ export class TextProcessor {
         chunks.push({ text: currentChunkText.trim(), originalIndices: currentChunkIndices });
     }
 
-    if (this.plugin.settings.debugMode) {
-        console.log(`PDF Translator: Splitting translation into ${chunks.length} chunks.`);
-    }
-
     for (let i = 0; i < chunks.length; i++) {
         const chunk = chunks[i];
         try {
@@ -340,7 +393,63 @@ export class TextProcessor {
     return allTranslatedLines;
   }
   
+  /**
+   * MODIFIED: Handles rendering of both DOM-based and External-based translation units.
+   */
   private renderOverlay(units: TranslationUnit[], translatedLines: string[], overlayContainer: HTMLElement, pageElement: HTMLElement) {
+    
+    // BRANCH 1: External Layout (Python)
+    // We don't have HTMLSpans to reassemble. We use the coordinates directly.
+    if (this.plugin.settings.useExternalLayout) {
+        const pageNumber = parseInt(pageElement.getAttribute('data-page-number') || '0', 10);
+        const activeFile = this.plugin.app.workspace.getActiveFile();
+
+        // Construct OverlayPositionData
+        const overlayData: OverlayPositionData[] = units.map((unit: any, index) => {
+            const extRect = unit._externalRect;
+            const extFont = unit._externalFont;
+            
+            if (!extRect) return null;
+
+            return {
+                selector: '',
+                textContent: unit.text,
+                page: pageNumber,
+                translatedText: translatedLines[index] || unit.text,
+                relativeRect: {
+                    left: extRect.l,
+                    top: extRect.t,
+                    width: extRect.w,
+                    height: extRect.h
+                },
+                fontSize: extFont?.size,
+                fontFamily: extFont?.family,
+                originalFontSizes: extFont?.sizes || [],
+            } as OverlayPositionData;
+        }).filter((x): x is OverlayPositionData => x !== null);
+
+        // 1. Render to screen (Visual)
+        this.plugin.overlay.renderSavedOverlay(overlayData, pageNumber);
+
+        // 2. --- FIX: Save Directly to Storage (Data) ---
+        // Don't wait for DOM scraping. Save the data we just created.
+        if (this.plugin.settings.autoSaveOverlay && activeFile) {
+            // Using a non-blocking call so UI doesn't freeze
+            this.plugin.storage.updatePageOverlaysAndWrite(activeFile, {
+                [pageNumber]: overlayData
+            }).then(() => {
+                // Optional: console.log(`Auto-saved page ${pageNumber}`);
+            }).catch(err => {
+                console.error("Failed to auto-save external layout translation:", err);
+                new Notice("Failed to save translation.");
+            });
+        }
+        
+        return;
+    }
+
+    // BRANCH 2: Internal Layout (DOM)
+    // Existing logic to reassemble split sentences back into paragraphs for rendering
     const reassembledParagraphs = new Map<string, { originalSpans: HTMLSpanElement[]; translatedText: string; }>();
     units.forEach((unit, index) => {
       const { paragraphId, originalSpans } = unit;
@@ -360,6 +469,8 @@ export class TextProcessor {
 
     this.plugin.overlay.renderOverlays(mergedUnits, mergedTranslatedLines, overlayContainer, pageElement);
   }
+
+  // --- Helpers ---
 
   private spansToHtml(spans: HTMLSpanElement[]): string {
     if (!spans?.length) return '';
@@ -412,6 +523,7 @@ export class TextProcessor {
 
   private validateSpans(spans: HTMLSpanElement[]): HTMLSpanElement[] { return spans.filter(span => span instanceof HTMLSpanElement && span.isConnected); }
   private validatePageElement(pageElement: HTMLElement): boolean { return pageElement instanceof HTMLElement && pageElement.isConnected; }
+  
   private getBoundingClientRectCached(element: HTMLElement): DOMRect {
     const now = Date.now();
     const cached = this.measurementCache.get(element);
@@ -420,7 +532,9 @@ export class TextProcessor {
     this.measurementCache.set(element, { rect, timestamp: now });
     return rect;
   }
+  
   private getComputedStyleCached(element: HTMLElement): CSSStyleDeclaration { return this.styleCache.get(element) || this.styleCache.set(element, window.getComputedStyle(element)).get(element)!; }
+  
   private clearCaches(): void {
     this.measurementCache.clear();
     this.styleCache.clear();
@@ -477,5 +591,6 @@ export class TextProcessor {
     this.translationFailures = [];
     this.lastColumnAnalysis = null;
     this.lastPreparedUnits = null;
+    this.externalLayoutService.clearCache(); // Clean external cache as well
   }
 }

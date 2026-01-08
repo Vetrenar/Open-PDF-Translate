@@ -11,7 +11,8 @@ export class TranslationEngine {
         this.plugin = plugin;
     }
 
-    // === Language Helpers (No changes needed) ===
+    // === Language Helpers ===
+
     getSourceLangName(): string {
         return this.plugin.settings.sourceLanguage === 'auto'
             ? 'Auto-detect'
@@ -30,27 +31,26 @@ export class TranslationEngine {
     async translateBatch(originalText: string, expectedLineCount: number): Promise<string> {
         const systemPromptTemplate = this.plugin.settings.batchPrompt;
         
-        // Prepare the system prompt by filling in all placeholders except the main text
+        // Prepare the system prompt
         const systemPrompt = systemPromptTemplate
             .replace(/{sourceLang}/g, this.getSourceLangName())
             .replace(/{targetLang}/g, this.getTargetLangName())
             .replace(/{lineCount}/g, expectedLineCount.toString())
-            .replace(/{inputText}/g, ''); // The actual text is sent as the user prompt
+            .replace(/{inputText}/g, ''); 
 
         return await this.makeApiCall(systemPrompt, originalText);
     }
 
     /**
-     * Translates a single piece of text. Maintained for compatibility.
+     * Translates a single piece of text.
      */
     async translateWithOpenRouter(text: string): Promise<string> {
         const systemPromptTemplate = this.plugin.settings.singlePrompt;
         
-        // Prepare the system prompt
         const systemPrompt = systemPromptTemplate
             .replace(/{sourceLang}/g, this.getSourceLangName())
             .replace(/{targetLang}/g, this.getTargetLangName())
-            .replace(/{inputText}/g, ''); // The actual text is sent as the user prompt
+            .replace(/{inputText}/g, ''); 
 
         return await this.makeApiCall(systemPrompt, text.slice(0, 3000));
     }
@@ -58,7 +58,7 @@ export class TranslationEngine {
     // === Low-Level API Communication ===
 
     /**
-     * Safely retrieves a nested property from an object using a string path (e.g., 'choices[0].message.content').
+     * Safely retrieves a nested property from an object using a string path.
      */
     private getPropertyByPath(obj: any, path: string): string | undefined {
         const keys = path.replace(/\[(\w+)\]/g, '.$1').replace(/^\./, '').split('.');
@@ -72,9 +72,6 @@ export class TranslationEngine {
         return result;
     }
     
-    /**
-     * Escapes characters in a string for safe inclusion in a JSON request body.
-     */
     private escapeJsonString(str: string): string {
         return str.replace(/\\/g, '\\\\')
                   .replace(/"/g, '\\"')
@@ -109,6 +106,40 @@ export class TranslationEngine {
                     ],
                     max_tokens: 4096,
                     temperature: 0.1,
+                };
+                break;
+
+            case 'openai':
+                if (!provider.apiKey) throw new Error('OpenAI API key is missing.');
+                url = 'https://api.openai.com/v1/chat/completions';
+                headers['Authorization'] = `Bearer ${provider.apiKey}`;
+                body = {
+                    model: provider.model || 'gpt-4o',
+                    messages: [
+                        { role: 'system', content: systemPrompt },
+                        { role: 'user', content: userPrompt }
+                    ],
+                    temperature: 0.1,
+                };
+                break;
+
+            case 'gemini':
+                if (!provider.apiKey) throw new Error('Gemini API key is missing.');
+                // Ensure model has 'models/' prefix if not present, though usually handled in settings
+                const modelName = provider.model?.startsWith('models/') ? provider.model : `models/${provider.model || 'gemini-1.5-flash'}`;
+                url = `https://generativelanguage.googleapis.com/v1beta/${modelName}:generateContent?key=${provider.apiKey}`;
+                
+                // Gemini doesn't use a "system" role in the same way as OpenAI in the 'generateContent' endpoint.
+                // We combine system and user prompt for best compatibility across Gemini versions.
+                body = {
+                    contents: [{
+                        parts: [{
+                            text: `${systemPrompt}\n\nTask:\n${userPrompt}`
+                        }]
+                    }],
+                    generationConfig: {
+                        temperature: 0.1
+                    }
                 };
                 break;
             
@@ -176,8 +207,9 @@ export class TranslationEngine {
         const providerId = this.plugin.settings.apiProvider;
         const providerSettings = this.plugin.settings.providerSettings[providerId];
 
+        // Specific warning for OpenRouter/Qwen free models
         if (providerId === 'openrouter' && providerSettings.model?.includes('qwen') && !this.warnedAboutQwen) {
-            new Notice('Warning: Some Qwen models have low rate limits. Consider gemini-flash.', 6000);
+            new Notice('Warning: Some Qwen models have low rate limits.', 6000);
             this.warnedAboutQwen = true;
         }
 
@@ -189,25 +221,40 @@ export class TranslationEngine {
                 const { url, options } = this.getRequestConfig(systemPrompt, userPrompt);
                 
                 const controller = new AbortController();
-                const timeoutId = setTimeout(() => controller.abort(), 45000);
+                // Gemini can be slow with large contexts, give it more time
+                const timeoutMs = providerId === 'gemini' ? 60000 : 45000;
+                const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
                 options.signal = controller.signal;
 
                 const response = await requestUrl({ url, ...options });
                 clearTimeout(timeoutId);
 
                 if (response.status === 200) {
-                    let responsePath = 'choices[0].message.content'; // Default for OpenAI-compatible APIs
+                    // Determine where to look for the translation based on provider
+                    let responsePath = 'choices[0].message.content'; // Default (OpenAI/OpenRouter)
+                    
                     if (providerId === 'ollama') {
                         responsePath = 'message.content';
+                    } else if (providerId === 'gemini') {
+                        responsePath = 'candidates[0].content.parts[0].text';
                     } else if (providerId === 'custom') {
                         responsePath = providerSettings.responsePath || responsePath;
                     }
 
                     const translatedText = this.getPropertyByPath(response.json, responsePath);
-                    return translatedText?.trim() || userPrompt;
+                    
+                    if (!translatedText) {
+                        if (this.plugin.settings.debugMode) console.log("Full Response:", response.json);
+                        throw new Error('Empty response from API or invalid path.');
+                    }
+
+                    return translatedText.trim();
                 }
 
-                const errorMsg = response.json?.error?.message || response.text;
+                // Handle Errors
+                const errorMsg = response.json?.error?.message || JSON.stringify(response.json) || response.text;
+                
+                // Rate Limits (429) handling
                 if (response.status === 429 || (typeof errorMsg === 'string' && errorMsg.toLowerCase().includes('rate limit'))) {
                     if (attempt === MAX_RETRIES) break;
                     const delay = BASE_DELAY * Math.pow(2, attempt - 1) + Math.random() * 500;
@@ -222,16 +269,16 @@ export class TranslationEngine {
 
             } catch (err: any) {
                 if (err.name === 'AbortError') {
-                    throw new Error('Request timed out (45s)');
+                    throw new Error('Request timed out.');
                 }
                 if (attempt === MAX_RETRIES) {
-                    new Notice(`API call failed: ${err.message}`);
+                    new Notice(`Translation failed: ${err.message}`);
                     throw err;
                 }
             }
         }
 
-        throw new Error('Rate limit exceeded after multiple retries.');
+        throw new Error('Rate limit exceeded or API unavailable after retries.');
     }
 
     // === Utility: Safe delay ===

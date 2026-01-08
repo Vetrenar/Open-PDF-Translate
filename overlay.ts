@@ -48,7 +48,7 @@ export class OverlayRenderer {
     private zoomDebounceTimeout: ReturnType<typeof setTimeout> | null = null;
     private inFlightPageLoads: Map<number, Promise<void>> = new Map();
     // Gradual loading properties
-    private cachedOverlayData: SavedOverlay | null = null;
+    public cachedOverlayData: SavedOverlay | null = null;
     private pagesWithOverlays: Set<number> = new Set();
     private pageIntersectionObserver: IntersectionObserver | null = null;
     // Enhanced scroll safeguard properties

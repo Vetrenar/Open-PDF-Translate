@@ -100,19 +100,21 @@ export default class OpenRouterSettingsTab extends PluginSettingTab {
         containerEl.empty();
         containerEl.createEl('h2', { text: 'PDF Text Translator' });
 
-        // --- API PROVIDER SELECTION ---
+// --- API PROVIDER SELECTION ---
         new Setting(containerEl)
             .setName('API Provider')
             .setDesc('Choose your preferred translation service.')
             .addDropdown(dd => {
                 dd.addOption('openrouter', 'OpenRouter')
+                  .addOption('openai', 'OpenAI') // Added
+                  .addOption('gemini', 'Google Gemini') // Added
                   .addOption('ollama', 'Ollama (Local)')
                   .addOption('custom', 'Custom Endpoint')
                   .setValue(this.plugin.settings.apiProvider)
-                  .onChange(async (value: 'openrouter' | 'ollama' | 'custom') => {
+                  .onChange(async (value: any) => {
                       this.plugin.settings.apiProvider = value;
                       await this.plugin.saveSettings();
-                      // Re-render the settings tab to show provider-specific options
+                      // Re-render to show specific options
                       this.display();
                   });
             });
@@ -120,11 +122,143 @@ export default class OpenRouterSettingsTab extends PluginSettingTab {
         containerEl.createEl('hr');
         
         const provider = this.plugin.settings.apiProvider;
+        // Ensure the setting object exists to prevent crashes if upgrading from old version
+        if (!this.plugin.settings.providerSettings[provider]) {
+            this.plugin.settings.providerSettings[provider] = {}; 
+        }
         const providerSettings = this.plugin.settings.providerSettings[provider];
 
         // --- PROVIDER-SPECIFIC SETTINGS ---
         
-        if (provider === 'openrouter') {
+        // ==========================================================
+        // OPENAI
+        // ==========================================================
+        if (provider === 'openai') {
+            new Setting(containerEl).setName('OpenAI Settings').setHeading();
+
+            new Setting(containerEl)
+                .setName('OpenAI API Key')
+                .setDesc('Get your key from https://platform.openai.com/api-keys')
+                .addText(text => {
+                    text.setPlaceholder('sk-...')
+                        .setValue(providerSettings.apiKey || '')
+                        .onChange(async (value) => {
+                            providerSettings.apiKey = value.trim();
+                            await this.plugin.saveSettings();
+                        });
+                    text.inputEl.type = 'password';
+                });
+
+            new Setting(containerEl)
+                .setName('Model')
+                .setDesc('Choose an OpenAI model.')
+                .addDropdown(async dd => {
+                    dd.setDisabled(true); // Disable while loading
+                    
+                    const defaultModels = ['gpt-4o', 'gpt-4o-mini', 'gpt-4-turbo', 'gpt-3.5-turbo'];
+                    let models = defaultModels.map(m => ({ id: m, name: m }));
+
+                    // Try to fetch real models if key exists
+                    if (providerSettings.apiKey) {
+                        try {
+                            const resp = await requestUrl({
+                                url: 'https://api.openai.com/v1/models',
+                                headers: { 'Authorization': `Bearer ${providerSettings.apiKey}` }
+                            });
+                            const data = await resp.json;
+                            if (data.data && Array.isArray(data.data)) {
+                                models = data.data
+                                    .filter((m: any) => m.id.includes('gpt')) // Filter for chat models
+                                    .sort((a: any, b: any) => a.id.localeCompare(b.id));
+                            }
+                        } catch (e) {
+                            console.error('Failed to fetch OpenAI models', e);
+                            new Notice('Could not fetch OpenAI models. Using default list.');
+                        }
+                    }
+
+                    dd.selectEl.empty();
+                    models.forEach(m => dd.addOption(m.id, m.id));
+                    
+                    // Set default if empty
+                    const currentModel = providerSettings.model || 'gpt-4o';
+                    if (!models.find(m => m.id === currentModel)) {
+                        dd.addOption(currentModel, `${currentModel} (Saved)`);
+                    }
+                    dd.setValue(currentModel);
+                    dd.setDisabled(false);
+
+                    dd.onChange(async v => {
+                        providerSettings.model = v;
+                        await this.plugin.saveSettings();
+                    });
+                });
+
+        // ==========================================================
+        // GOOGLE GEMINI
+        // ==========================================================
+        } else if (provider === 'gemini') {
+            new Setting(containerEl).setName('Google Gemini Settings').setHeading();
+
+            new Setting(containerEl)
+                .setName('Gemini API Key')
+                .setDesc('Get your key from https://aistudio.google.com/app/apikey')
+                .addText(text => {
+                    text.setPlaceholder('AIzaSy...')
+                        .setValue(providerSettings.apiKey || '')
+                        .onChange(async (value) => {
+                            providerSettings.apiKey = value.trim();
+                            await this.plugin.saveSettings();
+                        });
+                    text.inputEl.type = 'password';
+                });
+
+            new Setting(containerEl)
+                .setName('Model')
+                .setDesc('Choose a Gemini model.')
+                .addDropdown(async dd => {
+                    dd.setDisabled(true);
+
+                    const defaultModels = ['gemini-1.5-flash', 'gemini-1.5-pro', 'gemini-1.0-pro'];
+                    let models = defaultModels.map(m => ({ name: `models/${m}`, displayName: m }));
+
+                    // Gemini requires API key to list models
+                    if (providerSettings.apiKey) {
+                        try {
+                            const resp = await requestUrl(
+                                `https://generativelanguage.googleapis.com/v1beta/models?key=${providerSettings.apiKey}`
+                            );
+                            const data = await resp.json;
+                            if (data.models && Array.isArray(data.models)) {
+                                models = data.models
+                                    .filter((m: any) => m.name.includes('gemini'))
+                                    .map((m: any) => ({ name: m.name, displayName: m.displayName || m.name }));
+                            }
+                        } catch (e) {
+                            console.error('Failed to fetch Gemini models', e);
+                        }
+                    }
+
+                    dd.selectEl.empty();
+                    models.forEach(m => dd.addOption(m.name, m.displayName));
+                    
+                    // Handle saved model
+                    // Note: Gemini models usually come as "models/gemini-1.5-flash" from API, 
+                    // but users might just type "gemini-1.5-flash". This handles strict matching.
+                    const currentModel = providerSettings.model || 'models/gemini-1.5-flash';
+                    dd.setValue(currentModel);
+                    dd.setDisabled(false);
+
+                    dd.onChange(async v => {
+                        providerSettings.model = v;
+                        await this.plugin.saveSettings();
+                    });
+                });
+
+        // ==========================================================
+        // OPENROUTER
+        // ==========================================================
+        } else if (provider === 'openrouter') {
             new Setting(containerEl).setName('OpenRouter Settings').setHeading();
 
             new Setting(containerEl)
@@ -153,19 +287,18 @@ export default class OpenRouterSettingsTab extends PluginSettingTab {
                         const models = (Array.isArray(data.data) ? data.data : [])
                             .sort((a: any, b: any) => a.name.localeCompare(b.name));
 
-                        dd.selectEl.empty(); // Clear "Loading..."
+                        dd.selectEl.empty();
                         models.forEach((m: any) => dd.addOption(m.id, `${m.name} (${m.id})`));
                         
                         dd.setValue(providerSettings.model || 'google/gemini-flash-1.5');
-                        dd.setDisabled(false);
                     } catch (err) {
                         console.error('Failed to load models from OpenRouter:', err);
                         dd.selectEl.empty();
-                        dd.addOption(providerSettings.model || 'google/gemini-flash-1.5', `Default (${providerSettings.model || 'google/gemini-flash-1.5'})`);
+                        dd.addOption(providerSettings.model || 'google/gemini-flash-1.5', 'Default');
                         dd.setValue(providerSettings.model || 'google/gemini-flash-1.5');
                         new Notice('⚠️ Could not load models. Using current setting.');
-                        dd.setDisabled(false);
                     }
+                    dd.setDisabled(false);
 
                     dd.onChange(async v => {
                         providerSettings.model = v;
@@ -173,6 +306,9 @@ export default class OpenRouterSettingsTab extends PluginSettingTab {
                     });
                 });
 
+        // ==========================================================
+        // OLLAMA
+        // ==========================================================
         } else if (provider === 'ollama') {
             new Setting(containerEl).setName('Ollama (Local) Settings').setHeading();
 
@@ -185,7 +321,6 @@ export default class OpenRouterSettingsTab extends PluginSettingTab {
                     .onChange(async (value) => {
                         providerSettings.apiEndpoint = value;
                         await this.plugin.saveSettings();
-                        // Refresh the settings to re-fetch models
                         this.display(); 
                     }));
 
@@ -223,6 +358,9 @@ export default class OpenRouterSettingsTab extends PluginSettingTab {
                     });
                 });
 
+        // ==========================================================
+        // CUSTOM
+        // ==========================================================
         } else if (provider === 'custom') {
             new Setting(containerEl).setName('Custom Endpoint Settings').setHeading();
             
@@ -244,35 +382,30 @@ export default class OpenRouterSettingsTab extends PluginSettingTab {
 
             new Setting(containerEl)
                 .setName('Model Name')
-                .setDesc('The model identifier to include in the request body.')
                 .addText(t => t.setValue(providerSettings.model || '').onChange(async v => {
                     providerSettings.model = v; await this.plugin.saveSettings();
                 }));
 
             new Setting(containerEl)
                 .setName('Request Headers (JSON)')
-                .setDesc('JSON object for request headers. Use {apiKey} for your key.')
                 .addTextArea(ta => {
-                    ta.setValue(providerSettings.headers || DEFAULT_SETTINGS.providerSettings.custom.headers)
+                    ta.setValue(providerSettings.headers || '{}')
                     .onChange(async v => { providerSettings.headers = v; await this.plugin.saveSettings(); });
                     ta.inputEl.rows = 4;
                 });
             
             new Setting(containerEl)
                 .setName('Request Body (JSON Template)')
-                .setDesc('JSON template with placeholders: {model}, {systemPrompt}, {userPrompt}.')
                 .addTextArea(ta => {
-                    ta.setValue(providerSettings.requestBody || DEFAULT_SETTINGS.providerSettings.custom.requestBody)
+                    ta.setValue(providerSettings.requestBody || '{}')
                     .onChange(async v => { providerSettings.requestBody = v; await this.plugin.saveSettings(); });
                     ta.inputEl.rows = 10;
                 });
 
             new Setting(containerEl)
                 .setName('Response Path')
-                .setDesc('Dot notation path to the translated text in the response JSON.')
                 .addText(t => t
-                    .setPlaceholder('e.g., choices[0].message.content')
-                    .setValue(providerSettings.responsePath || DEFAULT_SETTINGS.providerSettings.custom.responsePath)
+                    .setValue(providerSettings.responsePath || '')
                     .onChange(async v => { providerSettings.responsePath = v; await this.plugin.saveSettings(); }));
         }
 
@@ -321,12 +454,7 @@ export default class OpenRouterSettingsTab extends PluginSettingTab {
                 this.plugin.settings.autoSaveOverlay = v; await this.plugin.saveSettings();
             }));
                 
-        new Setting(containerEl)
-            .setName('Auto-refresh Translations')
-            .setDesc('Automatically re-translate when a PDF is opened.')
-            .addToggle(t => t.setValue(this.plugin.settings.autoRefreshOverlay).onChange(async v => {
-                this.plugin.settings.autoRefreshOverlay = v; await this.plugin.saveSettings();
-            }));
+    
 
         // Language Settings
         new Setting(containerEl)
@@ -457,12 +585,50 @@ export default class OpenRouterSettingsTab extends PluginSettingTab {
                 this.plugin.settings.maxBatchChars = v; await this.plugin.saveSettings();
             }));
             
+  
+        containerEl.createEl('h3', { text: 'AI Layout & OCR (Experimental)' });
+        containerEl.createEl('p', { 
+            text: 'Use an external Python script  to detect reading order and text positions. This fixes issues with scanned PDFs or complex multi-column layouts.',
+            cls: 'setting-item-description'
+        });
+
         new Setting(containerEl)
-            .setName('Manual Paragraph Refinement')
-            .setDesc('Enable Shift+click and Ctrl+M to merge translation blocks.')
-            .addToggle(t => t.setValue(this.plugin.settings.manualRefinementMode).onChange(async v => {
-                this.plugin.settings.manualRefinementMode = v; await this.plugin.saveSettings();
-            }));
+            .setName('Enable External Layout Engine')
+            .setDesc('If enabled, the plugin will run the Python script below to analyze the page before translating. Replaces the native PDF text layer.')
+            .addToggle(toggle => toggle
+                .setValue(this.plugin.settings.useExternalLayout)
+                .onChange(async (value) => {
+                    this.plugin.settings.useExternalLayout = value;
+                    await this.plugin.saveSettings();
+                    // Force refresh of settings UI to show/hide dependent fields if you wanted to add logic, 
+                    // otherwise just saving is enough.
+                }));
+
+        new Setting(containerEl)
+            .setName('Python Interpreter Path')
+            .setDesc('Absolute path to your Python executable (e.g., "/usr/bin/python3" or "C:\\Users\\...\\venv\\Scripts\\python.exe"). Ensure the module is installed in this environment.')
+            .addText(text => text
+                .setPlaceholder('python')
+                .setValue(this.plugin.settings.pythonPath)
+                .onChange(async (value) => {
+                    this.plugin.settings.pythonPath = value;
+                    await this.plugin.saveSettings();
+                }));
+
+        new Setting(containerEl)
+            .setName('Layout Script Path')
+            .setDesc('Absolute path to the "layout_engine.py" script. Usually in the plugin folder')
+            .addText(text => text
+                .setPlaceholder('/path/to/layout_engine.py')
+                .setValue(this.plugin.settings.ocrScriptPath)
+                .onChange(async (value) => {
+                    this.plugin.settings.ocrScriptPath = value;
+                    await this.plugin.saveSettings();
+                }));
+
+        // ============================================================
+        // End of New Section
+        // ============================================================
 
         new Setting(containerEl)
             .setName('Debug Mode')

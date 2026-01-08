@@ -21,12 +21,19 @@ export interface ProviderSettings {
  */
 export interface OpenRouterTranslatorSettings {
     // --- Provider Management ---
-    apiProvider: 'openrouter' | 'ollama' | 'custom';
+    apiProvider: 'openrouter' | 'ollama' | 'openai' | 'gemini' | 'custom';
     providerSettings: {
         openrouter: ProviderSettings;
         ollama: ProviderSettings;
+        openai: ProviderSettings; // Added
+        gemini: ProviderSettings; // Added
         custom: ProviderSettings;
     };
+
+    // External Layout / OCR Settings
+    useExternalLayout: boolean;
+    pythonPath: string;     // e.g. "python" or path to venv
+    ocrScriptPath: string;  // e.g. "path/to/layout_engine.py"
 
     // Translation Behavior
     enableTranslation: boolean;
@@ -62,7 +69,7 @@ export interface OpenRouterTranslatorSettings {
     batchPrompt: string;
     singlePrompt: string;
 
-    // --- NEW: Custom Copy Formats ---
+    // --- Custom Copy Formats ---
     calloutFormat: string;
     citationFormat: string;
     footnoteFormat: string;
@@ -175,6 +182,14 @@ export const DEFAULT_SETTINGS: OpenRouterTranslatorSettings = {
             apiKey: '',
             model: 'google/gemini-flash-1.5'
         },
+        openai: {
+            apiKey: '',
+            model: 'gpt-4o'
+        },
+        gemini: {
+            apiKey: '',
+            model: 'models/gemini-1.5-flash'
+        },
         ollama: {
             apiEndpoint: 'http://localhost:11434',
             model: 'llama3'
@@ -188,6 +203,10 @@ export const DEFAULT_SETTINGS: OpenRouterTranslatorSettings = {
             responsePath: 'choices[0].message.content'
         }
     },
+
+    useExternalLayout: false,
+    pythonPath: 'python', // Assumes python is in system PATH
+    ocrScriptPath: '',    // User must set this
 
     // Translation Behavior
     enableTranslation: true,
@@ -209,7 +228,7 @@ export const DEFAULT_SETTINGS: OpenRouterTranslatorSettings = {
 
     // Storage Settings
     autoSaveOverlay: false,
-    autoRefreshOverlay: false,
+    autoRefreshOverlay: true,
     storageLocation: '',
     useIndividualMarkdownStorage: true,
     indexFilePath: 'Index.md',
@@ -241,7 +260,7 @@ No extra text. Never skip numbering. Only return the numbered list.`,
 
     singlePrompt: `Translate from {sourceLang} to {targetLang}. Only output the translation. Preserve formatting and tone.`,
 
-    // --- NEW: Custom Copy Formats ---
+    // --- Custom Copy Formats ---
     calloutFormat: '> [!quote] Translation\n> {blockquote_text}\n>\n> {pagelink}',
     citationFormat: '{blockquote_text}\n> — *{filename}, page {pagenumber}*',
     footnoteFormat: '^{text} [[{filename}#page={pagenumber}|source]]'

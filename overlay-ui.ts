@@ -2,16 +2,17 @@
 // Extracted UI and Rendering logic for PDF Translation Overlays
 
 import { Menu, Notice } from 'obsidian';
-import type OpenRouterTranslatorPlugin from './main'; // Adjust path if needed
-import type { OverlayPositionData, SavedOverlay } from './types'; // Adjust path if needed
-import { RetranslateUsingOverlaysModal } from './modal-retranslate'; // Adjust path if needed
+import type OpenRouterTranslatorPlugin from './main';
+import type { OverlayPositionData } from './types';
+import { RetranslateUsingOverlaysModal } from './modal-retranslate';
+import { EditSpecificTranslationModal } from './modal-edit-translation';
 
 // Constants relevant to UI
 const LINE_HEIGHT_MIN = 0.8;
 const LINE_HEIGHT_MAX = 2.0;
 const LINE_HEIGHT_STEP = 0.1;
 
-// Types for internal state (if not already defined elsewhere)
+// Types for internal state
 type OverlayHandlers = {
     contextHandler: EventListener;
     hoverHandlers?: { show: EventListener; hide: EventListener };
@@ -36,7 +37,7 @@ export class OverlayUIRenderer {
     }
 
     // ============================================================
-    // Public API for OverlayRenderer (or other managers)
+    // Public API for OverlayRenderer
     // ============================================================
 
     /**
@@ -83,7 +84,7 @@ export class OverlayUIRenderer {
         });
 
         el.style.setProperty('--overlay-opacity', `${overlayOpacity}`);
-        this.setOverlayElementVisibility(el, true); // Assuming visible by default here, manager handles toggling
+        this.setOverlayElementVisibility(el, true);
 
         if (fontFamily) {
              el.style.fontFamily = fontFamily;
@@ -100,16 +101,16 @@ export class OverlayUIRenderer {
         inner.innerHTML = (htmlText || '').trim() || '…';
         el.appendChild(inner);
 
-        // Apply initial line-height (adjustment might happen later by manager)
+        // Apply initial line-height
         this.applyLineHeight(inner, outputLineHeight);
 
-        // Metadata for later adjustment and saving (if needed by manager)
+        // Metadata for later adjustment and saving
         el.setAttribute('data-original-text', originalTextContent);
         if (originalFontSizes.length > 0) {
             el.setAttribute('data-original-font-sizes', JSON.stringify(originalFontSizes));
         }
 
-        // Interaction events (context menu, z-index bump) - attached here
+        // Interaction events (context menu, z-index bump)
         const contextHandler = (event: Event) => {
             try {
                 this.showContextMenu(event, inner.textContent || '', el);
@@ -136,7 +137,6 @@ export class OverlayUIRenderer {
 
     /**
      * Adjusts overlay's line height first to fit, then font size only as last resort.
-     * Ensures minimum font size doesn't go below what would naturally fit the bounding box.
      */
     public adjustOverlayForOverflow(el: HTMLElement, outputLineHeight: number): void {
         const inner = el.querySelector('div');
@@ -149,7 +149,6 @@ export class OverlayUIRenderer {
         }
 
         const intendedFontSize = parseFloat(el.style.fontSize);
-        const intendedLineHeight = outputLineHeight;
         
         const minReasonableFontSize = Math.max(8, Math.min(
             el.clientHeight * 0.3,
@@ -159,9 +158,10 @@ export class OverlayUIRenderer {
         const minFontSizeFromIntention = intendedFontSize * 0.5;
         const absoluteMinimumFontSize = Math.max(minReasonableFontSize, minFontSizeFromIntention);
 
-        let currentLineHeight = intendedLineHeight;
+        let currentLineHeight = outputLineHeight;
         let attempts = 0;
         
+        // 1. Try reducing line height
         while (currentLineHeight > 0.8 && attempts < 20) {
             currentLineHeight -= 0.03;
             this.applyLineHeight(inner as HTMLDivElement, currentLineHeight);
@@ -172,6 +172,7 @@ export class OverlayUIRenderer {
             attempts++;
         }
 
+        // 2. Try reducing font size
         let testFontSize = intendedFontSize;
         attempts = 0;
         
@@ -186,6 +187,7 @@ export class OverlayUIRenderer {
             attempts++;
         }
 
+        // 3. Fallback: Set to min font size and allow scroll
         if (absoluteMinimumFontSize <= intendedFontSize) {
             el.style.fontSize = `${absoluteMinimumFontSize}px`;
             if (inner.scrollHeight <= el.clientHeight && inner.scrollWidth <= el.clientWidth) {
@@ -194,7 +196,7 @@ export class OverlayUIRenderer {
         }
 
         el.style.overflow = 'auto';
-        console.debug("[OverlayUIRenderer] Could not fit content with minimum font size, enabled scrollbar");
+        console.debug("[OverlayUIRenderer] Could not fit content, enabled scrollbar");
     }
 
     /**
@@ -209,7 +211,6 @@ export class OverlayUIRenderer {
             newValue = Math.max(LINE_HEIGHT_MIN, Math.min(LINE_HEIGHT_MAX, newValue));
             newValue = Math.round(newValue * 10) / 10;
             this.applyLineHeight(inner, newValue);
-            console.debug(`[OverlayUIRenderer] Line height for a single overlay adjusted to ${newValue}`);
         } catch (error) {
             console.debug('[OverlayUIRenderer] adjustSingleOverlayLineHeight failed:', error);
         }
@@ -222,16 +223,13 @@ export class OverlayUIRenderer {
         if (!overlayEl) return;
         try {
             const currentSize = parseFloat(overlayEl.style.fontSize);
-            if (isNaN(currentSize)) {
-                console.debug('[OverlayUIRenderer] Could not parse current font size for adjustment.');
-                return;
-            }
+            if (isNaN(currentSize)) return;
+            
             const FONT_SIZE_MIN_PX = 6;
             const FONT_SIZE_MAX_PX = 72;
             let newSize = currentSize * scaleFactor;
             newSize = Math.max(FONT_SIZE_MIN_PX, Math.min(FONT_SIZE_MAX_PX, newSize));
             overlayEl.style.fontSize = `${newSize}px`;
-            console.debug(`[OverlayUIRenderer] Font size for a single overlay adjusted to ${newSize}px`);
         } catch (error) {
             console.debug('[OverlayUIRenderer] adjustSingleOverlayFontSize failed:', error);
         }
@@ -280,10 +278,60 @@ export class OverlayUIRenderer {
         const activeLeaf = this.plugin.app.workspace.activeLeaf;
         const activeFile = activeLeaf?.view?.file;
         const pageNumber = this.plugin.getCurrentPageNumber();
+        
+        // Retrieve the original text stored on the element
+        const originalText = targetOverlay.getAttribute('data-original-text') || '';
+
+        // --- Calculate Index for Stable Editing ---
+        const container = targetOverlay.parentElement;
+        let itemIndex = -1;
+        if (container) {
+            // Find all siblings that are also translation overlays
+            const siblings = Array.from(container.children).filter(el => 
+                el.classList.contains('pdf-text-overlay-reflow')
+            );
+            itemIndex = siblings.indexOf(targetOverlay);
+        }
+        // ------------------------------------------
 
         const menu = new Menu();
         const addItem = (title: string, icon: string, onClick: () => void) =>
             menu.addItem(item => item.setTitle(title).setIcon(icon).onClick(onClick));
+
+        // ============================================================
+        // 1. Edit Actions
+        // ============================================================
+        
+        addItem('Edit Translation', 'pencil', () => {
+             if (!activeFile || pageNumber === null) {
+                 new Notice('Cannot edit: PDF context missing.');
+                 return;
+             }
+             if (!originalText && !textToCopy) {
+                 new Notice('Cannot edit: Reference text missing.');
+                 return;
+             }
+             if (itemIndex === -1) {
+                 new Notice('Cannot edit: Could not determine overlay position.');
+                 return;
+             }
+             
+             new EditSpecificTranslationModal(
+                 this.plugin.app,
+                 this.plugin,
+                 activeFile,
+                 pageNumber,
+                 itemIndex, // Pass the index so we edit the correct block
+                 originalText,
+                 textToCopy // Current overlay text
+             ).open();
+        });
+
+        menu.addSeparator();
+
+        // ============================================================
+        // 2. Copy Actions
+        // ============================================================
 
         addItem('Copy Translation', 'copy', async () => {
             try {
@@ -294,7 +342,7 @@ export class OverlayUIRenderer {
             }
         });
 
-        // --- NEW: DYNAMIC FORMATTED COPY ---
+        // Dynamic Formatted Copy Helper
         const copyFormattedText = async (format: string, title: string) => {
             if (!activeFile || pageNumber === null) {
                 new Notice(`Cannot copy as ${title}: PDF file or page number is not available.`);
@@ -302,11 +350,11 @@ export class OverlayUIRenderer {
             }
 
             try {
-                // Prepare all placeholder values
+                // Prepare placeholders
                 const pageLink = `[[${activeFile.path}#page=${pageNumber}]]`;
                 const blockquoteText = textToCopy.split('\n').map(line => `> ${line}`).join('\n');
                 
-                // Replace placeholders in the format string
+                // Replace placeholders in the user-defined format string
                 const formattedText = format
                     .replace(/{blockquote_text}/g, blockquoteText)
                     .replace(/{text}/g, textToCopy)
@@ -322,24 +370,29 @@ export class OverlayUIRenderer {
             }
         };
 
-        addItem('Copy as Callout', '', () => 
+        addItem('Copy as Callout', 'quote-glyph', () => 
             copyFormattedText(this.plugin.settings.calloutFormat, 'callout')
         );
         
-        addItem('Copy as Citation', '', () => 
+        addItem('Copy as Citation', 'book-open', () => 
             copyFormattedText(this.plugin.settings.citationFormat, 'citation')
         );
 
-        addItem('Copy as Footnote', '', () => 
+        addItem('Copy as Footnote', 'superscript', () => 
             copyFormattedText(this.plugin.settings.footnoteFormat, 'footnote')
         );
 
         menu.addSeparator();
 
+        // ============================================================
+        // 3. Page & Overlay Management
+        // ============================================================
+
         addItem('Retranslate Page...', 'refresh-cw', () => {
             if (!activeFile) return;
             new RetranslateUsingOverlaysModal(this.plugin.app, this.plugin, activeFile).open();
         });
+
         addItem('Force Refresh Overlays', 'refresh-ccw', () => {
             if (typeof (this.plugin.renderer ?? this.plugin).forceRefreshVisibleOverlays === 'function') {
                  (this.plugin.renderer ?? this.plugin).forceRefreshVisibleOverlays();
@@ -347,16 +400,24 @@ export class OverlayUIRenderer {
                 new Notice("Refresh function not available");
             }
         });
+
         menu.addSeparator();
 
-        // Font size controls
+        // ============================================================
+        // 4. Visual Adjustments (Specific to this block)
+        // ============================================================
+
         addItem('Increase Text Size', 'zoom-in', () => this.adjustSingleOverlayFontSize(targetOverlay, 1.1));
         addItem('Decrease Text Size', 'zoom-out', () => this.adjustSingleOverlayFontSize(targetOverlay, 1 / 1.1));
-        // Line height controls
+        
         addItem('Increase Line Height', 'plus', () => this.adjustSingleOverlayLineHeight(targetOverlay, LINE_HEIGHT_STEP));
         addItem('Decrease Line Height', 'minus', () => this.adjustSingleOverlayLineHeight(targetOverlay, -LINE_HEIGHT_STEP));
 
         menu.addSeparator();
+
+        // ============================================================
+        // 5. Navigation
+        // ============================================================
 
         addItem('Go to Translation File', 'file-text', () => {
             try {
@@ -368,7 +429,6 @@ export class OverlayUIRenderer {
                 const wikiLink = `${translationFileName}#Page ${pageNumber}`;
                 this.plugin.app.workspace.openLinkText(wikiLink, '', false);
                 new Notice(`Opened translation for page ${pageNumber}`);
-                console.debug(`[OverlayUIRenderer] Opened translation link: ${wikiLink}`);
             } catch (error) {
                 console.debug('[OverlayUIRenderer] Go to translation file error:', error);
                 new Notice('Error opening translation file.');
@@ -417,7 +477,6 @@ export class OverlayUIRenderer {
         this.tempDiv = null; // Clear temp div reference
     }
 
-    // Helper for text extraction (if needed here)
     public extractPlainTextFromHtml(html: string): string {
         if (!this.tempDiv) this.tempDiv = document.createElement('div');
         this.tempDiv.innerHTML = html;

@@ -1,0 +1,168 @@
+/* Base overlay style */
+.pdf-text-overlay-reflow {
+    position: absolute;
+    color: #333;
+    background-color: #fff;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    padding: 2px 6px;
+    border-radius: 4px;
+    white-space: normal;
+    overflow-wrap: break-word;
+    pointer-events: all;
+    z-index: 100;
+    box-sizing: border-box;
+    opacity: 0;
+    
+    /* Base font size - will be overridden by relative sizing */
+    font-size: 16px;
+    
+    /* Smooth transitions */
+    transition: 
+        opacity 0.3s ease, 
+        max-height 0.3s ease,
+        width 0.25s ease,
+        padding 0.25s ease,
+        box-shadow 0.25s ease,
+        left 0.25s ease,
+        top 0.25s ease,
+        font-size 0.25s ease;
+    
+    /* Base state shadow */
+    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    
+    /* Performance hint */
+    will-change: opacity, max-height, width, left, top, font-size;
+}
+
+/* Inner content */
+.pdf-text-overlay-reflow > div {
+    line-height: 1.6;
+    word-break: break-word;
+    hyphens: auto;
+}
+
+/* Expanded state */
+.pdf-text-overlay-reflow.is-expanded {
+    z-index: 101;
+    width: auto !important;
+    min-width: 280px;
+    max-width: 500px;
+    max-height: 70vh !important;
+    padding: 14px 18px;
+    font-size: 1.03em !important;
+    overflow-y: auto;
+    overflow-x: hidden;
+    
+    /* Enhanced shadow for depth */
+    box-shadow: 0 6px 12px rgba(0,0,0,0.15);
+    
+    /* Smooth scrolling */
+    scroll-behavior: smooth;
+    
+    /* Subtle border */
+    border: 1px solid rgba(0,0,0,0.05);
+}
+
+/* Scrollable behavior */
+.pdf-text-overlay-reflow.is-expanded::-webkit-scrollbar {
+    width: 6px;
+}
+
+.pdf-text-overlay-reflow.is-expanded::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+.pdf-text-overlay-reflow.is-expanded::-webkit-scrollbar-thumb {
+    background: rgba(0,0,0,0.2);
+    border-radius: 3px;
+}
+
+.pdf-text-overlay-reflow.is-expanded::-webkit-scrollbar-thumb:hover {
+    background: rgba(0,0,0,0.4);
+}
+
+/* Dynamic font sizing based on relative sizes */
+.pdf-text-overlay-reflow[data-font-size] {
+    font-size: calc(var(--reference-height, 1000px) * var(--relative-font-size, 0.012));
+}
+
+/* Font family support */
+.pdf-text-overlay-reflow[data-font-family] {
+    font-family: var(--font-family, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif);
+}
+
+/* Color support */
+.pdf-text-overlay-reflow[data-color] {
+    color: var(--text-color, #333);
+}
+
+/* Font weight support */
+.pdf-text-overlay-reflow[data-font-weight] {
+    font-weight: var(--font-weight, normal);
+}
+
+/* Font style support */
+.pdf-text-overlay-reflow[data-font-style] {
+    font-style: var(--font-style, normal);
+}
+
+/* Text decoration support */
+.pdf-text-overlay-reflow[data-text-decoration] {
+    text-decoration: var(--text-decoration, none);
+}
+
+/* Text alignment support */
+.pdf-text-overlay-reflow[data-text-align] {
+    text-align: var(--text-align, left);
+}
+
+/* Combined font properties */
+.pdf-text-overlay-reflow.font-styled {
+    font-family: var(--font-family, inherit);
+    color: var(--text-color, inherit);
+    font-weight: var(--font-weight, normal);
+    font-style: var(--font-style, normal);
+    text-decoration: var(--text-decoration, none);
+    text-align: var(--text-align, left);
+}
+
+/* Multiple font sizes handling */
+.pdf-text-overlay-reflow .multi-font-text {
+    font-size: inherit;
+}
+
+.pdf-text-overlay-reflow .font-size-0 { font-size: calc(var(--reference-height, 1000px) * var(--relative-size-0, 0.012)); }
+.pdf-text-overlay-reflow .font-size-1 { font-size: calc(var(--reference-height, 1000px) * var(--relative-size-1, 0.014)); }
+.pdf-text-overlay-reflow .font-size-2 { font-size: calc(var(--reference-height, 1000px) * var(--relative-size-2, 0.016)); }
+
+/* Font style variations */
+.pdf-text-overlay-reflow.bold { font-weight: bold; }
+.pdf-text-overlay-reflow.italic { font-style: italic; }
+.pdf-text-overlay-reflow.underline { text-decoration: underline; }
+.pdf-text-overlay-reflow.strikethrough { text-decoration: line-through; }
+
+.pdf-text-overlay-reflow.center { text-align: center; }
+.pdf-text-overlay-reflow.right { text-align: right; }
+.pdf-text-overlay-reflow.justify { text-align: justify; }
+
+/* Responsive adjustments */
+@media (max-width: 768px) {
+    .pdf-text-overlay-reflow.is-expanded {
+        max-width: 90vw;
+        min-width: 200px;
+    }
+}
+
+/* High contrast mode support */
+@media (prefers-contrast: high) {
+    .pdf-text-overlay-reflow {
+        border: 2px solid #000;
+    }
+}
+
+/* Reduced motion support */
+@media (prefers-reduced-motion: reduce) {
+    .pdf-text-overlay-reflow {
+        transition: none;
+    }
+}
