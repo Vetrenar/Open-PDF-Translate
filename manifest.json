@@ -1,7 +1,7 @@
 {
 	"id": "open-pdf-translate",
 	"name": "OPEN PDF Translate",
-	"version": "1.2.0",
+	"version": "1.3.0",
 	"minAppVersion": "0.15.0",
 	"description": "Перевод PDF через нейросеть.",
 	"author": "Vetrenar",
