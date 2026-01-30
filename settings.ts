@@ -15,9 +15,9 @@ import {
     TFolder
 } from 'obsidian';
 import OpenRouterTranslatorPlugin from './main';
-import { AVAILABLE_LANGUAGES, DEFAULT_SETTINGS } from './types';
+import { AVAILABLE_LANGUAGES, DEFAULT_SETTINGS, GEMMA_TEMPLATE } from './types';
 
-// === Folder Suggester Component (No changes needed) ===
+// === Folder Suggester Component ===
 export class FolderSuggest extends TextComponent {
     app: App;
 
@@ -106,8 +106,8 @@ export default class OpenRouterSettingsTab extends PluginSettingTab {
             .setDesc('Choose your preferred translation service.')
             .addDropdown(dd => {
                 dd.addOption('openrouter', 'OpenRouter')
-                  .addOption('openai', 'OpenAI') // Added
-                  .addOption('gemini', 'Google Gemini') // Added
+                  .addOption('openai', 'OpenAI') 
+                  .addOption('gemini', 'Google Gemini') 
                   .addOption('ollama', 'Ollama (Local)')
                   .addOption('custom', 'Custom Endpoint')
                   .setValue(this.plugin.settings.apiProvider)
@@ -243,8 +243,6 @@ export default class OpenRouterSettingsTab extends PluginSettingTab {
                     models.forEach(m => dd.addOption(m.name, m.displayName));
                     
                     // Handle saved model
-                    // Note: Gemini models usually come as "models/gemini-1.5-flash" from API, 
-                    // but users might just type "gemini-1.5-flash". This handles strict matching.
                     const currentModel = providerSettings.model || 'models/gemini-1.5-flash';
                     dd.setValue(currentModel);
                     dd.setDisabled(false);
@@ -478,50 +476,84 @@ export default class OpenRouterSettingsTab extends PluginSettingTab {
         containerEl.createEl('hr');
         new Setting(containerEl).setName('Advanced Settings').setHeading();
 
-        // Prompts
+        // --- GEMMA PROMPT TOGGLE ---
         new Setting(containerEl)
-            .setName('Batch Translation Prompt')
-            .setDesc('System prompt for batch translations. Placeholders: {sourceLang}, {targetLang}, {lineCount}, {inputText}')
-            .then(setting => {
-                setting.controlEl.style.flexDirection = 'column';
-                setting.controlEl.style.alignItems = 'flex-end';
-                
-                const textarea = new TextAreaComponent(setting.controlEl)
-                    .setValue(this.plugin.settings.batchPrompt).onChange(async v => {
-                        this.plugin.settings.batchPrompt = v; await this.plugin.saveSettings();
-                    });
-                textarea.inputEl.style.width = '100%';
-                textarea.inputEl.rows = 8;
-
-                new ButtonComponent(setting.controlEl).setButtonText('Restore Default').onClick(async () => {
-                    this.plugin.settings.batchPrompt = DEFAULT_SETTINGS.batchPrompt;
+            .setName('Use Gemma/Custom Template')
+            .setDesc('Enable the specific "Gemma" prompt template ({SOURCE_CODE} -> {TARGET_CODE}) defined in code. Disables custom prompts below.')
+            .addToggle(t => t
+                .setValue(this.plugin.settings.useGemmaPrompt)
+                .onChange(async v => {
+                    this.plugin.settings.useGemmaPrompt = v;
                     await this.plugin.saveSettings();
-                    textarea.setValue(DEFAULT_SETTINGS.batchPrompt);
-                }).buttonEl.style.marginTop = '8px';
-            });
+                    // Reload display to show/hide the prompt boxes
+                    this.display();
+                }));
 
-        new Setting(containerEl)
-            .setName('Single Sentence Prompt')
-            .setDesc('System prompt for single translations. Placeholders: {sourceLang}, {targetLang}')
-            .then(setting => {
-                setting.controlEl.style.flexDirection = 'column';
-                setting.controlEl.style.alignItems = 'flex-end';
-                
-                const textarea = new TextAreaComponent(setting.controlEl)
-                    .setValue(this.plugin.settings.singlePrompt).onChange(async v => {
-                        this.plugin.settings.singlePrompt = v; await this.plugin.saveSettings();
-                    });
-                textarea.inputEl.style.width = '100%';
-                textarea.inputEl.rows = 4;
+        if (this.plugin.settings.useGemmaPrompt) {
+            // SHOW READ-ONLY GEMMA TEMPLATE
+            const desc = document.createDocumentFragment();
+            desc.createEl('span', { text: 'Currently using the internal Gemma template. The Custom Prompts below are ignored.' });
+            
+            new Setting(containerEl)
+                .setName('Active Gemma Template (Read-Only)')
+                .setDesc(desc)
+                .then(setting => {
+                    setting.controlEl.style.flexDirection = 'column';
+                    setting.controlEl.style.alignItems = 'flex-end';
+                    
+                    const textarea = new TextAreaComponent(setting.controlEl)
+                        .setValue(GEMMA_TEMPLATE);
+                    textarea.inputEl.style.width = '100%';
+                    textarea.inputEl.rows = 6;
+                    textarea.setDisabled(true); // Read-only
+                });
 
-                new ButtonComponent(setting.controlEl).setButtonText('Restore Default').onClick(async () => {
-                    this.plugin.settings.singlePrompt = DEFAULT_SETTINGS.singlePrompt;
-                    await this.plugin.saveSettings();
-                    textarea.setValue(DEFAULT_SETTINGS.singlePrompt);
-                }).buttonEl.style.marginTop = '8px';
-            });
+        } else {
+            // SHOW STANDARD EDITABLE PROMPTS
+            new Setting(containerEl)
+                .setName('Batch Translation Prompt')
+                .setDesc('System prompt for batch translations. Placeholders: {sourceLang}, {targetLang}, {lineCount}, {inputText}')
+                .then(setting => {
+                    setting.controlEl.style.flexDirection = 'column';
+                    setting.controlEl.style.alignItems = 'flex-end';
+                    
+                    const textarea = new TextAreaComponent(setting.controlEl)
+                        .setValue(this.plugin.settings.batchPrompt).onChange(async v => {
+                            this.plugin.settings.batchPrompt = v; await this.plugin.saveSettings();
+                        });
+                    textarea.inputEl.style.width = '100%';
+                    textarea.inputEl.rows = 8;
 
-        // --- NEW: CUSTOM COPY FORMATS ---
+                    new ButtonComponent(setting.controlEl).setButtonText('Restore Default').onClick(async () => {
+                        this.plugin.settings.batchPrompt = DEFAULT_SETTINGS.batchPrompt;
+                        await this.plugin.saveSettings();
+                        textarea.setValue(DEFAULT_SETTINGS.batchPrompt);
+                    }).buttonEl.style.marginTop = '8px';
+                });
+
+            new Setting(containerEl)
+                .setName('Single Sentence Prompt')
+                .setDesc('System prompt for single translations. Placeholders: {sourceLang}, {targetLang}')
+                .then(setting => {
+                    setting.controlEl.style.flexDirection = 'column';
+                    setting.controlEl.style.alignItems = 'flex-end';
+                    
+                    const textarea = new TextAreaComponent(setting.controlEl)
+                        .setValue(this.plugin.settings.singlePrompt).onChange(async v => {
+                            this.plugin.settings.singlePrompt = v; await this.plugin.saveSettings();
+                        });
+                    textarea.inputEl.style.width = '100%';
+                    textarea.inputEl.rows = 4;
+
+                    new ButtonComponent(setting.controlEl).setButtonText('Restore Default').onClick(async () => {
+                        this.plugin.settings.singlePrompt = DEFAULT_SETTINGS.singlePrompt;
+                        await this.plugin.saveSettings();
+                        textarea.setValue(DEFAULT_SETTINGS.singlePrompt);
+                    }).buttonEl.style.marginTop = '8px';
+                });
+        }
+
+        // --- CUSTOM COPY FORMATS ---
         containerEl.createEl('hr');
         new Setting(containerEl).setName('Custom Copy Formats').setHeading();
 
@@ -600,8 +632,6 @@ export default class OpenRouterSettingsTab extends PluginSettingTab {
                 .onChange(async (value) => {
                     this.plugin.settings.useExternalLayout = value;
                     await this.plugin.saveSettings();
-                    // Force refresh of settings UI to show/hide dependent fields if you wanted to add logic, 
-                    // otherwise just saving is enough.
                 }));
 
         new Setting(containerEl)

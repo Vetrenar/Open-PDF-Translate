@@ -3,6 +3,12 @@ import { requestUrl, Notice, RequestUrlParam } from 'obsidian';
 import OpenRouterTranslatorPlugin from './main';
 import { AVAILABLE_LANGUAGES } from './types';
 
+// The template definition (Fallback if not in types.ts)
+export const GEMMA_TEMPLATE = `You are a professional {SOURCE_LANG} ({SOURCE_CODE}) to {TARGET_LANG} ({TARGET_CODE}) translator. Your goal is to accurately convey the meaning and nuances of the original {SOURCE_LANG} text while adhering to {TARGET_LANG} grammar, vocabulary, and cultural sensitivities.
+Produce only the {TARGET_LANG} translation, without any additional explanations or commentary. Please translate the following {SOURCE_LANG} text into {TARGET_LANG}:
+
+{TEXT}`;
+
 export class TranslationEngine {
     private plugin: OpenRouterTranslatorPlugin;
     private warnedAboutQwen = false;
@@ -19,54 +25,115 @@ export class TranslationEngine {
             : AVAILABLE_LANGUAGES.find(l => l.code === this.plugin.settings.sourceLanguage)?.name || this.plugin.settings.sourceLanguage;
     }
 
+    getSourceLangCode(): string {
+        return this.plugin.settings.sourceLanguage;
+    }
+
     getTargetLangName(): string {
         return AVAILABLE_LANGUAGES.find(l => l.code === this.plugin.settings.targetLanguage)?.name || this.plugin.settings.targetLanguage;
+    }
+
+    getTargetLangCode(): string {
+        return this.plugin.settings.targetLanguage;
+    }
+
+    // === Template Processing ===
+
+    /**
+     * Replaces placeholders in the prompt template.
+     * Supports both standard Plugin variables and Custom/Gemma variables.
+     */
+    private applyTemplateVariables(template: string, textContent: string, lineCount: number = 0): string {
+        return template
+            // Standard Plugin Variables
+            .replace(/{sourceLang}/g, this.getSourceLangName())
+            .replace(/{targetLang}/g, this.getTargetLangName())
+            .replace(/{lineCount}/g, lineCount.toString())
+            .replace(/{inputText}/g, textContent)
+            
+            // Custom / Gemma Variables (UPPERCASE)
+            .replace(/{SOURCE_LANG}/g, this.getSourceLangName())
+            .replace(/{TARGET_LANG}/g, this.getTargetLangName())
+            .replace(/{SOURCE_CODE}/g, this.getSourceLangCode())
+            .replace(/{TARGET_CODE}/g, this.getTargetLangCode())
+            .replace(/{TEXT}/g, textContent);
     }
 
     // === High-Level Translation Methods ===
 
     /**
-     * Translates a batch of text using the currently configured provider.
+     * Translates a batch of text.
+     * Note: If using Gemma Template, we must inject numbering instructions, 
+     * otherwise the Overlay will fail to parse the response.
      */
     async translateBatch(originalText: string, expectedLineCount: number): Promise<string> {
-        const systemPromptTemplate = this.plugin.settings.batchPrompt;
+        let finalSystemPrompt: string;
         
-        // Prepare the system prompt
-        const systemPrompt = systemPromptTemplate
-            .replace(/{sourceLang}/g, this.getSourceLangName())
-            .replace(/{targetLang}/g, this.getTargetLangName())
-            .replace(/{lineCount}/g, expectedLineCount.toString())
-            .replace(/{inputText}/g, ''); 
+        // Check for the setting (casting to any in case types.ts isn't updated yet)
+        const useGemma = (this.plugin.settings as any).useGemmaPrompt;
 
-        return await this.makeApiCall(systemPrompt, originalText);
+        if (useGemma) {
+            // 1. Remove {TEXT} from the base template because we need to format the input specifically for batching
+            const baseTemplate = GEMMA_TEMPLATE.replace('{TEXT}', '').trim();
+            
+            // 2. Add strict instructions for Numbered Lines so processing.ts can parse it
+            const batchInstruction = `
+            
+COMMAND: Translate the following numbered lines from {SOURCE_LANG} to {TARGET_LANG}.
+Return exactly {lineCount} lines in this format:
+1. Translated text
+2. Translated text
+...
+Do NOT translate the numbers. Maintain the list structure. No extra commentary.
+
+{TEXT}`;
+            
+            finalSystemPrompt = this.applyTemplateVariables(baseTemplate + batchInstruction, originalText, expectedLineCount);
+        } else {
+            // Standard Mode
+            let template = this.plugin.settings.batchPrompt;
+            // Ensure input text is placed if the user used {inputText}
+            if (template.includes('{inputText}')) {
+                 finalSystemPrompt = this.applyTemplateVariables(template, originalText, expectedLineCount);
+            } else {
+                 // Fallback if user messed up the prompt
+                 finalSystemPrompt = this.applyTemplateVariables(template, '', expectedLineCount) + `\n\n${originalText}`;
+            }
+        }
+
+        return await this.makeApiCall(finalSystemPrompt, originalText, true);
     }
 
     /**
-     * Translates a single piece of text.
+     * Translates a single piece of text (Sequential Mode).
      */
     async translateWithOpenRouter(text: string): Promise<string> {
-        const systemPromptTemplate = this.plugin.settings.singlePrompt;
-        
-        const systemPrompt = systemPromptTemplate
-            .replace(/{sourceLang}/g, this.getSourceLangName())
-            .replace(/{targetLang}/g, this.getTargetLangName())
-            .replace(/{inputText}/g, ''); 
+        let finalSystemPrompt: string;
+        const useGemma = (this.plugin.settings as any).useGemmaPrompt;
 
-        return await this.makeApiCall(systemPrompt, text.slice(0, 3000));
+        if (useGemma) {
+            // In Gemma mode, the text is baked into the System Prompt via {TEXT}
+            finalSystemPrompt = this.applyTemplateVariables(GEMMA_TEMPLATE, text);
+        } else {
+            // Standard Mode
+            let template = this.plugin.settings.singlePrompt;
+            if (template.includes('{inputText}')) {
+                finalSystemPrompt = this.applyTemplateVariables(template, text);
+            } else {
+                finalSystemPrompt = this.applyTemplateVariables(template, '') + `\n\n${text}`;
+            }
+        }
+
+        return await this.makeApiCall(finalSystemPrompt, text, false);
     }
 
     // === Low-Level API Communication ===
 
-    /**
-     * Safely retrieves a nested property from an object using a string path.
-     */
     private getPropertyByPath(obj: any, path: string): string | undefined {
         const keys = path.replace(/\[(\w+)\]/g, '.$1').replace(/^\./, '').split('.');
         let result = obj;
         for (const key of keys) {
-            if (result === null || result === undefined) {
-                return undefined;
-            }
+            if (result === null || result === undefined) return undefined;
             result = result[key];
         }
         return result;
@@ -81,15 +148,29 @@ export class TranslationEngine {
     }
 
     /**
-     * Constructs the request URL, headers, and body based on the selected provider.
+     * Constructs the request URL, headers, and body.
+     * @param fullPrompt The fully constructed system prompt (which might contain the text already).
+     * @param originalText The raw text (used for User role if not baked into System).
+     * @param isBakedIn If true, the text is already inside fullPrompt, so User content should be minimal.
      */
-    private getRequestConfig(systemPrompt: string, userPrompt: string): { url: string; options: RequestUrlParam } {
+    private getRequestConfig(fullPrompt: string, originalText: string, isBakedIn: boolean): { url: string; options: RequestUrlParam } {
         const providerId = this.plugin.settings.apiProvider;
         const provider = this.plugin.settings.providerSettings[providerId];
         
         let url: string;
         let body: any;
         let headers: Record<string, string> = { 'Content-Type': 'application/json' };
+
+        // Determine Content Distribution
+        // If using Gemma Template, text is in System. User prompt should be empty-ish to avoid double tokens.
+        // If using Standard, text is usually in User prompt (unless user edited Standard to use {inputText}).
+        const useGemma = (this.plugin.settings as any).useGemmaPrompt;
+        
+        // Logic: If the prompt template ALREADY replaced {TEXT} or {inputText}, we don't want to send it again.
+        const textIsInsideSystem = useGemma || fullPrompt.includes(originalText.substring(0, 20));
+
+        const systemContent = fullPrompt;
+        const userContent = textIsInsideSystem ? " " : originalText; // " " keeps APIs happy that demand user content
 
         switch (providerId) {
             case 'openrouter':
@@ -101,8 +182,8 @@ export class TranslationEngine {
                 body = {
                     model: provider.model,
                     messages: [
-                        { role: 'system', content: systemPrompt },
-                        { role: 'user', content: userPrompt }
+                        { role: 'system', content: systemContent },
+                        { role: 'user', content: userContent }
                     ],
                     max_tokens: 4096,
                     temperature: 0.1,
@@ -116,8 +197,8 @@ export class TranslationEngine {
                 body = {
                     model: provider.model || 'gpt-4o',
                     messages: [
-                        { role: 'system', content: systemPrompt },
-                        { role: 'user', content: userPrompt }
+                        { role: 'system', content: systemContent },
+                        { role: 'user', content: userContent }
                     ],
                     temperature: 0.1,
                 };
@@ -125,21 +206,19 @@ export class TranslationEngine {
 
             case 'gemini':
                 if (!provider.apiKey) throw new Error('Gemini API key is missing.');
-                // Ensure model has 'models/' prefix if not present, though usually handled in settings
                 const modelName = provider.model?.startsWith('models/') ? provider.model : `models/${provider.model || 'gemini-1.5-flash'}`;
                 url = `https://generativelanguage.googleapis.com/v1beta/${modelName}:generateContent?key=${provider.apiKey}`;
                 
-                // Gemini doesn't use a "system" role in the same way as OpenAI in the 'generateContent' endpoint.
-                // We combine system and user prompt for best compatibility across Gemini versions.
+                // Gemini prefers context combined nicely.
+                const combinedGeminiText = textIsInsideSystem 
+                    ? systemContent 
+                    : `${systemContent}\n\nTask:\n${userContent}`;
+
                 body = {
                     contents: [{
-                        parts: [{
-                            text: `${systemPrompt}\n\nTask:\n${userPrompt}`
-                        }]
+                        parts: [{ text: combinedGeminiText }]
                     }],
-                    generationConfig: {
-                        temperature: 0.1
-                    }
+                    generationConfig: { temperature: 0.1 }
                 };
                 break;
             
@@ -151,8 +230,8 @@ export class TranslationEngine {
                     model: provider.model,
                     stream: false,
                     messages: [
-                        { role: 'system', content: systemPrompt },
-                        { role: 'user', content: userPrompt }
+                        { role: 'system', content: systemContent },
+                        { role: 'user', content: userContent }
                     ]
                 };
                 break;
@@ -163,23 +242,17 @@ export class TranslationEngine {
                 
                 if (provider.headers) {
                     const populatedHeaders = provider.headers.replace(/{apiKey}/g, provider.apiKey || '');
-                    try {
-                        headers = { ...headers, ...JSON.parse(populatedHeaders) };
-                    } catch (e) {
-                        throw new Error('Failed to parse custom headers JSON.');
-                    }
+                    try { headers = { ...headers, ...JSON.parse(populatedHeaders) }; } 
+                    catch (e) { throw new Error('Failed to parse custom headers JSON.'); }
                 }
 
                 if (provider.requestBody) {
                     const populatedBody = provider.requestBody
                         .replace(/{model}/g, provider.model || '')
-                        .replace(/{systemPrompt}/g, this.escapeJsonString(systemPrompt))
-                        .replace(/{userPrompt}/g, this.escapeJsonString(userPrompt));
-                    try {
-                        body = JSON.parse(populatedBody);
-                    } catch (e) {
-                        throw new Error('Failed to parse custom request body JSON.');
-                    }
+                        .replace(/{systemPrompt}/g, this.escapeJsonString(systemContent))
+                        .replace(/{userPrompt}/g, this.escapeJsonString(userContent));
+                    try { body = JSON.parse(populatedBody); } 
+                    catch (e) { throw new Error('Failed to parse custom request body JSON.'); }
                 } else {
                      throw new Error('Custom request body setting is missing.');
                 }
@@ -200,14 +273,10 @@ export class TranslationEngine {
         };
     }
 
-    /**
-     * Makes an API call to the configured provider with retry logic.
-     */
-    async makeApiCall(systemPrompt: string, userPrompt: string): Promise<string> {
+    async makeApiCall(systemPrompt: string, originalText: string, isBatch: boolean): Promise<string> {
         const providerId = this.plugin.settings.apiProvider;
         const providerSettings = this.plugin.settings.providerSettings[providerId];
 
-        // Specific warning for OpenRouter/Qwen free models
         if (providerId === 'openrouter' && providerSettings.model?.includes('qwen') && !this.warnedAboutQwen) {
             new Notice('Warning: Some Qwen models have low rate limits.', 6000);
             this.warnedAboutQwen = true;
@@ -218,10 +287,13 @@ export class TranslationEngine {
 
         for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
             try {
-                const { url, options } = this.getRequestConfig(systemPrompt, userPrompt);
+                // Determine if the text was already baked into the system prompt
+                const useGemma = (this.plugin.settings as any).useGemmaPrompt;
+                const textBakedIn = useGemma || systemPrompt.includes(originalText.substring(0, 50));
+
+                const { url, options } = this.getRequestConfig(systemPrompt, originalText, textBakedIn);
                 
                 const controller = new AbortController();
-                // Gemini can be slow with large contexts, give it more time
                 const timeoutMs = providerId === 'gemini' ? 60000 : 45000;
                 const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
                 options.signal = controller.signal;
@@ -230,16 +302,10 @@ export class TranslationEngine {
                 clearTimeout(timeoutId);
 
                 if (response.status === 200) {
-                    // Determine where to look for the translation based on provider
-                    let responsePath = 'choices[0].message.content'; // Default (OpenAI/OpenRouter)
-                    
-                    if (providerId === 'ollama') {
-                        responsePath = 'message.content';
-                    } else if (providerId === 'gemini') {
-                        responsePath = 'candidates[0].content.parts[0].text';
-                    } else if (providerId === 'custom') {
-                        responsePath = providerSettings.responsePath || responsePath;
-                    }
+                    let responsePath = 'choices[0].message.content';
+                    if (providerId === 'ollama') responsePath = 'message.content';
+                    else if (providerId === 'gemini') responsePath = 'candidates[0].content.parts[0].text';
+                    else if (providerId === 'custom') responsePath = providerSettings.responsePath || responsePath;
 
                     const translatedText = this.getPropertyByPath(response.json, responsePath);
                     
@@ -251,16 +317,12 @@ export class TranslationEngine {
                     return translatedText.trim();
                 }
 
-                // Handle Errors
+                // Error Handling
                 const errorMsg = response.json?.error?.message || JSON.stringify(response.json) || response.text;
-                
-                // Rate Limits (429) handling
                 if (response.status === 429 || (typeof errorMsg === 'string' && errorMsg.toLowerCase().includes('rate limit'))) {
                     if (attempt === MAX_RETRIES) break;
                     const delay = BASE_DELAY * Math.pow(2, attempt - 1) + Math.random() * 500;
-                    if (this.plugin.settings.debugMode) {
-                        console.log(`Rate limit hit. Retrying in ${delay}ms (attempt ${attempt})`);
-                    }
+                    if (this.plugin.settings.debugMode) console.log(`Rate limit hit. Retrying in ${delay}ms...`);
                     await this.sleep(delay);
                     continue;
                 }
@@ -268,9 +330,7 @@ export class TranslationEngine {
                 throw new Error(`API Error - HTTP ${response.status}: ${errorMsg}`);
 
             } catch (err: any) {
-                if (err.name === 'AbortError') {
-                    throw new Error('Request timed out.');
-                }
+                if (err.name === 'AbortError') throw new Error('Request timed out.');
                 if (attempt === MAX_RETRIES) {
                     new Notice(`Translation failed: ${err.message}`);
                     throw err;
@@ -281,7 +341,6 @@ export class TranslationEngine {
         throw new Error('Rate limit exceeded or API unavailable after retries.');
     }
 
-    // === Utility: Safe delay ===
     async sleep(ms: number): Promise<void> {
         return new Promise(resolve => setTimeout(resolve, ms));
     }

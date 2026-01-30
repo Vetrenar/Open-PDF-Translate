@@ -25,8 +25,8 @@ export interface OpenRouterTranslatorSettings {
     providerSettings: {
         openrouter: ProviderSettings;
         ollama: ProviderSettings;
-        openai: ProviderSettings; // Added
-        gemini: ProviderSettings; // Added
+        openai: ProviderSettings;
+        gemini: ProviderSettings;
         custom: ProviderSettings;
     };
 
@@ -66,6 +66,7 @@ export interface OpenRouterTranslatorSettings {
     clickToShowMode: boolean;
 
     // Custom Prompts
+    useGemmaPrompt: boolean; // <--- NEW: Toggle for specific Gemma template logic
     batchPrompt: string;
     singlePrompt: string;
 
@@ -80,6 +81,9 @@ export interface TranslationUnit {
     text: string;
     id: string; // Unique ID for the chunk (sentence or paragraph)
     paragraphId: string; // ID to group chunks by original paragraph
+    // Optional properties for external layout support
+    _externalRect?: { l: number; t: number; w: number; h: number };
+    _externalFont?: { family: string; size: number; sizes: number[] };
 }
 
 export interface OverlayPositionData {
@@ -173,6 +177,14 @@ export const AVAILABLE_LANGUAGES = [
     { code: 'is', name: 'Icelandic' },
 ];
 
+// === Templates ===
+
+// NEW: The specific Gemma Template requested
+export const GEMMA_TEMPLATE = `You are a professional {SOURCE_LANG} ({SOURCE_CODE}) to {TARGET_LANG} ({TARGET_CODE}) translator, with specialisation in veterinary medicine. Your goal is to accurately convey the meaning and nuances of the original {SOURCE_LANG} text while adhering to {TARGET_LANG} grammar, vocabulary, and cultural sensitivities.
+Produce only the {TARGET_LANG} translation, without any additional explanations or commentary. Don't translate acronyms, leave them in original language. Please translate the following {SOURCE_LANG} text into {TARGET_LANG}:
+
+{TEXT}`;
+
 // === Default Settings ===
 export const DEFAULT_SETTINGS: OpenRouterTranslatorSettings = {
     // --- PROVIDER-AWARE DEFAULTS ---
@@ -239,6 +251,8 @@ export const DEFAULT_SETTINGS: OpenRouterTranslatorSettings = {
     clickToShowMode: false,
 
     // Custom Prompts
+    useGemmaPrompt: false, // <--- NEW DEFAULT
+    
     batchPrompt: `You are a precise document translator. Translate each of the following numbered lines from {sourceLang} to {targetLang}, and only this language.
 
 Example:
