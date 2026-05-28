@@ -349,9 +349,9 @@ export const AVAILABLE_LANGUAGES = [
 // PROMPT TEMPLATES
 // ════════════════════════════════════════════════════════════════
 
-export const GEMMA_TEMPLATE = `You are a professional {SOURCE_LANG} ({SOURCE_CODE}) to {TARGET_LANG} ({TARGET_CODE}) translator, with specialization in veterinary medicine. Your goal is to accurately convey the meaning and nuances of the original {SOURCE_LANG} text while adhering to {TARGET_LANG} grammar, vocabulary, terminology. Produce only the {TARGET_LANG} translation, without any additional explanations or commentary. 
+export const GEMMA_TEMPLATE = `You are a professional {SOURCE_LANG} ({SOURCE_CODE}) to {TARGET_LANG} ({TARGET_CODE}) translator. Your goal is to accurately convey the meaning and nuances of the original {SOURCE_LANG} text while adhering to {TARGET_LANG} grammar, vocabulary, terminology. Produce only the {TARGET_LANG} translation, without any additional explanations or commentary. 
 
-Be accurate with russian grammar, use only correct and actual terminology corresponding to veterinary medicine, as clinical, pathological, anatomical, pharmacological or any other terminology. Double check the output. For acronyms, don't translate them, leave them in original language. Please translate the following {SOURCE_LANG} text into {TARGET_LANG}: {TEXT}`;
+Be accurate with  grammar, use only correct and actual terminology. Please translate the following {SOURCE_LANG} text into {TARGET_LANG}: {TEXT}`;
 
 // ════════════════════════════════════════════════════════════════
 // OCR PROMPTS (PROVIDER-OPTIMIZED)
@@ -572,7 +572,7 @@ export const DEFAULT_SETTINGS: OpenRouterTranslatorSettings = {
   useGemmaPrompt: false,
   
   // UPDATED BATCH PROMPT to match processing.ts [#ID] logic
-  batchPrompt: `You are a precise document translator working in veterinary medicine, translating between {sourceLang} and {targetLang}. 
+  batchPrompt: `You are a precise document translator, translating between {sourceLang} and {targetLang}. 
 
 Your task is to translate the provided lines while STRICTLY maintaining a specific separator format.
 
@@ -592,8 +592,7 @@ Output:
 
 Translation Rules:
 - Return exactly {lineCount} lines.
-- Use precise veterinary terminology (clinical, pathological, anatomical, pharmacological).
-- DO NOT translate acronyms (e.g., FeLV, FIV, AKI); keep them in the original language.
+- Use precise  terminology.
 - Do not split paragraphs. One input line = One output line.
 - Do not add conversational text, markdown code blocks, or notes.
 - Ensure 1:1 mapping: if the input has 5 lines, the output must have 5 lines.
