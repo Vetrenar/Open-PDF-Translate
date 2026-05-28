@@ -198,15 +198,18 @@ export class ParagraphMerger {
       return paragraphs;
     }
 
-    if (!verticalStrips?.length) return paragraphs;
     const results: HTMLSpanElement[][] = [];
-
     const filteredStrips = this.filterStrips(verticalStrips, viewportWidth);
-
-    if (!filteredStrips.length) return paragraphs;
+    const effectiveStrips = filteredStrips.length ? filteredStrips : [];
 
     for (const para of paragraphs) {
-      const parts = this.splitParagraphByStrips(para, spanInfos, filteredStrips, lineHeight);
+      const parts = this.splitParagraphByStrips(
+        para,
+        spanInfos,
+        effectiveStrips,
+        lineHeight,
+        viewportWidth
+      );
       results.push(...parts);
     }
 
@@ -225,27 +228,43 @@ export class ParagraphMerger {
     const merged: HTMLSpanElement[][] = [];
     const used = new Set<number>();
     const filteredStrips = this.filterStrips(verticalStrips, viewportWidth);
+    const sorted = [...paragraphs].sort((a, b) => {
+      const ba = this.getParaBbox(a, spanInfos);
+      const bb = this.getParaBbox(b, spanInfos);
+      return ba.top - bb.top || ba.left - bb.left;
+    });
 
-    for (let i = 0; i < paragraphs.length; i++) {
+    for (let i = 0; i < sorted.length; i++) {
       if (used.has(i)) continue;
-      let current = [...paragraphs[i]];
+      let current = [...sorted[i]];
       const currStyle = spanInfos.get(current[0])!.style;
-      const currBbox = this.getParaBbox(current, spanInfos);
+      let currBbox = this.getParaBbox(current, spanInfos);
 
-      for (let j = i + 1; j < paragraphs.length; j++) {
+      for (let j = i + 1; j < sorted.length; j++) {
         if (used.has(j)) continue;
-        const next = paragraphs[j];
+        const next = sorted[j];
         const nextStyle = spanInfos.get(next[0])!.style;
 
         if (!this.stylesMatchStyle(currStyle, nextStyle, true)) continue;
 
         const nextBbox = this.getParaBbox(next, spanInfos);
+        const verticalGap = nextBbox.top - currBbox.bottom;
+        if (verticalGap < 0) continue;
+
+        const cappedLineHeight = Math.min(
+          lineHeight,
+          Math.max(currStyle.fontSize, nextStyle.fontSize) * 2.4
+        );
+        const mergeThreshold = Math.min(
+          cappedLineHeight * this.generalMergeVerticalGapMultiplier,
+          Math.max(currStyle.fontSize, nextStyle.fontSize) * this.generalMergeVerticalGapMaxMultiplier
+        );
+        if (verticalGap > mergeThreshold) break;
 
         // Checks for column alignment and horizontal bands (both now respect forceLinearMerge)
         if (!this.sameColumnByStrips(currBbox, nextBbox, filteredStrips)) continue;
         if (this.hasHorizontalBandBetween(currBbox, nextBbox, horizontalBands)) continue;
 
-        const verticalGap = nextBbox.top - currBbox.bottom;
         const horizontalOverlap = currBbox.left < nextBbox.right && currBbox.right > nextBbox.left;
         const overlapWidth = Math.max(0, Math.min(currBbox.right, nextBbox.right) - Math.max(currBbox.left, nextBbox.left));
         const minParaWidth = Math.max(1, Math.min(currBbox.width, nextBbox.width));
@@ -255,20 +274,20 @@ export class ParagraphMerger {
         const leftAligned = Math.abs(currBbox.left - nextBbox.left) < leftAlignTol;
         const rightAligned = Math.abs(currBbox.right - nextBbox.right) < leftAlignTol;
         const aligned = leftAligned || rightAligned;
+        const driftTol = Math.max(
+          Math.min(currBbox.width, nextBbox.width) * 0.22,
+          Math.max(currStyle.fontSize, nextStyle.fontSize) * 2.2
+        );
+        const strongEdgeDrift =
+          Math.abs(currBbox.left - nextBbox.left) > driftTol ||
+          Math.abs(currBbox.right - nextBbox.right) > driftTol;
 
-        // In forced mode, the layout/alignment checks matter less, but we usually rely on vertical gap
-        // to prevent header -> footer merges. The User should increase gap multipliers in settings if
-        // they want to bridge large gaps.
-        const mergeThreshold = Math.min(lineHeight * this.generalMergeVerticalGapMultiplier, Math.max(currStyle.fontSize, nextStyle.fontSize) * this.generalMergeVerticalGapMaxMultiplier);
-        
-        // In force mode, we are more permissive about alignment if the gap is small enough
         const permissiveAlignment = this.forceLinearMerge || (aligned || overlapStrong);
 
-        if (verticalGap <= mergeThreshold && permissiveAlignment) {
+        if (verticalGap <= mergeThreshold && permissiveAlignment && !strongEdgeDrift) {
           current.push(...next);
           used.add(j);
-          const newBbox = this.getParaBbox(current, spanInfos);
-          Object.assign(currBbox, newBbox);
+          currBbox = this.getParaBbox(current, spanInfos);
         }
       }
 
@@ -329,6 +348,14 @@ export class ParagraphMerger {
           const verticalGap = cand.bbox.top - base.bbox.bottom;
           if (verticalGap < 0) continue;
 
+          const maxFontSize = Math.max(base.style.fontSize, cand.style.fontSize);
+          const cappedLineHeight = Math.min(lineHeight, maxFontSize * 2.4);
+          const mergeThreshold = Math.min(
+            cappedLineHeight * this.stackedMergeVerticalGapMultiplier,
+            maxFontSize * this.stackedMergeVerticalGapMaxMultiplier
+          );
+          if (verticalGap > mergeThreshold) break;
+
           const horizontalOverlap = base.bbox.left < cand.bbox.right && base.bbox.right > cand.bbox.left;
           const overlapWidth = Math.max(0, Math.min(base.bbox.right, cand.bbox.right) - Math.max(base.bbox.left, cand.bbox.left));
           const minParaWidth = Math.max(1, Math.min(base.bbox.width, cand.bbox.width));
@@ -338,13 +365,17 @@ export class ParagraphMerger {
           const leftAligned = Math.abs(base.bbox.left - cand.bbox.left) < leftAlignTol;
           const rightAligned = Math.abs(base.bbox.right - cand.bbox.right) < leftAlignTol;
           const aligned = leftAligned || rightAligned;
+          const driftTol = Math.max(
+            Math.min(base.bbox.width, cand.bbox.width) * 0.22,
+            Math.max(base.style.fontSize, cand.style.fontSize) * 2.2
+          );
+          const strongEdgeDrift =
+            Math.abs(base.bbox.left - cand.bbox.left) > driftTol ||
+            Math.abs(base.bbox.right - cand.bbox.right) > driftTol;
 
-          const maxFontSize = Math.max(base.style.fontSize, cand.style.fontSize);
-          const mergeThreshold = Math.min(lineHeight * this.stackedMergeVerticalGapMultiplier, maxFontSize * this.stackedMergeVerticalGapMaxMultiplier);
-          
           const permissiveAlignment = this.forceLinearMerge || (aligned || overlapStrong);
 
-          if (permissiveAlignment && verticalGap <= mergeThreshold) {
+          if (permissiveAlignment && verticalGap <= mergeThreshold && !strongEdgeDrift) {
             const combinedSpans = [...base.spans, ...cand.spans]
               .map(s => ({ s, r: spanInfos.get(s)!.rect }))
               .sort((a, b) => a.r.top - b.r.top || a.r.left - b.r.left)
@@ -627,8 +658,7 @@ export class ParagraphMerger {
 
   private isCursiveOrBoldSpan(spanInfo: SpanInfo): boolean {
     const isCursive = spanInfo.style.fontStyle === 'italic' || spanInfo.style.fontStyle === 'oblique';
-    const isBold = spanInfo.style.fontWeight === 'bold' ||
-                   (typeof spanInfo.style.fontWeight === 'number' && spanInfo.style.fontWeight >= 600);
+    const isBold = this.getNumericFontWeight(spanInfo.style.fontWeight) >= 600;
     return isCursive || isBold;
   }
 
@@ -644,7 +674,8 @@ export class ParagraphMerger {
   }
 
   private stylesMatch(a: SpanInfo, b: SpanInfo, mathAware = true): boolean {
-    return this.stylesMatchStyle(a.style, b.style, mathAware);
+    const useStrictMath = mathAware && (a.isMathElement || b.isMathElement);
+    return this.stylesMatchStyle(a.style, b.style, useStrictMath);
   }
 
   /**
@@ -653,12 +684,12 @@ export class ParagraphMerger {
   private stylesMatchStyle(
     a: SpanInfo['style'],
     b: SpanInfo['style'],
-    mathAware = true
+    useStrictMath = false
   ): boolean {
     // OVERHAUL: Force linear merge bypass
     if (this.forceLinearMerge) return true;
 
-    if (mathAware && (a.isMathElement || b.isMathElement)) {
+    if (useStrictMath) {
       if (a.fontFamily !== b.fontFamily) return false;
       if (a.fontStyle !== b.fontStyle) return false;
       if (a.fontWeight !== b.fontWeight) return false;
@@ -733,8 +764,15 @@ export class ParagraphMerger {
 
     const [leftPara, rightPara] = a.left < b.left ? [a, b] : [b, a];
     const horizontalOverlap = Math.max(0, Math.min(a.right, b.right) - Math.max(a.left, b.left));
-    const minWidthOverlap = Math.min(a.width, b.width) * 0.3;
-    if (horizontalOverlap > minWidthOverlap) return true;
+    const overlapFrac = Math.min(a.width, b.width) > 0
+      ? horizontalOverlap / Math.min(a.width, b.width)
+      : 0;
+    if (overlapFrac > 0.85) return true;
+
+    const aCenter = (a.left + a.right) / 2;
+    const bCenter = (b.left + b.right) / 2;
+    const centerLeft = Math.min(aCenter, bCenter);
+    const centerRight = Math.max(aCenter, bCenter);
 
     const gapLeft = leftPara.right;
     const gapRight = rightPara.left;
@@ -762,6 +800,12 @@ export class ParagraphMerger {
       if (stripInGap >= minStripCoverage) {
         totalStripCoverage += stripInGap;
       }
+
+      // If a confident strip lies between paragraph centers, treat as hard separator.
+      const stripCenter = (s.left + s.right) / 2;
+      if (stripCenter > centerLeft && stripCenter < centerRight && yOverlap > 0) {
+        return false;
+      }
     }
 
     const coverageRatio = totalStripCoverage / gapWidth;
@@ -773,13 +817,24 @@ export class ParagraphMerger {
     if (this.forceLinearMerge) return false;
 
     if (!bands?.length) return false;
-    const top = Math.min(a.bottom, b.bottom);
-    const bottom = Math.max(a.top, b.top);
+    const upperBottom = Math.min(a.bottom, b.bottom);
+    const lowerTop = Math.max(a.top, b.top);
+    const betweenHeight = lowerTop - upperBottom;
+    if (betweenHeight <= 0) return false;
+    const sharedLeft = Math.max(a.left, b.left);
+    const sharedRight = Math.min(a.right, b.right);
+    if (sharedRight <= sharedLeft) return false;
+    const sharedWidth = sharedRight - sharedLeft;
 
     for (const band of bands) {
-      if (band.confidence < 0.6) continue;
-      const within = band.y > top && (band.y + band.height) < bottom;
-      if (within) return true;
+      if (band.confidence < 0.72) continue;
+      const xOverlap = Math.min(sharedRight, band.right) - Math.max(sharedLeft, band.left);
+      if (xOverlap < Math.max(6, sharedWidth * 0.2)) continue;
+      const bandTop = band.y;
+      const bandBottom = band.y + band.height;
+      const overlap = Math.min(lowerTop, bandBottom) - Math.max(upperBottom, bandTop);
+      const minOverlap = Math.max(1.5, Math.min(band.height, betweenHeight) * 0.35);
+      if (overlap >= minOverlap) return true;
     }
 
     return false;
@@ -829,11 +884,111 @@ export class ParagraphMerger {
     paragraph: HTMLSpanElement[],
     infos: Map<HTMLSpanElement, SpanInfo>,
     strips: VerticalStrip[],
-    lineHeight: number = 0
+    lineHeight: number = 0,
+    viewportWidth: number = 0
   ): HTMLSpanElement[][] {
-    if (!paragraph.length || !strips.length) return [paragraph];
+    if (!paragraph.length) return [paragraph];
 
     const paraBbox = this.getParaBbox(paragraph, infos);
+    const noStrips = !strips.length;
+    if (noStrips) {
+      const minWideForFallback = Math.max(220, viewportWidth * 0.42);
+      const minSpansForFallback = 8;
+      if (paraBbox.width < minWideForFallback || paragraph.length < minSpansForFallback) {
+        return [paragraph];
+      }
+    }
+
+    const paraHeight = Math.max(1, paraBbox.height);
+    const minParaCoverageForSplit = 0.6;
+    const overlappingStrips = strips
+      .filter(s => {
+        const yOverlap = Math.min(paraBbox.bottom, s.bottom) - Math.max(paraBbox.top, s.top);
+        if (yOverlap <= 0) return false;
+        const overlapFrac = yOverlap / Math.max(1, Math.min(paraBbox.height, s.bottom - s.top));
+        const paraCoverage = yOverlap / paraHeight;
+        return overlapFrac >= this.minStripOverlapFrac && paraCoverage >= minParaCoverageForSplit;
+      })
+      .sort((a, b) => a.left - b.left);
+
+    // Primary path: split using stable global strip separators.
+    if (overlappingStrips.length > 0) {
+      const separatorRanges = overlappingStrips
+        .map(s => ({
+          left: Math.max(paraBbox.left, s.left),
+          right: Math.min(paraBbox.right, s.right),
+          center: (s.left + s.right) / 2
+        }))
+        .filter(s => s.right - s.left > 0)
+        .sort((a, b) => a.center - b.center);
+
+      const mergedRanges: Array<{ left: number; right: number; center: number }> = [];
+      const minSepDelta = Math.max(2, (lineHeight || 12) * this.splitBoundaryDedupTol);
+      for (const r of separatorRanges) {
+        const last = mergedRanges[mergedRanges.length - 1];
+        if (!last || r.left > last.right + minSepDelta) {
+          mergedRanges.push({ ...r });
+        } else {
+          last.left = Math.min(last.left, r.left);
+          last.right = Math.max(last.right, r.right);
+          last.center = (last.left + last.right) / 2;
+        }
+      }
+
+      if (mergedRanges.length > 0) {
+        const regions: Array<{ left: number; right: number }> = [];
+        let cursor = paraBbox.left;
+        for (const sep of mergedRanges) {
+          const regionRight = Math.max(cursor, sep.left);
+          if (regionRight - cursor > 1) {
+            regions.push({ left: cursor, right: regionRight });
+          }
+          cursor = Math.max(cursor, sep.right);
+        }
+        if (paraBbox.right - cursor > 1) {
+          regions.push({ left: cursor, right: paraBbox.right });
+        }
+
+        if (regions.length > 1) {
+          const sortedSpans = [...paragraph].sort((a, b) => {
+            const ra = infos.get(a)!.rect;
+            const rb = infos.get(b)!.rect;
+            return ra.top - rb.top || ra.left - rb.left;
+          });
+          const buckets: HTMLSpanElement[][] = regions.map(() => []);
+
+          for (const span of sortedSpans) {
+            const rect = infos.get(span)!.rect;
+            let idx = -1;
+            let bestOverlap = -1;
+            for (let i = 0; i < regions.length; i++) {
+              const overlap = Math.min(rect.right, regions[i].right) - Math.max(rect.left, regions[i].left);
+              if (overlap > bestOverlap) {
+                bestOverlap = overlap;
+                idx = i;
+              }
+            }
+            if (idx < 0) {
+              const cx = (rect.left + rect.right) / 2;
+              idx = cx < regions[0].left ? 0 : regions.length - 1;
+            }
+            buckets[idx].push(span);
+          }
+
+          const groups = buckets
+            .filter(b => b.length > 0)
+            .map(bucket => bucket.sort((a, b) => {
+              const ra = infos.get(a)!.rect;
+              const rb = infos.get(b)!.rect;
+              return ra.top - rb.top || ra.left - rb.left;
+            }));
+
+          if (groups.length > 1) return this.reconcileTinyPeripheralSplits(groups, infos, lineHeight);
+        }
+      }
+    }
+
+    const effectiveLineHeight = Math.max(1, lineHeight);
     const sorted = [...paragraph].sort((a, b) => {
       const ra = infos.get(a)!.rect;
       const rb = infos.get(b)!.rect;
@@ -847,9 +1002,9 @@ export class ParagraphMerger {
     for (const span of sorted) {
       const rect = infos.get(span)!.rect;
 
-      if (currentLineTop === -Infinity || Math.abs(rect.top - currentLineTop) > lineHeight * this.splitLineHeightTol) {
+      if (currentLineTop === -Infinity || Math.abs(rect.top - currentLineTop) > effectiveLineHeight * this.splitLineHeightTol) {
         if (currentLineSpans.length > 1) {
-          this.processLineForColumnBoundaries(currentLineSpans, columnBoundaries, lineHeight);
+          this.processLineForColumnBoundaries(currentLineSpans, columnBoundaries, effectiveLineHeight);
         }
         currentLineTop = rect.top;
         currentLineSpans = [{ span, rect }];
@@ -859,7 +1014,7 @@ export class ParagraphMerger {
     }
 
     if (currentLineSpans.length > 1) {
-      this.processLineForColumnBoundaries(currentLineSpans, columnBoundaries, lineHeight);
+      this.processLineForColumnBoundaries(currentLineSpans, columnBoundaries, effectiveLineHeight);
     }
 
     if (columnBoundaries.length === 0) return [paragraph];
@@ -867,7 +1022,7 @@ export class ParagraphMerger {
     columnBoundaries.sort((a, b) => a - b);
     const uniqueBoundaries = [columnBoundaries[0]];
     for (let i = 1; i < columnBoundaries.length; i++) {
-      if (columnBoundaries[i] - uniqueBoundaries[uniqueBoundaries.length - 1] > lineHeight * this.splitBoundaryDedupTol) {
+      if (columnBoundaries[i] - uniqueBoundaries[uniqueBoundaries.length - 1] > effectiveLineHeight * this.splitBoundaryDedupTol) {
         uniqueBoundaries.push(columnBoundaries[i]);
       }
     }
@@ -902,7 +1057,56 @@ export class ParagraphMerger {
       groups.push(bucket);
     }
 
-    return groups.length > 1 ? groups : [paragraph];
+    return groups.length > 1 ? this.reconcileTinyPeripheralSplits(groups, infos, lineHeight) : [paragraph];
+  }
+
+  // Avoid tiny accidental edge fragments caused by noisy separators.
+  private reconcileTinyPeripheralSplits(
+    groups: HTMLSpanElement[][],
+    infos: Map<HTMLSpanElement, SpanInfo>,
+    lineHeight: number
+  ): HTMLSpanElement[][] {
+    if (groups.length < 2) return groups;
+    const maxTinySpans = 2;
+    const tolY = Math.max(2, (lineHeight || 12) * 0.7);
+    const out = [...groups];
+
+    // Left edge tiny group: merge into the next group if they are line-aligned.
+    if (out[0].length <= maxTinySpans) {
+      const a = this.getParaBbox(out[0], infos);
+      const b = this.getParaBbox(out[1], infos);
+      const sameTop = Math.abs(a.top - b.top) <= tolY;
+      const sameBottom = Math.abs(a.bottom - b.bottom) <= tolY;
+      if (sameTop || sameBottom) {
+        out[1] = [...out[0], ...out[1]].sort((x, y) => {
+          const rx = infos.get(x)!.rect;
+          const ry = infos.get(y)!.rect;
+          return rx.top - ry.top || rx.left - ry.left;
+        });
+        out.shift();
+      }
+    }
+
+    if (out.length < 2) return out;
+
+    // Right edge tiny group: merge into the previous group if they are line-aligned.
+    const last = out.length - 1;
+    if (out[last].length <= maxTinySpans) {
+      const a = this.getParaBbox(out[last - 1], infos);
+      const b = this.getParaBbox(out[last], infos);
+      const sameTop = Math.abs(a.top - b.top) <= tolY;
+      const sameBottom = Math.abs(a.bottom - b.bottom) <= tolY;
+      if (sameTop || sameBottom) {
+        out[last - 1] = [...out[last - 1], ...out[last]].sort((x, y) => {
+          const rx = infos.get(x)!.rect;
+          const ry = infos.get(y)!.rect;
+          return rx.top - ry.top || rx.left - ry.left;
+        });
+        out.pop();
+      }
+    }
+
+    return out;
   }
 
   private processLineForColumnBoundaries(
@@ -932,8 +1136,8 @@ export class ParagraphMerger {
     return strips.filter(s => {
       const width = s.right - s.left;
       const height = s.bottom - s.top;
-      if (width < viewportWidth * 0.003) return false;
-      const minHeight = Math.max(12, height * 0.7);
+      if (width < viewportWidth * 0.0015) return false;
+      const minHeight = 12;
       if (height < minHeight) return false;
       return s.confidence >= this.minStripConfidenceSplit &&
              width >= this.minStripWidthPx &&

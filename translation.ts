@@ -4,8 +4,8 @@ import OpenRouterTranslatorPlugin from './main';
 import { AVAILABLE_LANGUAGES } from './types';
 
 // The template definition (Fallback if not in types.ts)
-export const GEMMA_TEMPLATE = `You are a professional {SOURCE_LANG} ({SOURCE_CODE}) to {TARGET_LANG} ({TARGET_CODE}) translator. Your goal is to accurately convey the meaning and nuances of the original {SOURCE_LANG} text while adhering to {TARGET_LANG} grammar, vocabulary, and cultural sensitivities.
-Produce only the {TARGET_LANG} translation, without any additional explanations or commentary. Please translate the following {SOURCE_LANG} text into {TARGET_LANG}:
+export const GEMMA_TEMPLATE = `You are a professional {SOURCE_LANG} ({SOURCE_CODE}) to {TARGET_LANG} ({TARGET_CODE}) translator, with specialisation in veterinary medicine. Your goal is to accurately convey the meaning and nuances of the original {SOURCE_LANG} text while adhering to {TARGET_LANG} grammar, vocabulary, and cultural sensitivities.
+Produce only the {TARGET_LANG} translation, without any additional explanations or commentary. Don't translate acronyms, leave them in original language. Please translate the following {SOURCE_LANG} text into {TARGET_LANG}:
 
 {TEXT}`;
 
@@ -148,6 +148,28 @@ Do NOT translate the numbers. Maintain the list structure. No extra commentary.
     }
 
     /**
+     * Check if a model supports reasoning/thinking mode
+     */
+    private supportsReasoning(modelId?: string): boolean {
+        if (!modelId) return false;
+        
+        const reasoningModels = [
+            'o1',                    // OpenAI O1 series
+            'o3',                    // OpenAI O3 series  
+            'deepseek-r1',           // DeepSeek R1 reasoner
+            'deepseek-reasoner',     // DeepSeek reasoner variants
+            'qwen-qwq',              // Qwen with reasoning
+            'qwq',                   // Qwen QwQ
+            'thinking',              // Gemini thinking models
+            'gemini-2.0-flash-thinking'
+        ];
+        
+        return reasoningModels.some(pattern => 
+            modelId.toLowerCase().includes(pattern)
+        );
+    }
+
+    /**
      * Constructs the request URL, headers, and body.
      * @param fullPrompt The fully constructed system prompt (which might contain the text already).
      * @param originalText The raw text (used for User role if not baked into System).
@@ -167,63 +189,81 @@ Do NOT translate the numbers. Maintain the list structure. No extra commentary.
         const useGemma = (this.plugin.settings as any).useGemmaPrompt;
         
         // Logic: If the prompt template ALREADY replaced {TEXT} or {inputText}, we don't want to send it again.
-        const textIsInsideSystem = useGemma || fullPrompt.includes(originalText.substring(0, 20));
-
         const systemContent = fullPrompt;
-        const userContent = textIsInsideSystem ? " " : originalText; // " " keeps APIs happy that demand user content
+        const userContent = isBakedIn ? 'Translate.' : originalText;
 
         switch (providerId) {
             case 'openrouter':
                 if (!provider.apiKey) throw new Error('OpenRouter API key is missing.');
                 url = 'https://openrouter.ai/api/v1/chat/completions';
                 headers['Authorization'] = `Bearer ${provider.apiKey}`;
-                headers['HTTP-Referer'] = 'obsidian://pdf-translator';
-                headers['X-Title'] = 'PDF Translator Plugin';
+                headers['HTTP-Referer'] = 'https://obsidian.md';
+                headers['X-Title'] = 'Obsidian PDF Translator';
+                
                 body = {
                     model: provider.model,
                     messages: [
                         { role: 'system', content: systemContent },
                         { role: 'user', content: userContent }
                     ],
-                    max_tokens: 4096,
-                    temperature: 0.1,
+                    temperature: provider.temperature ?? 0.3
                 };
+                
+                // Add reasoning effort for compatible models
+                if (provider.enableReasoning && this.supportsReasoning(provider.model)) {
+                    body.reasoning = { effort: 'high' };
+                }
                 break;
 
             case 'openai':
                 if (!provider.apiKey) throw new Error('OpenAI API key is missing.');
                 url = 'https://api.openai.com/v1/chat/completions';
                 headers['Authorization'] = `Bearer ${provider.apiKey}`;
+                
                 body = {
-                    model: provider.model || 'gpt-4o',
+                    model: provider.model,
                     messages: [
                         { role: 'system', content: systemContent },
                         { role: 'user', content: userContent }
-                    ],
-                    temperature: 0.1,
+                    ]
                 };
+                
+                // O1/O3 models handle temperature and reasoning differently
+                if (provider.model?.includes('o1') || provider.model?.includes('o3')) {
+                    // These models don't support temperature parameter
+                    if (provider.enableReasoning) {
+                        body.reasoning_effort = 'high'; // Options: 'low', 'medium', 'high'
+                    }
+                } else {
+                    // Standard models use temperature
+                    body.temperature = provider.temperature ?? 0.3;
+                }
                 break;
 
             case 'gemini':
                 if (!provider.apiKey) throw new Error('Gemini API key is missing.');
-                const modelName = provider.model?.startsWith('models/') ? provider.model : `models/${provider.model || 'gemini-1.5-flash'}`;
-                url = `https://generativelanguage.googleapis.com/v1beta/${modelName}:generateContent?key=${provider.apiKey}`;
+                const geminiModel = provider.model?.replace('models/', '') || 'gemini-1.5-flash';
+                url = `https://generativelanguage.googleapis.com/v1beta/models/${geminiModel}:generateContent?key=${provider.apiKey}`;
                 
-                // Gemini prefers context combined nicely.
-                const combinedGeminiText = textIsInsideSystem 
-                    ? systemContent 
-                    : `${systemContent}\n\nTask:\n${userContent}`;
-
                 body = {
                     contents: [{
-                        parts: [{ text: combinedGeminiText }]
+                        parts: [
+                            { text: systemContent + '\n\n' + userContent }
+                        ]
                     }],
-                    generationConfig: { temperature: 0.1 }
+                    generationConfig: {
+                        temperature: provider.temperature ?? 0.3
+                    }
                 };
+                
+                // Enable thinking mode for Gemini 2.0 Flash Thinking
+                if (provider.enableReasoning && geminiModel.toLowerCase().includes('thinking')) {
+                    body.generationConfig.thinkingMode = 'THINKING_MODE_ENABLED';
+                }
                 break;
-            
+
             case 'ollama':
-                if (!provider.apiEndpoint || !provider.model) throw new Error('Ollama endpoint or model is missing.');
+                if (!provider.apiEndpoint) throw new Error('Ollama endpoint is missing.');
                 const endpoint = provider.apiEndpoint.endsWith('/') ? provider.apiEndpoint.slice(0, -1) : provider.apiEndpoint;
                 url = `${endpoint}/api/chat`;
                 body = {
@@ -232,7 +272,10 @@ Do NOT translate the numbers. Maintain the list structure. No extra commentary.
                     messages: [
                         { role: 'system', content: systemContent },
                         { role: 'user', content: userContent }
-                    ]
+                    ],
+                    options: {
+                        temperature: provider.temperature ?? 0.3
+                    }
                 };
                 break;
 
@@ -250,7 +293,8 @@ Do NOT translate the numbers. Maintain the list structure. No extra commentary.
                     const populatedBody = provider.requestBody
                         .replace(/{model}/g, provider.model || '')
                         .replace(/{systemPrompt}/g, this.escapeJsonString(systemContent))
-                        .replace(/{userPrompt}/g, this.escapeJsonString(userContent));
+                        .replace(/{userPrompt}/g, this.escapeJsonString(userContent))
+                        .replace(/{temperature}/g, (provider.temperature ?? 0.3).toString());
                     try { body = JSON.parse(populatedBody); } 
                     catch (e) { throw new Error('Failed to parse custom request body JSON.'); }
                 } else {
@@ -294,12 +338,20 @@ Do NOT translate the numbers. Maintain the list structure. No extra commentary.
                 const { url, options } = this.getRequestConfig(systemPrompt, originalText, textBakedIn);
                 
                 const controller = new AbortController();
-                const timeoutMs = providerId === 'gemini' ? 60000 : 45000;
+                const timeoutMs = providerId === 'gemini' ? 60000 : (providerId === 'ollama' ? 120000 : 45000);
                 const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
                 options.signal = controller.signal;
 
                 const response = await requestUrl({ url, ...options });
                 clearTimeout(timeoutId);
+
+                // DIAGNOSTIC: Log the full response if debug mode is enabled
+                if (this.plugin.settings.debugMode) {
+                    console.log('=== API RESPONSE DEBUG ===');
+                    console.log('Status:', response.status);
+                    console.log('Response:', JSON.stringify(response.json, null, 2));
+                    console.log('==========================');
+                }
 
                 if (response.status === 200) {
                     let responsePath = 'choices[0].message.content';
@@ -310,8 +362,9 @@ Do NOT translate the numbers. Maintain the list structure. No extra commentary.
                     const translatedText = this.getPropertyByPath(response.json, responsePath);
                     
                     if (!translatedText) {
-                        if (this.plugin.settings.debugMode) console.log("Full Response:", response.json);
-                        throw new Error('Empty response from API or invalid path.');
+                        console.log("Full Response:", response.json);
+                        console.log("Expected Path:", responsePath);
+                        throw new Error('Empty response from API or invalid response path.');
                     }
 
                     return translatedText.trim();
@@ -319,26 +372,66 @@ Do NOT translate the numbers. Maintain the list structure. No extra commentary.
 
                 // Error Handling
                 const errorMsg = response.json?.error?.message || JSON.stringify(response.json) || response.text;
+                
+                console.error('=== API ERROR DEBUG ===');
+                console.error('Status:', response.status);
+                console.error('Provider:', providerId);
+                console.error('Model:', providerSettings.model);
+                console.error('Error Message:', errorMsg);
+                console.error('Full Response:', response.json);
+                console.error('=======================');
+                
+                // Rate limit handling
                 if (response.status === 429 || (typeof errorMsg === 'string' && errorMsg.toLowerCase().includes('rate limit'))) {
-                    if (attempt === MAX_RETRIES) break;
+                    if (attempt === MAX_RETRIES) {
+                        throw new Error(`Rate limit exceeded after ${MAX_RETRIES} attempts. Please wait and try again.`);
+                    }
                     const delay = BASE_DELAY * Math.pow(2, attempt - 1) + Math.random() * 500;
-                    if (this.plugin.settings.debugMode) console.log(`Rate limit hit. Retrying in ${delay}ms...`);
+                    console.log(`Rate limit hit. Retrying in ${delay}ms...`);
                     await this.sleep(delay);
                     continue;
                 }
                 
-                throw new Error(`API Error - HTTP ${response.status}: ${errorMsg}`);
+                // Provider-specific error messages
+                let userFriendlyError = `API Error - HTTP ${response.status}`;
+                if (response.status === 400) {
+                    userFriendlyError += ': Bad request - check your model selection and API key';
+                } else if (response.status === 401) {
+                    userFriendlyError += ': Invalid API key';
+                } else if (response.status === 403) {
+                    userFriendlyError += ': Access forbidden - check your API permissions';
+                } else if (response.status === 404) {
+                    userFriendlyError += ': Model not found - check your model name';
+                } else if (response.status === 500 || response.status === 502 || response.status === 503) {
+                    userFriendlyError += ': Provider service error - try again later';
+                } else {
+                    userFriendlyError += `: ${errorMsg}`;
+                }
+                
+                throw new Error(userFriendlyError);
 
             } catch (err: any) {
-                if (err.name === 'AbortError') throw new Error('Request timed out.');
+                if (err.name === 'AbortError') {
+                    if (attempt < MAX_RETRIES) {
+                        new Notice(`Request timed out. Retrying (${attempt}/${MAX_RETRIES})...`);
+                        continue;
+                    }
+                    throw new Error('Request timed out. The model may be slow or overloaded.');
+                }
+                
                 if (attempt === MAX_RETRIES) {
                     new Notice(`Translation failed: ${err.message}`);
                     throw err;
                 }
+                
+                // For network errors, retry with exponential backoff
+                const delay = BASE_DELAY * Math.pow(2, attempt - 1);
+                console.log(`Attempt ${attempt} failed, retrying in ${delay}ms...`, err);
+                await this.sleep(delay);
             }
         }
 
-        throw new Error('Rate limit exceeded or API unavailable after retries.');
+        throw new Error('Translation failed after multiple retries. Please check your connection and try again.');
     }
 
     async sleep(ms: number): Promise<void> {

@@ -1,5 +1,5 @@
 // main.ts
-import { Plugin, TFile, normalizePath, App, Notice, Menu, FuzzySuggestModal, debounce } from 'obsidian';
+import { Plugin, TFile, normalizePath, App, Notice, Menu, FuzzySuggestModal, debounce, Platform, Modal } from 'obsidian';
 import OpenRouterSettingsTab from './settings';
 import { OpenRouterTranslatorSettings, DEFAULT_SETTINGS } from './types';
 
@@ -11,12 +11,14 @@ import { TextProcessor } from './processing';
 import { TranslateMultiplePagesModal } from './modal';
 import { RegionReprocessor } from './reprocessor';
 import { RetranslateUsingOverlaysModal } from './modal-retranslate';
-import { 
-    showLayoutSettingsModal, 
-    LayoutSettings, 
-    defaultLayoutSettings, 
-    PresetManager, 
-    Preset 
+import { PdfExportService } from './pdf-export';
+import { LayoutParserDebugModule } from './layout-parser-debug';
+import {
+    showLayoutSettingsModal,
+    LayoutSettings,
+    defaultLayoutSettings,
+    PresetManager,
+    Preset
 } from './layout-modal';
 
 export default class OpenRouterTranslatorPlugin extends Plugin {
@@ -26,6 +28,8 @@ export default class OpenRouterTranslatorPlugin extends Plugin {
     overlay: OverlayRenderer;
     translation: TranslationEngine;
     processor: TextProcessor;
+    layoutParserDebug: LayoutParserDebugModule;
+    pdfExport: PdfExportService | null = null; // Nullable for mobile
 
     // Fast lookup: PDF path → .translations.md file path
     public pdfToMdMap: Map<string, string> = new Map();
@@ -61,6 +65,17 @@ export default class OpenRouterTranslatorPlugin extends Plugin {
         this.overlay = new OverlayRenderer(this);
         this.processor = new TextProcessor(this);
         this.storage = new TranslationStorage(this);
+        this.layoutParserDebug = new LayoutParserDebugModule(this);
+        
+        // Only initialize PDF export on desktop platforms
+        if (Platform.isDesktop && !Platform.isMobile) {
+            try {
+                this.pdfExport = new PdfExportService(this);
+            } catch (error) {
+                console.error('[PDF Export] Failed to initialize:', error);
+                this.pdfExport = null;
+            }
+        }
 
         // ======= Initialization for Cold and Warm Starts =======
 
@@ -75,6 +90,7 @@ export default class OpenRouterTranslatorPlugin extends Plugin {
             if (activeLeaf && activeLeaf.view.getViewType() === 'pdf') {
                 this.overlay.setupPDFMonitoring(activeLeaf);
                 await this.refreshAffectedOverlays();
+                await this.layoutParserDebug.onActiveLeafChange(activeLeaf);
             }
         });
 
@@ -143,6 +159,20 @@ export default class OpenRouterTranslatorPlugin extends Plugin {
         });
 
         this.addCommand({
+            id: 'clean-unused-translations',
+            name: 'Clean unused translation files...',
+            callback: async () => {
+                new Notice('Scanning for orphaned translations...');
+                const orphans = await this.storage.findOrphanedTranslations();
+                if (orphans.length === 0) {
+                    new Notice('No unused translation files found.');
+                    return;
+                }
+                new CleanTranslationsModal(this.app, this, orphans).open();
+            }
+        });
+
+        this.addCommand({
             id: 'translate-multiple-pages',
             name: 'Translate multiple pages...',
             callback: async () => {
@@ -205,21 +235,24 @@ export default class OpenRouterTranslatorPlugin extends Plugin {
         });
 
         this.addCommand({
-            id: 'delete-pdf-overlay',
-            name: 'Delete current PDF overlay',
-            callback: () => this.storage.deleteCurrentOverlay(),
+            id: 'clear-pdf-overlay',
+            name: 'Clear current PDF overlay',
+            callback: () => this.overlay.clearCurrentOverlay(),
         });
 
         this.addCommand({
-            id: 'toggle-pdf-overlay',
-            name: 'Toggle PDF overlay visibility',
-            callback: () => this.overlay.toggleOverlayVisibility(),
+            id: 'reprocess-text-region',
+            name: 'Reprocess/retranslate a text region...',
+            callback: async () => {
+                const reprocessor = new RegionReprocessor(this);
+                reprocessor.start();
+            }
         });
 
         this.addCommand({
             id: 'retranslate-using-overlays',
-            name: 'Re-translate using saved overlay boxes…',
-            callback: async () => {
+            name: 'Retranslate using saved overlay layout...',
+            callback: () => {
                 const file = this.app.workspace.getActiveFile();
                 if (file && file.extension === 'pdf') {
                     new RetranslateUsingOverlaysModal(this.app, this, file).open();
@@ -230,16 +263,49 @@ export default class OpenRouterTranslatorPlugin extends Plugin {
         });
 
         this.addCommand({
-            id: 'retranslate-region-fast',
-            name: 'Re-translate region by dragging (fast)',
-            callback: () => new RegionReprocessor(this).start(),
+            id: 'toggle-pdf-overlay',
+            name: 'Toggle PDF overlay visibility',
+            callback: () => this.overlay.toggleOverlayVisibility(),
         });
 
-        // ======= PDF Monitoring =======
+        this.addCommand({
+            id: 'toggle-bbox-edit-mode',
+            name: 'Toggle BBox Edit Mode',
+            callback: async () => {
+                this.settings.bboxEditMode = !this.settings.bboxEditMode;
+                await this.saveSettings();
+                new Notice(`BBox Edit Mode ${this.settings.bboxEditMode ? 'enabled' : 'disabled'}.`);
+            }
+        });
+
+        this.addCommand({
+            id: 'toggle-layout-parser-debug-mode',
+            name: 'Toggle Layout Parser Debug Mode',
+            callback: async () => {
+                await this.layoutParserDebug.toggleMode();
+            }
+        });
+
+        // ======= PDF Export Command (Desktop Only) =======
+
+        if (this.pdfExport) {
+            this.addCommand({
+                id: 'export-full-pdf',
+                name: 'Export PDF with translations',
+                callback: () => this.pdfExport?.exportFullPdf()
+            });
+        }
+
+        // ======= Event Listeners =======
 
         this.registerEvent(this.app.workspace.on('active-leaf-change', (leaf) => {
             if (leaf && leaf.view.getViewType() === 'pdf') {
-                setTimeout(() => this.overlay.setupPDFMonitoring(leaf), 300);
+                setTimeout(() => {
+                    this.overlay.setupPDFMonitoring(leaf);
+                    void this.layoutParserDebug.onActiveLeafChange(leaf);
+                }, 300);
+            } else {
+                void this.layoutParserDebug.onActiveLeafChange(leaf);
             }
         }));
 
@@ -364,7 +430,23 @@ export default class OpenRouterTranslatorPlugin extends Plugin {
     
     async loadSettings() {
         const data = await this.loadData() || {};
-        this.settings = { ...DEFAULT_SETTINGS, ...data.settings || {} };
+        const savedSettings = data.settings || {};
+        const savedProviderSettings = savedSettings.providerSettings || {};
+        this.settings = {
+            ...DEFAULT_SETTINGS,
+            ...savedSettings,
+            providerSettings: {
+                openrouter: { ...DEFAULT_SETTINGS.providerSettings.openrouter, ...(savedProviderSettings.openrouter || {}) },
+                ollama: { ...DEFAULT_SETTINGS.providerSettings.ollama, ...(savedProviderSettings.ollama || {}) },
+                openai: { ...DEFAULT_SETTINGS.providerSettings.openai, ...(savedProviderSettings.openai || {}) },
+                gemini: { ...DEFAULT_SETTINGS.providerSettings.gemini, ...(savedProviderSettings.gemini || {}) },
+                custom: { ...DEFAULT_SETTINGS.providerSettings.custom, ...(savedProviderSettings.custom || {}) },
+            },
+            ocrProvider: {
+                ...DEFAULT_SETTINGS.ocrProvider,
+                ...(savedSettings.ocrProvider || {})
+            }
+        };
         this.layoutSettings = { ...defaultLayoutSettings, ...data.layoutSettings || {} };
 
         if (this.settings.storageLocation) {
@@ -406,6 +488,7 @@ export default class OpenRouterTranslatorPlugin extends Plugin {
 
     onunload() {
         console.log('🧩 OpenRouter PDF Translator plugin unloaded');
+        this.layoutParserDebug?.cleanup();
         this.overlay.cleanup();
         this.clearAllOverlays();
         this.pdfToMdMap.clear();
@@ -445,5 +528,141 @@ export class PresetFuzzyModal extends FuzzySuggestModal<Preset> {
 
     onChooseItem(preset: Preset, evt: MouseEvent | KeyboardEvent): void {
         this.plugin.activateLayoutSettings(preset.settings, preset.name);
+    }
+}
+
+/**
+ * Modal that displays orphaned translation files (ones whose PDF no longer exists)
+ * and allows the user to selectively delete them.
+ */
+export class CleanTranslationsModal extends Modal {
+    private plugin: OpenRouterTranslatorPlugin;
+    private orphans: Array<{ mdFile: TFile; pdfSource: string }>;
+
+    constructor(
+        app: App,
+        plugin: OpenRouterTranslatorPlugin,
+        orphans: Array<{ mdFile: TFile; pdfSource: string }>
+    ) {
+        super(app);
+        this.plugin = plugin;
+        this.orphans = orphans;
+    }
+
+    onOpen() {
+        const { contentEl } = this;
+        contentEl.empty();
+
+        contentEl.createEl('h2', { text: 'Clean Unused Translation Files' });
+
+        contentEl.createEl('p', {
+            text: `Found ${this.orphans.length} translation file(s) whose source PDF no longer exists in the vault. Select the files you want to delete.`
+        });
+
+        const checkboxes: HTMLInputElement[] = [];
+
+        // Build the list of orphaned files with checkboxes
+        const listContainer = contentEl.createEl('div', {
+            cls: 'clean-translations-list',
+            attr: { style: 'max-height: 400px; overflow-y: auto; margin-bottom: 12px;' }
+        });
+
+        for (const orphan of this.orphans) {
+            const itemEl = listContainer.createEl('div', {
+                attr: {
+                    style: 'display: flex; align-items: flex-start; gap: 8px; padding: 6px 4px; border-bottom: 1px solid var(--background-modifier-border);'
+                }
+            });
+
+            const checkbox = itemEl.createEl('input', { type: 'checkbox' });
+            checkbox.checked = true;
+            checkbox.style.marginTop = '4px';
+            checkboxes.push(checkbox);
+
+            const labelEl = itemEl.createEl('div');
+
+            const mdName = orphan.mdFile.name.replace('.translations.md', '');
+            labelEl.createEl('strong', { text: mdName });
+
+            labelEl.createEl('br');
+            labelEl.createEl('small', {
+                text: `Translation file: ${orphan.mdFile.path}`,
+                attr: { style: 'color: var(--text-muted);' }
+            });
+            labelEl.createEl('br');
+            labelEl.createEl('small', {
+                text: `Missing PDF: ${orphan.pdfSource}`,
+                attr: { style: 'color: var(--text-error);' }
+            });
+        }
+
+        // Select All / Deselect All buttons
+        const toggleBar = contentEl.createEl('div', {
+            attr: { style: 'display: flex; gap: 8px; margin-bottom: 16px;' }
+        });
+
+        const selectAllBtn = toggleBar.createEl('button', { text: 'Select All' });
+        const deselectAllBtn = toggleBar.createEl('button', { text: 'Deselect All' });
+
+        selectAllBtn.onclick = () => checkboxes.forEach(cb => (cb.checked = true));
+        deselectAllBtn.onclick = () => checkboxes.forEach(cb => (cb.checked = false));
+
+        // Action buttons
+        const actionBar = contentEl.createEl('div', {
+            attr: { style: 'display: flex; gap: 8px; justify-content: flex-end;' }
+        });
+
+        const cancelBtn = actionBar.createEl('button', { text: 'Cancel' });
+        cancelBtn.onclick = () => this.close();
+
+        const deleteBtn = actionBar.createEl('button', {
+            text: 'Delete Selected',
+            cls: 'mod-warning'
+        });
+
+        deleteBtn.onclick = async () => {
+            const toDelete = this.orphans.filter((_, i) => checkboxes[i].checked);
+            if (toDelete.length === 0) {
+                new Notice('No files selected for deletion.');
+                return;
+            }
+
+            // Disable buttons to prevent double-click
+            deleteBtn.disabled = true;
+            cancelBtn.disabled = true;
+            deleteBtn.textContent = 'Deleting...';
+
+            let deleted = 0;
+            let errors = 0;
+
+            for (const orphan of toDelete) {
+                try {
+                    await this.app.vault.trash(orphan.mdFile, true);
+                    // Remove any stale entry from the map
+                    const mapEntry = [...this.plugin.pdfToMdMap.entries()].find(
+                        ([_, md]) => md === orphan.mdFile.path
+                    );
+                    if (mapEntry) {
+                        this.plugin.pdfToMdMap.delete(mapEntry[0]);
+                    }
+                    deleted++;
+                } catch (e) {
+                    console.error('PDF Translator: Failed to delete translation file:', orphan.mdFile.path, e);
+                    errors++;
+                }
+            }
+
+            const msg = errors > 0
+                ? `Deleted ${deleted} file(s), ${errors} error(s).`
+                : `Deleted ${deleted} unused translation file(s).`;
+            new Notice(msg);
+
+            this.close();
+        };
+    }
+
+    onClose() {
+        const { contentEl } = this;
+        contentEl.empty();
     }
 }

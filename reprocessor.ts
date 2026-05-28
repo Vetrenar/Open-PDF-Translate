@@ -287,7 +287,6 @@ export class RegionReprocessor {
                 // fontSize is often derived from originalFontSizes or not strictly needed if originalFontSizes is present
                 // If you still want to store it, store the base size:
                 fontSize: baseAvgFontSize,
-                id: `reproc-${Date.now()}-${i}`, // Unique ID for the item
             });
         }
 

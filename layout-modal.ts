@@ -2,11 +2,13 @@
 
 // Configuration settings for LayoutDetector magical numbers and constants.
 export interface LayoutSettings {
+  /** If true, runs multiple layout mode profiles and picks the best regional fit (default: true) */
+  useModeEnsemble: boolean;
   /** Multiplier for line height calculations (default: 1.6) */
   lineHeightMultiplier: number;
-  /** Minimum confidence for vertical strips (default: 0.7) */
+  /** Minimum confidence for vertical strips (default: 0.62) */
   minStripConfidence: number;
-  /** Minimum width in pixels for vertical strips (default: 4) */
+  /** Minimum width in pixels for vertical strips (default: 3) */
   minStripWidthPx: number;
   /** Enable debug validation logging (default: false) */
   debugValidation: boolean;
@@ -40,6 +42,82 @@ export interface LayoutSettings {
   columnThresholdLineHeightMultiplier: number;
   /** Fallback pixel value for column threshold if line height is unavailable (default: 20) */
   columnThresholdFallback: number;
+  /** GapDetector: max number of columns produced from vertical boundaries (default: 6) */
+  gapMaxColumns: number;
+  /** GapDetector: minimum horizontal whitespace width considered as a gap (default: 3) */
+  gapMinGapWidthPx: number;
+  /** GapDetector: y-band step factor relative to line-height (default: 0.6) */
+  gapBandStepFactor: number;
+  /** GapDetector: minimum strip height factor relative to line-height (default: 2.0) */
+  gapMinStripHeightFactor: number;
+  /** GapDetector: x-cluster tolerance factor relative to line-height (default: 0.45) */
+  gapCenterXTolFactor: number;
+  /** Vertical separator: x-bin width in px for occupancy voting (default: 3) */
+  verticalSeparatorBinPx: number;
+  /** Vertical separator: min clear-ratio per x-bin across content bands (default: 0.72) */
+  verticalSeparatorMinClearRatio: number;
+  /** Vertical separator: min content-band coverage of a candidate separator (default: 0.58) */
+  verticalSeparatorMinBandCoverage: number;
+  /** Vertical separator: min separator width as line-height multiplier (default: 0.6) */
+  verticalSeparatorMinWidthLineHeightMultiplier: number;
+  /** Vertical separator: edge margin as line-height multiplier (default: 0.8) */
+  verticalSeparatorEdgeMarginLineHeightMultiplier: number;
+  /** Vertical separator: max short hole size (in bins) merged inside a separator (default: 1) */
+  verticalSeparatorMergeGapBins: number;
+  /** GridDetector: min horizontal gap as line-height multiplier (default: 1.5) */
+  gridMinHorizontalGapLineHeightMultiplier: number;
+  /** GridDetector: min vertical gap as line-height multiplier (default: 0.8) */
+  gridMinVerticalGapLineHeightMultiplier: number;
+  /** GridDetector: edge margin as line-height multiplier (default: 0.75) */
+  gridEdgeMarginLineHeightMultiplier: number;
+  /** GridDetector: number of strongest vertical gaps to keep (default: 8) */
+  gridMaxVerticalGaps: number;
+  /** GridDetector: smoothing radius for projection profiles (default: 3) */
+  gridSmoothRadius: number;
+  /** GridDetector: absolute occupancy threshold for empty bins (default: 1) */
+  gridProjectionProfileThreshold: number;
+
+  // --- Multi-profile selector tuning ---
+  /** Column profile score gain multiplier (default: 1.75) */
+  profileColumnSpanScoreWeight: number;
+  /** Minimum cost advantage for column profile over flow (default: 0.35) */
+  profileColumnWinMargin: number;
+  /** Minimum spans for table profile consideration (default: 8) */
+  profileTableMinParagraphSpans: number;
+  /** Row grouping tolerance multiplier for table profile (default: 0.55) */
+  profileTableRowTolMultiplier: number;
+  /** Absolute minimum horizontal gap (px) when inferring table boundaries (default: 14) */
+  profileTableMinGapPx: number;
+  /** Line-height-based minimum gap multiplier for table boundaries (default: 1.2) */
+  profileTableMinGapLineHeightMultiplier: number;
+  /** Median-span-width-based minimum gap multiplier for table boundaries (default: 1.15) */
+  profileTableMinGapMedianWidthMultiplier: number;
+  /** Minimum rows required for strong table classification (default: 3) */
+  profileTableMinRows: number;
+  /** Minimum distinct columns required for strong table classification (default: 2) */
+  profileTableMinDistinctCols: number;
+  /** Minimum multi-cell row ratio for strong table classification (default: 0.66) */
+  profileTableMinMultiCellRowRatio: number;
+  /** Minimum average cells per row for strong table classification (default: 2.0) */
+  profileTableMinAvgCellsPerRow: number;
+  /** Maximum fragmentation ratio allowed for table profile (default: 0.65) */
+  profileTableMaxFragmentationRatio: number;
+  /** Boundary clustering tolerance as line-height multiplier (default: 0.45) */
+  profileTableBoundaryTolMultiplier: number;
+  /** Minimum repeats per boundary cluster (absolute floor) (default: 2) */
+  profileTableBoundaryMinRepeatsAbs: number;
+  /** Minimum repeats per boundary cluster as row fraction (default: 0.4) */
+  profileTableBoundaryMinRepeatsRowFrac: number;
+  /** Region classifier: minimum density ratio for table region (default: 0.7) */
+  profileRegionTableDensityRatioMin: number;
+  /** Region classifier: minimum occupancy for table region (default: 0.05) */
+  profileRegionTableOccupancyMin: number;
+  /** Region classifier: minimum density ratio for columns region (default: 0.65) */
+  profileRegionColumnsDensityRatioMin: number;
+  /** Cost bias for regions classified as columns (default: -0.35) */
+  profileRegionColumnsCostBias: number;
+  /** Cost bias for regions classified as flow (default: 0.45) */
+  profileRegionFlowCostBias: number;
 
   // --- Settings potentially used by ParagraphMerger ---
   
@@ -50,9 +128,9 @@ export interface LayoutSettings {
    */
   pmForceLinearMerge: boolean;
 
-  /** Minimum confidence for vertical strips used in ParagraphMerger (default: 0.7) */
+  /** Minimum confidence for vertical strips used in ParagraphMerger (default: 0.58) */
   pmMinStripConfidenceSplit: number;
-  /** Minimum width in pixels for vertical strips used in ParagraphMerger (default: 6) */
+  /** Minimum width in pixels for vertical strips used in ParagraphMerger (default: 4) */
   pmMinStripWidthPx: number;
   /** Minimum vertical overlap fraction required for spans to be considered in the same column (default: 0.6) */
   pmMinStripOverlapFrac: number;
@@ -66,29 +144,29 @@ export interface LayoutSettings {
   pmInitialMergeKernTolMath: number;
   /** Tolerance multiplier for hyphenation continuation (default: 1.8) */
   pmHyphenContinuationTol: number;
-  /** Tolerance multiplier for left/right alignment in initial merge (non-math) (default: 2.0) */
+  /** Tolerance multiplier for left/right alignment in initial merge (non-math) (default: 1.8) */
   pmInitialMergeAlignTolNonMath: number;
-  /** Tolerance multiplier for left/right alignment in initial merge (math) (default: 2.0) */
+  /** Tolerance multiplier for left/right alignment in initial merge (math) (default: 1.8) */
   pmInitialMergeAlignTolMath: number;
-  /** Vertical gap multiplier relative to line height in initial merge (default: 1.3) */
+  /** Vertical gap multiplier relative to line height in initial merge (default: 1.15) */
   pmInitialMergeVerticalGapMultiplier: number;
-  /** Maximum vertical gap as a multiplier of font size in initial merge (default: 2.2) */
+  /** Maximum vertical gap as a multiplier of font size in initial merge (default: 1.95) */
   pmInitialMergeVerticalGapMaxMultiplier: number;
-  /** Tolerance multiplier for left/right alignment in stacked merge (default: 2.0) */
+  /** Tolerance multiplier for left/right alignment in stacked merge (default: 1.6) */
   pmStackedMergeAlignTol: number;
-  /** Horizontal overlap fraction threshold for strong overlap in stacked merge (default: 0.25) */
+  /** Horizontal overlap fraction threshold for strong overlap in stacked merge (default: 0.35) */
   pmStackedMergeOverlapFrac: number;
-  /** Vertical gap multiplier relative to line height in stacked merge (default: 1.35) */
+  /** Vertical gap multiplier relative to line height in stacked merge (default: 1.05) */
   pmStackedMergeVerticalGapMultiplier: number;
-  /** Maximum vertical gap as a multiplier of max font size in stacked merge (default: 2.0) */
+  /** Maximum vertical gap as a multiplier of max font size in stacked merge (default: 1.5) */
   pmStackedMergeVerticalGapMaxMultiplier: number;
-  /** Tolerance multiplier for left/right alignment in general merge (default: 2.0) */
+  /** Tolerance multiplier for left/right alignment in general merge (default: 1.6) */
   pmGeneralMergeAlignTol: number;
-  /** Horizontal overlap fraction threshold for strong overlap in general merge (default: 0.25) */
+  /** Horizontal overlap fraction threshold for strong overlap in general merge (default: 0.35) */
   pmGeneralMergeOverlapFrac: number;
-  /** Vertical gap multiplier relative to line height in general merge (default: 1.35) */
+  /** Vertical gap multiplier relative to line height in general merge (default: 1.05) */
   pmGeneralMergeVerticalGapMultiplier: number;
-  /** Maximum vertical gap as a multiplier of max font size in general merge (default: 2.0) */
+  /** Maximum vertical gap as a multiplier of max font size in general merge (default: 1.5) */
   pmGeneralMergeVerticalGapMaxMultiplier: number;
   /** Overlap fraction threshold for strong overlap in nested merge (default: 0.7) */
   pmNestedMergeOverlapFrac: number;
@@ -108,7 +186,7 @@ export interface LayoutSettings {
   pmInlineSpanMaxWeightDiff: number;
   /** Whether to allow merging of spans with different font styles. (default: true) */
   pmInlineSpanAllowMixedStyle: boolean;
-  /** Coverage ratio threshold for determining if strips separate columns (default: 0.65) */
+  /** Coverage ratio threshold for determining if strips separate columns (default: 0.45) */
   pmSameColumnCoverageRatio: number;
   /** Baseline proximity tolerance multiplier for math merge candidate (default: 2.0) */
   pmMathMergeBaselineTol: number;
@@ -136,9 +214,10 @@ export interface Preset {
 }
 
 export const defaultLayoutSettings: LayoutSettings = {
+  useModeEnsemble: true,
   lineHeightMultiplier: 1.6,
-  minStripConfidence: 0.7,
-  minStripWidthPx: 4,
+  minStripConfidence: 0.62,
+  minStripWidthPx: 3,
   debugValidation: false,
   maxIterMerges: 10,
   minBandConfidence: 0.6,
@@ -155,30 +234,67 @@ export const defaultLayoutSettings: LayoutSettings = {
   minRegionWidth: 1,
   columnThresholdLineHeightMultiplier: 2,
   columnThresholdFallback: 20,
+  gapMaxColumns: 6,
+  gapMinGapWidthPx: 3,
+  gapBandStepFactor: 0.6,
+  gapMinStripHeightFactor: 2.0,
+  gapCenterXTolFactor: 0.45,
+  verticalSeparatorBinPx: 3,
+  verticalSeparatorMinClearRatio: 0.72,
+  verticalSeparatorMinBandCoverage: 0.58,
+  verticalSeparatorMinWidthLineHeightMultiplier: 0.6,
+  verticalSeparatorEdgeMarginLineHeightMultiplier: 0.8,
+  verticalSeparatorMergeGapBins: 1,
+  gridMinHorizontalGapLineHeightMultiplier: 1.5,
+  gridMinVerticalGapLineHeightMultiplier: 0.8,
+  gridEdgeMarginLineHeightMultiplier: 0.75,
+  gridMaxVerticalGaps: 8,
+  gridSmoothRadius: 3,
+  gridProjectionProfileThreshold: 0,
+  profileColumnSpanScoreWeight: 1.75,
+  profileColumnWinMargin: 0.35,
+  profileTableMinParagraphSpans: 8,
+  profileTableRowTolMultiplier: 0.55,
+  profileTableMinGapPx: 14,
+  profileTableMinGapLineHeightMultiplier: 1.2,
+  profileTableMinGapMedianWidthMultiplier: 1.15,
+  profileTableMinRows: 3,
+  profileTableMinDistinctCols: 2,
+  profileTableMinMultiCellRowRatio: 0.66,
+  profileTableMinAvgCellsPerRow: 2.0,
+  profileTableMaxFragmentationRatio: 0.65,
+  profileTableBoundaryTolMultiplier: 0.45,
+  profileTableBoundaryMinRepeatsAbs: 2,
+  profileTableBoundaryMinRepeatsRowFrac: 0.4,
+  profileRegionTableDensityRatioMin: 0.7,
+  profileRegionTableOccupancyMin: 0.05,
+  profileRegionColumnsDensityRatioMin: 0.65,
+  profileRegionColumnsCostBias: -0.35,
+  profileRegionFlowCostBias: 0.45,
   
   // -- Paragraph Merger Defaults --
   pmForceLinearMerge: false, // Default: Off
 
-  pmMinStripConfidenceSplit: 0.7,
-  pmMinStripWidthPx: 6,
+  pmMinStripConfidenceSplit: 0.58,
+  pmMinStripWidthPx: 4,
   pmMinStripOverlapFrac: 0.6,
   pmInitialMergeBaselineTolNonMath: 0.45,
   pmInitialMergeBaselineTolMath: 0.75,
   pmInitialMergeKernTolNonMath: 0.55,
   pmInitialMergeKernTolMath: 0.9,
   pmHyphenContinuationTol: 1.8,
-  pmInitialMergeAlignTolNonMath: 2.0,
-  pmInitialMergeAlignTolMath: 2.0,
-  pmInitialMergeVerticalGapMultiplier: 1.3,
-  pmInitialMergeVerticalGapMaxMultiplier: 2.2,
-  pmStackedMergeAlignTol: 2.0,
-  pmStackedMergeOverlapFrac: 0.25,
-  pmStackedMergeVerticalGapMultiplier: 1.35,
-  pmStackedMergeVerticalGapMaxMultiplier: 2.0,
-  pmGeneralMergeAlignTol: 2.0,
-  pmGeneralMergeOverlapFrac: 0.25,
-  pmGeneralMergeVerticalGapMultiplier: 1.35,
-  pmGeneralMergeVerticalGapMaxMultiplier: 2.0,
+  pmInitialMergeAlignTolNonMath: 1.8,
+  pmInitialMergeAlignTolMath: 1.8,
+  pmInitialMergeVerticalGapMultiplier: 1.15,
+  pmInitialMergeVerticalGapMaxMultiplier: 1.95,
+  pmStackedMergeAlignTol: 1.6,
+  pmStackedMergeOverlapFrac: 0.35,
+  pmStackedMergeVerticalGapMultiplier: 1.05,
+  pmStackedMergeVerticalGapMaxMultiplier: 1.5,
+  pmGeneralMergeAlignTol: 1.6,
+  pmGeneralMergeOverlapFrac: 0.35,
+  pmGeneralMergeVerticalGapMultiplier: 1.05,
+  pmGeneralMergeVerticalGapMaxMultiplier: 1.5,
   pmNestedMergeOverlapFrac: 0.7,
   pmStitchBaselineTolNonMath: 0.45,
   pmStitchBaselineTolMath: 0.75,
@@ -188,7 +304,7 @@ export const defaultLayoutSettings: LayoutSettings = {
   pmInlineSpanKernTol: 0.6,
   pmInlineSpanMaxWeightDiff: 300,
   pmInlineSpanAllowMixedStyle: true,
-  pmSameColumnCoverageRatio: 0.65,
+  pmSameColumnCoverageRatio: 0.45,
   pmMathMergeBaselineTol: 2.0,
   pmMathMergeHorizTol: 1.5,
   pmMathMergeCenterTol: 2.5,
@@ -200,24 +316,242 @@ export const defaultLayoutSettings: LayoutSettings = {
 
 // Storage key for presets
 const PRESETS_STORAGE_KEY = 'layoutSettingsPresets';
+const PRESETS_MIGRATION_KEY = 'layoutSettingsPresetsBuiltinV6Migrated';
+
+function buildBuiltinPresetSettings(): Array<{ id: string; name: string; settings: LayoutSettings }> {
+  const base = defaultLayoutSettings;
+  return [
+    {
+      id: 'builtin-default',
+      name: 'Default',
+      settings: { ...base, useModeEnsemble: true }
+    },
+    {
+      id: 'builtin-bbox-columns',
+      name: 'BBox Columns',
+      settings: {
+        ...base,
+        useModeEnsemble: false,
+        minStripConfidence: Math.min(base.minStripConfidence, 0.4),
+        minStripWidthPx: Math.min(base.minStripWidthPx, 2),
+        maxIterMerges: Math.min(base.maxIterMerges, 4),
+        gapMinGapWidthPx: Math.min(base.gapMinGapWidthPx, 1),
+        gapBandStepFactor: Math.min(base.gapBandStepFactor, 0.55),
+        gapMinStripHeightFactor: Math.min(base.gapMinStripHeightFactor, 1.0),
+        gapCenterXTolFactor: Math.max(base.gapCenterXTolFactor, 0.85),
+        verticalSeparatorBinPx: Math.min(base.verticalSeparatorBinPx, 2.5),
+        verticalSeparatorMinClearRatio: Math.min(base.verticalSeparatorMinClearRatio, 0.66),
+        verticalSeparatorMinBandCoverage: Math.min(base.verticalSeparatorMinBandCoverage, 0.5),
+        verticalSeparatorMinWidthLineHeightMultiplier: Math.min(base.verticalSeparatorMinWidthLineHeightMultiplier, 0.5),
+        verticalSeparatorEdgeMarginLineHeightMultiplier: Math.min(base.verticalSeparatorEdgeMarginLineHeightMultiplier, 0.7),
+        verticalSeparatorMergeGapBins: Math.max(base.verticalSeparatorMergeGapBins, 2),
+        gridMinVerticalGapLineHeightMultiplier: Math.min(base.gridMinVerticalGapLineHeightMultiplier, 0.45),
+        gridEdgeMarginLineHeightMultiplier: Math.min(base.gridEdgeMarginLineHeightMultiplier, 0.5),
+        gridProjectionProfileThreshold: Math.min(base.gridProjectionProfileThreshold, 0.45),
+        pmMinStripConfidenceSplit: Math.min(base.pmMinStripConfidenceSplit, 0.35),
+        pmMinStripWidthPx: Math.min(base.pmMinStripWidthPx, 2),
+        pmMinStripOverlapFrac: Math.min(base.pmMinStripOverlapFrac, 0.35),
+        pmGeneralMergeVerticalGapMultiplier: Math.min(base.pmGeneralMergeVerticalGapMultiplier, 0.95),
+        pmGeneralMergeVerticalGapMaxMultiplier: Math.min(base.pmGeneralMergeVerticalGapMaxMultiplier, 1.35),
+        pmStackedMergeVerticalGapMultiplier: Math.min(base.pmStackedMergeVerticalGapMultiplier, 0.95),
+        pmStackedMergeVerticalGapMaxMultiplier: Math.min(base.pmStackedMergeVerticalGapMaxMultiplier, 1.35),
+        pmSplitBoundaryDedupTol: Math.min(base.pmSplitBoundaryDedupTol, 0.16),
+        pmSplitInterWordGapTol: Math.min(base.pmSplitInterWordGapTol, 0.8),
+        pmSplitColumnGapTol: Math.min(base.pmSplitColumnGapTol, 1.55),
+        profileColumnSpanScoreWeight: Math.max(base.profileColumnSpanScoreWeight, 2.6),
+        profileColumnWinMargin: Math.min(base.profileColumnWinMargin, 0.1),
+        profileRegionColumnsDensityRatioMin: Math.min(base.profileRegionColumnsDensityRatioMin, 0.48),
+        profileRegionColumnsCostBias: Math.min(base.profileRegionColumnsCostBias, -0.75),
+        profileRegionFlowCostBias: Math.max(base.profileRegionFlowCostBias, 0.85),
+      }
+    },
+    {
+      id: 'builtin-bbox-table',
+      name: 'BBox Table',
+      settings: {
+        ...base,
+        useModeEnsemble: false,
+        minStripConfidence: Math.min(base.minStripConfidence, 0.45),
+        minStripWidthPx: Math.min(base.minStripWidthPx, 2),
+        maxIterMerges: Math.min(base.maxIterMerges, 5),
+        gapMinGapWidthPx: Math.min(base.gapMinGapWidthPx, 1),
+        gapBandStepFactor: Math.min(base.gapBandStepFactor, 0.55),
+        gapMinStripHeightFactor: Math.min(base.gapMinStripHeightFactor, 1.0),
+        gapCenterXTolFactor: Math.max(base.gapCenterXTolFactor, 0.7),
+        verticalSeparatorBinPx: Math.min(base.verticalSeparatorBinPx, 2.5),
+        verticalSeparatorMinClearRatio: Math.min(base.verticalSeparatorMinClearRatio, 0.68),
+        verticalSeparatorMinBandCoverage: Math.min(base.verticalSeparatorMinBandCoverage, 0.52),
+        verticalSeparatorMinWidthLineHeightMultiplier: Math.min(base.verticalSeparatorMinWidthLineHeightMultiplier, 0.52),
+        verticalSeparatorEdgeMarginLineHeightMultiplier: Math.min(base.verticalSeparatorEdgeMarginLineHeightMultiplier, 0.72),
+        verticalSeparatorMergeGapBins: Math.max(base.verticalSeparatorMergeGapBins, 2),
+        gridMinHorizontalGapLineHeightMultiplier: Math.min(base.gridMinHorizontalGapLineHeightMultiplier, 1.0),
+        gridMinVerticalGapLineHeightMultiplier: Math.min(base.gridMinVerticalGapLineHeightMultiplier, 0.5),
+        gridProjectionProfileThreshold: Math.min(base.gridProjectionProfileThreshold, 0.5),
+        pmMinStripConfidenceSplit: Math.min(base.pmMinStripConfidenceSplit, 0.45),
+        pmMinStripWidthPx: Math.min(base.pmMinStripWidthPx, 2),
+        pmMinStripOverlapFrac: Math.min(base.pmMinStripOverlapFrac, 0.4),
+        pmGeneralMergeVerticalGapMultiplier: Math.min(base.pmGeneralMergeVerticalGapMultiplier, 1.0),
+        pmGeneralMergeVerticalGapMaxMultiplier: Math.min(base.pmGeneralMergeVerticalGapMaxMultiplier, 1.4),
+        pmStackedMergeVerticalGapMultiplier: Math.min(base.pmStackedMergeVerticalGapMultiplier, 1.0),
+        pmStackedMergeVerticalGapMaxMultiplier: Math.min(base.pmStackedMergeVerticalGapMaxMultiplier, 1.4),
+        pmSplitBoundaryDedupTol: Math.min(base.pmSplitBoundaryDedupTol, 0.15),
+        pmSplitInterWordGapTol: Math.min(base.pmSplitInterWordGapTol, 0.75),
+        pmSplitColumnGapTol: Math.min(base.pmSplitColumnGapTol, 1.6),
+        profileTableMinParagraphSpans: Math.min(base.profileTableMinParagraphSpans, 6),
+        profileTableMinRows: Math.min(base.profileTableMinRows, 2),
+        profileTableMinDistinctCols: Math.min(base.profileTableMinDistinctCols, 2),
+        profileTableMinMultiCellRowRatio: Math.min(base.profileTableMinMultiCellRowRatio, 0.5),
+        profileTableMinAvgCellsPerRow: Math.min(base.profileTableMinAvgCellsPerRow, 1.7),
+        profileTableBoundaryMinRepeatsAbs: Math.min(base.profileTableBoundaryMinRepeatsAbs, 1),
+        profileTableBoundaryMinRepeatsRowFrac: Math.min(base.profileTableBoundaryMinRepeatsRowFrac, 0.3),
+        profileRegionTableDensityRatioMin: Math.min(base.profileRegionTableDensityRatioMin, 0.55),
+        profileRegionTableOccupancyMin: Math.min(base.profileRegionTableOccupancyMin, 0.03),
+      }
+    },
+    {
+      id: 'builtin-bbox-paragraphs',
+      name: 'BBox Paragraphs',
+      settings: {
+        ...base,
+        useModeEnsemble: false,
+        minStripConfidence: Math.min(base.minStripConfidence, 0.5),
+        minStripWidthPx: Math.min(base.minStripWidthPx, 2.5),
+        maxIterMerges: Math.min(base.maxIterMerges, 6),
+        gapMinGapWidthPx: Math.min(base.gapMinGapWidthPx, 1.2),
+        gapBandStepFactor: Math.min(base.gapBandStepFactor, 0.6),
+        gapMinStripHeightFactor: Math.min(base.gapMinStripHeightFactor, 1.1),
+        verticalSeparatorBinPx: Math.min(base.verticalSeparatorBinPx, 3),
+        verticalSeparatorMinClearRatio: Math.min(base.verticalSeparatorMinClearRatio, 0.72),
+        verticalSeparatorMinBandCoverage: Math.min(base.verticalSeparatorMinBandCoverage, 0.56),
+        verticalSeparatorMergeGapBins: Math.max(base.verticalSeparatorMergeGapBins, 1),
+        gridMinHorizontalGapLineHeightMultiplier: Math.min(base.gridMinHorizontalGapLineHeightMultiplier, 1.1),
+        gridMinVerticalGapLineHeightMultiplier: Math.min(base.gridMinVerticalGapLineHeightMultiplier, 0.55),
+        gridProjectionProfileThreshold: Math.min(base.gridProjectionProfileThreshold, 0.6),
+        pmMinStripConfidenceSplit: Math.min(base.pmMinStripConfidenceSplit, 0.5),
+        pmMinStripWidthPx: Math.min(base.pmMinStripWidthPx, 2),
+        pmGeneralMergeVerticalGapMultiplier: Math.min(base.pmGeneralMergeVerticalGapMultiplier, 0.95),
+        pmGeneralMergeVerticalGapMaxMultiplier: Math.min(base.pmGeneralMergeVerticalGapMaxMultiplier, 1.5),
+        pmStackedMergeVerticalGapMultiplier: Math.min(base.pmStackedMergeVerticalGapMultiplier, 0.95),
+        pmStackedMergeVerticalGapMaxMultiplier: Math.min(base.pmStackedMergeVerticalGapMaxMultiplier, 1.5),
+        pmSplitBoundaryDedupTol: Math.min(base.pmSplitBoundaryDedupTol, 0.18),
+        pmSplitInterWordGapTol: Math.min(base.pmSplitInterWordGapTol, 0.85),
+        pmSplitColumnGapTol: Math.min(base.pmSplitColumnGapTol, 1.8),
+        profileRegionFlowCostBias: Math.min(base.profileRegionFlowCostBias, 0.05),
+      }
+    },
+    {
+      id: 'builtin-bbox-split',
+      name: 'BBox Split',
+      settings: {
+        ...base,
+        useModeEnsemble: false,
+        minStripConfidence: Math.min(base.minStripConfidence, 0.3),
+        minStripWidthPx: Math.min(base.minStripWidthPx, 1),
+        maxIterMerges: Math.min(base.maxIterMerges, 1),
+        gapMinGapWidthPx: Math.min(base.gapMinGapWidthPx, 1),
+        gapBandStepFactor: Math.min(base.gapBandStepFactor, 0.45),
+        gapMinStripHeightFactor: Math.min(base.gapMinStripHeightFactor, 0.75),
+        gapCenterXTolFactor: Math.max(base.gapCenterXTolFactor, 0.9),
+        verticalSeparatorBinPx: Math.min(base.verticalSeparatorBinPx, 2),
+        verticalSeparatorMinClearRatio: Math.min(base.verticalSeparatorMinClearRatio, 0.62),
+        verticalSeparatorMinBandCoverage: Math.min(base.verticalSeparatorMinBandCoverage, 0.45),
+        verticalSeparatorMinWidthLineHeightMultiplier: Math.min(base.verticalSeparatorMinWidthLineHeightMultiplier, 0.45),
+        verticalSeparatorEdgeMarginLineHeightMultiplier: Math.min(base.verticalSeparatorEdgeMarginLineHeightMultiplier, 0.65),
+        verticalSeparatorMergeGapBins: Math.max(base.verticalSeparatorMergeGapBins, 2),
+        gridMinHorizontalGapLineHeightMultiplier: Math.min(base.gridMinHorizontalGapLineHeightMultiplier, 0.75),
+        gridMinVerticalGapLineHeightMultiplier: Math.min(base.gridMinVerticalGapLineHeightMultiplier, 0.35),
+        gridEdgeMarginLineHeightMultiplier: Math.min(base.gridEdgeMarginLineHeightMultiplier, 0.45),
+        gridProjectionProfileThreshold: Math.min(base.gridProjectionProfileThreshold, 0.35),
+        pmMinStripConfidenceSplit: Math.min(base.pmMinStripConfidenceSplit, 0.25),
+        pmMinStripWidthPx: Math.min(base.pmMinStripWidthPx, 1),
+        pmMinStripOverlapFrac: Math.min(base.pmMinStripOverlapFrac, 0.2),
+        pmGeneralMergeVerticalGapMultiplier: Math.min(base.pmGeneralMergeVerticalGapMultiplier, 0.7),
+        pmGeneralMergeVerticalGapMaxMultiplier: Math.min(base.pmGeneralMergeVerticalGapMaxMultiplier, 1.0),
+        pmStackedMergeVerticalGapMultiplier: Math.min(base.pmStackedMergeVerticalGapMultiplier, 0.7),
+        pmStackedMergeVerticalGapMaxMultiplier: Math.min(base.pmStackedMergeVerticalGapMaxMultiplier, 1.0),
+        pmSplitBoundaryDedupTol: Math.min(base.pmSplitBoundaryDedupTol, 0.06),
+        pmSplitInterWordGapTol: Math.min(base.pmSplitInterWordGapTol, 0.5),
+        pmSplitColumnGapTol: Math.min(base.pmSplitColumnGapTol, 1.05),
+        profileTableMaxFragmentationRatio: Math.max(base.profileTableMaxFragmentationRatio, 0.98),
+      }
+    },
+    {
+      id: 'builtin-bbox-block',
+      name: 'BBox Block',
+      settings: {
+        ...base,
+        useModeEnsemble: false,
+        pmForceLinearMerge: true,
+        minStripConfidence: Math.max(base.minStripConfidence, 0.75),
+        pmMinStripConfidenceSplit: Math.max(base.pmMinStripConfidenceSplit, 0.75),
+        maxIterMerges: Math.max(base.maxIterMerges, 12),
+        pmGeneralMergeVerticalGapMultiplier: Math.max(base.pmGeneralMergeVerticalGapMultiplier, 1.6),
+        pmGeneralMergeVerticalGapMaxMultiplier: Math.max(base.pmGeneralMergeVerticalGapMaxMultiplier, 2.8),
+        profileRegionFlowCostBias: Math.min(base.profileRegionFlowCostBias, -0.25),
+      }
+    }
+  ];
+}
+
+function getBuiltinPresets(): Preset[] {
+  const ts = new Date('2026-02-19T00:00:00.000Z');
+  return buildBuiltinPresetSettings().map(p => ({
+    id: p.id,
+    name: p.name,
+    settings: p.settings,
+    createdAt: ts,
+    updatedAt: ts
+  }));
+}
 
 /**
  * Manages presets in localStorage
  */
 export class PresetManager {
+  private static normalizePresetDates(presets: any[]): Preset[] {
+    return presets.map((preset: any) => ({
+      ...preset,
+      createdAt: new Date(preset.createdAt),
+      updatedAt: new Date(preset.updatedAt)
+    }));
+  }
+
+  private static runBuiltinMigration(presets: Preset[]): Preset[] {
+    const migrated = localStorage.getItem(PRESETS_MIGRATION_KEY) === 'true';
+    if (migrated) return presets;
+
+    const builtins = getBuiltinPresets();
+    const byId = new Map<string, number>(presets.map((p, idx) => [p.id, idx]));
+    for (const b of builtins) {
+      const idx = byId.get(b.id);
+      if (idx === undefined) {
+        presets.push(b);
+      } else {
+        presets[idx] = b;
+      }
+    }
+
+    localStorage.setItem(PRESETS_STORAGE_KEY, JSON.stringify(presets));
+    localStorage.setItem(PRESETS_MIGRATION_KEY, 'true');
+    return presets;
+  }
+
   static getAllPresets(): Preset[] {
     try {
       const stored = localStorage.getItem(PRESETS_STORAGE_KEY);
-      if (!stored) return [];
-      const presets = JSON.parse(stored);
-      return presets.map((preset: any) => ({
-        ...preset,
-        createdAt: new Date(preset.createdAt),
-        updatedAt: new Date(preset.updatedAt)
-      }));
+      if (!stored) {
+        const seeded = getBuiltinPresets();
+        localStorage.setItem(PRESETS_STORAGE_KEY, JSON.stringify(seeded));
+        localStorage.setItem(PRESETS_MIGRATION_KEY, 'true');
+        return seeded;
+      }
+
+      const parsed = JSON.parse(stored);
+      const presets = this.normalizePresetDates(Array.isArray(parsed) ? parsed : []);
+      return this.runBuiltinMigration(presets);
     } catch (error) {
       console.error('Error loading presets:', error);
-      return [];
+      return getBuiltinPresets();
     }
   }
 
@@ -622,6 +956,7 @@ export function showLayoutSettingsModal(
   };
 
   // General / Band Settings
+  addInput('useModeEnsemble', 'Use Multi-Mode Ensemble', 'checkbox');
   addInput('lineHeightMultiplier', 'Line Height Multiplier');
   addInput('minStripConfidence', 'Min Strip Confidence');
   addInput('minStripWidthPx', 'Min Strip Width (px)');
@@ -641,6 +976,43 @@ export function showLayoutSettingsModal(
   addInput('minRegionWidth', 'Min Region Width');
   addInput('columnThresholdLineHeightMultiplier', 'Column Threshold Line Height Multiplier');
   addInput('columnThresholdFallback', 'Column Threshold Fallback');
+  addInput('gapMaxColumns', 'Gap Max Columns');
+  addInput('gapMinGapWidthPx', 'Gap Min Gap Width Px');
+  addInput('gapBandStepFactor', 'Gap Band Step Factor');
+  addInput('gapMinStripHeightFactor', 'Gap Min Strip Height Factor');
+  addInput('gapCenterXTolFactor', 'Gap Center X Tol Factor');
+  addInput('verticalSeparatorBinPx', 'Vertical Separator Bin (px)');
+  addInput('verticalSeparatorMinClearRatio', 'Vertical Separator Min Clear Ratio');
+  addInput('verticalSeparatorMinBandCoverage', 'Vertical Separator Min Band Coverage');
+  addInput('verticalSeparatorMinWidthLineHeightMultiplier', 'Vertical Separator Min Width LH Multiplier');
+  addInput('verticalSeparatorEdgeMarginLineHeightMultiplier', 'Vertical Separator Edge Margin LH Multiplier');
+  addInput('verticalSeparatorMergeGapBins', 'Vertical Separator Merge Gap Bins');
+  addInput('gridMinHorizontalGapLineHeightMultiplier', 'Grid Min Horizontal Gap LH Multiplier');
+  addInput('gridMinVerticalGapLineHeightMultiplier', 'Grid Min Vertical Gap LH Multiplier');
+  addInput('gridEdgeMarginLineHeightMultiplier', 'Grid Edge Margin LH Multiplier');
+  addInput('gridMaxVerticalGaps', 'Grid Max Vertical Gaps');
+  addInput('gridSmoothRadius', 'Grid Smooth Radius');
+  addInput('gridProjectionProfileThreshold', 'Grid Projection Profile Threshold');
+  addInput('profileColumnSpanScoreWeight', 'Profile Column Span Score Weight');
+  addInput('profileColumnWinMargin', 'Profile Column Win Margin');
+  addInput('profileTableMinParagraphSpans', 'Profile Table Min Paragraph Spans');
+  addInput('profileTableRowTolMultiplier', 'Profile Table Row Tol Multiplier');
+  addInput('profileTableMinGapPx', 'Profile Table Min Gap Px');
+  addInput('profileTableMinGapLineHeightMultiplier', 'Profile Table Min Gap LH Multiplier');
+  addInput('profileTableMinGapMedianWidthMultiplier', 'Profile Table Min Gap Width Multiplier');
+  addInput('profileTableMinRows', 'Profile Table Min Rows');
+  addInput('profileTableMinDistinctCols', 'Profile Table Min Distinct Cols');
+  addInput('profileTableMinMultiCellRowRatio', 'Profile Table Min Multi-Cell Row Ratio');
+  addInput('profileTableMinAvgCellsPerRow', 'Profile Table Min Avg Cells Per Row');
+  addInput('profileTableMaxFragmentationRatio', 'Profile Table Max Fragmentation Ratio');
+  addInput('profileTableBoundaryTolMultiplier', 'Profile Table Boundary Tol Multiplier');
+  addInput('profileTableBoundaryMinRepeatsAbs', 'Profile Table Boundary Min Repeats Abs');
+  addInput('profileTableBoundaryMinRepeatsRowFrac', 'Profile Table Boundary Min Repeats Row Frac');
+  addInput('profileRegionTableDensityRatioMin', 'Profile Region Table Density Ratio Min');
+  addInput('profileRegionTableOccupancyMin', 'Profile Region Table Occupancy Min');
+  addInput('profileRegionColumnsDensityRatioMin', 'Profile Region Columns Density Ratio Min');
+  addInput('profileRegionColumnsCostBias', 'Profile Region Columns Cost Bias');
+  addInput('profileRegionFlowCostBias', 'Profile Region Flow Cost Bias');
 
   // Paragraph Merger Settings
   // Place the FORCE override at the top of this section

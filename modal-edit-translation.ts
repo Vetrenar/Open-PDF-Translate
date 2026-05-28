@@ -148,15 +148,8 @@ export class EditSpecificTranslationModal extends Modal {
             await this.plugin.storage.updatePageOverlaysAndWrite(this.file, pagesToUpdate);
 
             // 5. Update Runtime Cache & UI
-            if (this.plugin.renderer) {
-                // If the renderer keeps a cache, update it to prevent visual reversion
-                if (this.plugin.renderer['cachedOverlayData']?.pageOverlays) {
-                    this.plugin.renderer['cachedOverlayData'].pageOverlays[this.pageNumber] = updatedOverlays;
-                }
-                
-                // Force visual refresh of this page in the PDF Viewer
-                await this.plugin.renderer.loadSavedOverlayForPage(this.pageNumber, true);
-            }
+            // Force visual refresh of this page in the PDF Viewer
+            await this.plugin.overlay.loadSavedOverlayForPage(this.pageNumber, true);
 
             new Notice('Translation updated.');
 

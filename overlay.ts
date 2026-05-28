@@ -110,6 +110,8 @@ export class OverlayRenderer {
                         this.plugin.settings.overlayOpacity, this.plugin.settings.outputFontSizeScale,
                         this.plugin.settings.outputLineHeight, this.lastKnownScale, fontFamily
                     );
+                    overlayEl.setAttribute('data-overlay-index', String(i));
+                    overlayEl.setAttribute('data-overlay-page', String(pageNumber));
                     container.appendChild(overlayEl);
                 } catch (unitError) {
                     this.logDebug(`Error rendering unit ${i}:`, unitError);
@@ -135,6 +137,39 @@ export class OverlayRenderer {
             this.logDebug('Error refreshing overlay:', error);
             new Notice('Failed to refresh overlay');
         }
+    }
+
+    public clearCurrentOverlay(): void {
+        const pageElement = this.getCurrentPageElement();
+        if (!pageElement) {
+            new Notice('No active PDF page found.');
+            return;
+        }
+        this.clearOverlayFromPage(pageElement);
+        new Notice('Current page overlay cleared.');
+    }
+
+    public addOverlayToggleToPDFMenu(menu: Menu, file: TFile): void {
+        menu.addItem((item) =>
+            item
+                .setTitle(this.isOverlayVisible ? 'Hide translation overlay' : 'Show translation overlay')
+                .setIcon('languages')
+                .onClick(() => this.toggleOverlayVisibility())
+        );
+
+        menu.addItem((item) =>
+            item
+                .setTitle('Reload saved overlay for current page')
+                .setIcon('refresh-cw')
+                .onClick(() => void this.loadSavedOverlayForCurrentPage(true))
+        );
+
+        menu.addItem((item) =>
+            item
+                .setTitle('Retranslate using saved overlay layout...')
+                .setIcon('wand')
+                .onClick(() => new RetranslateUsingOverlaysModal(this.plugin.app, this.plugin, file).open())
+        );
     }
 
     public adjustLineHeight(delta: number): void {
@@ -914,7 +949,8 @@ export class OverlayRenderer {
             const overlays: HTMLElement[] = [];
 
             // Step 1: Create all overlays and put them in staging container
-            for (const data of positionData) {
+            for (let overlayIndex = 0; overlayIndex < positionData.length; overlayIndex++) {
+                const data = positionData[overlayIndex];
                 try {
                     const scaleX = textLayerRect.width;
                     const scaleY = textLayerRect.height;
@@ -938,6 +974,8 @@ export class OverlayRenderer {
                         this.lastKnownScale,
                         data.fontFamily
                     );
+                    overlayEl.setAttribute('data-overlay-index', String(overlayIndex));
+                    overlayEl.setAttribute('data-overlay-page', String(pageNumber));
                     stagingContainer.appendChild(overlayEl);
                     overlays.push(overlayEl);
                 } catch (itemError) {

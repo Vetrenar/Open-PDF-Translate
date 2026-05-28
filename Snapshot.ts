@@ -1,9 +1,10 @@
 // Snapshot.ts
 export interface NormalizedStyle {
   fontFamily: string;
-  fontSize: number;    // normalized by DPR
+  fontSize: number;    // CSS px
   fontWeight: number;  // normalized numeric
   fontStyle: string;
+  direction: string;
   color: string;       // original CSS color string
   colorRGB: [number, number, number];
   styleSig: string;    // "family|fontSizeRounded|weight|style|r,g,b"
@@ -11,7 +12,7 @@ export interface NormalizedStyle {
 
 export interface SpanInfo {
   span: HTMLSpanElement;
-  rect: DOMRect;       // normalized by DPR
+  rect: DOMRect;       // CSS px
   style: NormalizedStyle;
   isMathElement: boolean;
   mathContext: 'equation' | 'inline' | 'none';
@@ -72,19 +73,18 @@ export function determineMathContext(text: string, fontFamily: string): 'equatio
 }
 
 export function buildSnapshot(spans: HTMLSpanElement[]): Map<HTMLSpanElement, SpanInfo> {
-  const dpr = window.devicePixelRatio || 1;
   const map = new Map<HTMLSpanElement, SpanInfo>();
 
   for (const s of spans) {
     const rectRaw = s.getBoundingClientRect();
     const rect = new DOMRect(
-      rectRaw.left / dpr,
-      rectRaw.top / dpr,
-      rectRaw.width / dpr,
-      rectRaw.height / dpr
+      rectRaw.left,
+      rectRaw.top,
+      rectRaw.width,
+      rectRaw.height
     );
     const style = window.getComputedStyle(s);
-    const fontSize = (parseFloat(style.fontSize) || 12) / dpr;
+    const fontSize = parseFloat(style.fontSize) || 12;
     const fontWeight = normalizeWeight(style.fontWeight);
     const colorRGB = parseColorToRGB(style.color);
     const text = s.textContent || '';
@@ -104,6 +104,7 @@ export function buildSnapshot(spans: HTMLSpanElement[]): Map<HTMLSpanElement, Sp
       fontSize,
       fontWeight,
       fontStyle: style.fontStyle,
+      direction: style.direction,
       color: style.color,
       colorRGB,
       styleSig

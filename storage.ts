@@ -757,6 +757,84 @@ format-version: ${STORAGE_FORMAT_VERSION}
 
 
     /**
+     * Finds all .translations.md files whose referenced PDF no longer exists in the vault.
+     * These are "orphaned" translation files that serve no purpose and can be safely deleted.
+     *
+     * Returns an array of objects containing the translation file and the unresolved PDF path.
+     */
+    async findOrphanedTranslations(): Promise<Array<{ mdFile: TFile; pdfSource: string }>> {
+        const orphans: Array<{ mdFile: TFile; pdfSource: string }> = [];
+
+        let mdFiles = this.app.vault.getMarkdownFiles();
+        if (this.storageLocation) {
+            mdFiles = mdFiles.filter(file => file.path.startsWith(this.storageLocation));
+        }
+
+        for (const mdFile of mdFiles) {
+            if (!mdFile.name.endsWith('.translations.md')) continue;
+
+            const cache = this.app.metadataCache.getFileCache(mdFile);
+            if (!cache?.frontmatter) {
+                // No frontmatter at all — cannot determine which PDF this belongs to
+                orphans.push({ mdFile, pdfSource: '(no frontmatter)' });
+                continue;
+            }
+
+            const raw = cache.frontmatter['pdf-source'];
+            if (!raw || typeof raw !== 'string') {
+                // Frontmatter exists but no pdf-source — orphan
+                orphans.push({ mdFile, pdfSource: '(missing pdf-source)' });
+                continue;
+            }
+
+            // Clean the link path using the same logic as buildPdfTranslationMap
+            let linkPath = raw.trim();
+
+            if (linkPath.startsWith('[[') && linkPath.endsWith(']]')) {
+                linkPath = linkPath.slice(2, -2);
+            } else if (
+                (linkPath.startsWith('"') && linkPath.endsWith('"')) ||
+                (linkPath.startsWith("'") && linkPath.endsWith("'"))
+            ) {
+                linkPath = linkPath.slice(1, -1);
+            }
+
+            if (linkPath.includes('|')) {
+                linkPath = linkPath.split('|')[0];
+            }
+
+            linkPath = linkPath.trim();
+            if (!linkPath) {
+                orphans.push({ mdFile, pdfSource: '(empty pdf-source)' });
+                continue;
+            }
+
+            // Try to resolve the PDF file using the same strategies as buildPdfTranslationMap
+            let resolved: TFile | null = null;
+
+            resolved = this.app.metadataCache.getFirstLinkpathDest(linkPath, mdFile.path) as TFile;
+
+            if (!resolved) {
+                const abstractFile = this.app.vault.getAbstractFileByPath(linkPath);
+                if (abstractFile instanceof TFile) resolved = abstractFile;
+            }
+
+            if (!resolved) {
+                const normalized = normalizePath(linkPath);
+                const abstractFile = this.app.vault.getAbstractFileByPath(normalized);
+                if (abstractFile instanceof TFile) resolved = abstractFile;
+            }
+
+            // If PDF doesn't exist (or isn't a PDF), this is an orphan
+            if (!resolved || resolved.extension !== 'pdf') {
+                orphans.push({ mdFile, pdfSource: linkPath });
+            }
+        }
+
+        return orphans;
+    }
+
+    /**
      * Ensure an existing translation note's pdf-source wikilink points to the given PDF.
      * Repairs stale links after renames or moves. Keeps the original single-quoted wikilink format.
      */

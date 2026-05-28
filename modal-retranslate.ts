@@ -147,22 +147,18 @@ export class RetranslateUsingOverlaysModal extends Modal {
     }
 
     // Collect jobs
-    const jobs: { page: number; items: OverlayPositionData[] }[] = [];
+    const jobs: { page: number; pageItems: OverlayPositionData[]; targetIndexes: number[] }[] = [];
     for (const p of targetPages) {
       const key = String(p);
-      const items = (saved.pageOverlays[key] || [])
-        .filter((it) => (it.textContent || '').trim().length > 0);
+      const pageItems = saved.pageOverlays[key] || [];
+      const targetIndexes = pageItems
+        .map((it, idx) => ({ it, idx }))
+        .filter(({ it }) => (it.textContent || '').trim().length > 0)
+        .filter(({ it }) => !this.onlyEmpty || !it.translatedText || !it.translatedText.trim())
+        .map(({ idx }) => idx);
 
-      if (this.onlyEmpty) {
-        // Filter to only untranslated or blank
-        const filtered = items.filter((it) => !it.translatedText || !it.translatedText.trim());
-        if (filtered.length > 0) {
-          jobs.push({ page: p, items: filtered });
-        }
-      } else {
-        if (items.length > 0) {
-          jobs.push({ page: p, items });
-        }
+      if (targetIndexes.length > 0) {
+        jobs.push({ page: p, pageItems, targetIndexes });
       }
     }
 
@@ -173,7 +169,9 @@ export class RetranslateUsingOverlaysModal extends Modal {
 
     // Confirm overwrite if needed
     if (!this.onlyEmpty && this.confirmOverwrite) {
-      const willOverwrite = jobs.some(j => j.items.some(i => (i.translatedText || '').trim().length > 0));
+      const willOverwrite = jobs.some(j =>
+        j.targetIndexes.some(idx => (j.pageItems[idx]?.translatedText || '').trim().length > 0)
+      );
       if (willOverwrite) {
         const proceed = await this.confirm(
           'Overwrite existing translations?',
@@ -183,21 +181,27 @@ export class RetranslateUsingOverlaysModal extends Modal {
       }
     }
 
-    let totalItems = jobs.reduce((acc, j) => acc + j.items.length, 0);
+    let totalItems = jobs.reduce((acc, j) => acc + j.targetIndexes.length, 0);
     new Notice(`Re-translating ${totalItems} item(s) across ${jobs.length} page(s)...`, 3000);
 
     // Execute page by page
     for (const job of jobs) {
-      const texts = job.items.map(i => i.textContent || '');
+      const texts = job.targetIndexes.map(idx => job.pageItems[idx]?.textContent || '');
 
       let translated: string[] = [];
       try {
         if (this.plugin.settings.useBatchTranslation && texts.length > 1) {
           const numbered = texts.map((t, idx) => `${idx + 1}. ${t}`).join('\n');
           const maxChars = this.plugin.settings.maxBatchChars;
-          const payload = numbered.length > maxChars ? numbered.slice(0, maxChars) : numbered;
-          const raw = await this.plugin.translation.translateBatch(payload, texts.length);
-          translated = this.plugin.processor.extractNumberedLines(raw, texts.length);
+          if (numbered.length > maxChars) {
+            translated = [];
+            for (const t of texts) {
+              translated.push(await this.plugin.translation.translateWithOpenRouter(t));
+            }
+          } else {
+            const raw = await this.plugin.translation.translateBatch(numbered, texts.length);
+            translated = this.plugin.processor.extractNumberedLines(raw, texts.length, texts);
+          }
         } else {
           // Sequential
           translated = [];
@@ -217,12 +221,14 @@ export class RetranslateUsingOverlaysModal extends Modal {
       }
 
       // Update saved overlay data
-      job.items.forEach((item, i) => {
+      job.targetIndexes.forEach((itemIndex, i) => {
+        const item = job.pageItems[itemIndex];
+        if (!item) return;
         item.translatedText = translated[i] || item.textContent || '';
       });
 
-      // Write back to memory structure
-      saved.pageOverlays[String(job.page)] = job.items;
+      // Preserve full page array; only targeted entries are updated.
+      saved.pageOverlays[String(job.page)] = job.pageItems;
     }
 
     // Persist to disk

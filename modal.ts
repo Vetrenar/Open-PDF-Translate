@@ -1,4 +1,4 @@
-// modal.ts
+﻿// modal.ts
 import { Modal, Setting, Notice, ButtonComponent, TFile } from 'obsidian';
 import OpenRouterTranslatorPlugin from './main';
 
@@ -254,13 +254,25 @@ export class TranslateMultiplePagesModal extends Modal {
      * The main logic loop for processing a range of pages.
      */
     private async translatePageRange(pdfFile: TFile, startPage: number, endPage: number): Promise<void> {
-        const pdfLeaf = this.app.workspace.getLeavesOfType('pdf')[0] || this.app.workspace.getMostRecentLeaf();
+        const activeLeaf = this.app.workspace.activeLeaf;
+        const activeIsPdfLeaf = !!activeLeaf && activeLeaf.view.getViewType() === 'pdf';
+        const activeFile = this.app.workspace.getActiveFile();
+        const shouldRestorePage = !!activeFile && activeFile.path === pdfFile.path;
+        const pageToRestore = shouldRestorePage ? this.plugin.getCurrentPageNumber() : null;
+
+        const pdfLeaf = (activeIsPdfLeaf ? activeLeaf : null)
+            || this.app.workspace.getLeavesOfType('pdf')[0]
+            || this.app.workspace.getMostRecentLeaf();
         if (!pdfLeaf) {
             throw new Error('No available workspace leaf to open PDF.');
         }
 
         try {
-            await pdfLeaf.openFile(pdfFile);
+            const openedFile = (pdfLeaf as any).view?.file as TFile | undefined;
+            const isAlreadyOpen = !!openedFile && openedFile.path === pdfFile.path;
+            if (!isAlreadyOpen) {
+                await pdfLeaf.openFile(pdfFile);
+            }
             if (!await this.waitForEl('.pdfViewer', 10000)) throw new Error('Failed to load PDF viewer.');
         } catch (err) {
             throw new Error('Could not open the specified PDF file.');
@@ -286,13 +298,13 @@ export class TranslateMultiplePagesModal extends Modal {
         try {
             while (processingQueue.length > 0) {
                 if (this.isCancelled) {
-                    this.updateProgress('⏹️ Translation cancelled by user.');
+                    this.updateProgress('вЏ№пёЏ Translation cancelled by user.');
                     return;
                 }
 
                 const pageNum = processingQueue.shift()!;
                 const progressPrefix = `[${completed + 1}/${totalPagesToProcess}]`;
-                this.updateProgress(`${progressPrefix} 🔄 Processing page ${pageNum}...`);
+                this.updateProgress(`${progressPrefix} рџ”„ Processing page ${pageNum}...`);
 
                 try {
                     // MODIFIED: Reworked the core logic with caching and verification
@@ -306,7 +318,7 @@ export class TranslateMultiplePagesModal extends Modal {
                         // Step 1: Get translation (from cache or new API call)
                         let translatedText = this.translationCache.get(pageNum);
                         if (!translatedText) {
-                            this.updateProgress(`${progressPrefix} ✍️ Translating page ${pageNum}...`);
+                            this.updateProgress(`${progressPrefix} вњЌпёЏ Translating page ${pageNum}...`);
                             // ASSUMPTION: You need a method that only does the translation and returns a string.
                             translatedText = await this.plugin.processor.translatePageContent(pageEl);
                             if (!translatedText || translatedText.trim() === '') {
@@ -314,7 +326,7 @@ export class TranslateMultiplePagesModal extends Modal {
                             }
                             this.translationCache.set(pageNum, translatedText); // Cache the successful translation
                         } else {
-                            this.updateProgress(`${progressPrefix} 📄 Using cached translation for page ${pageNum}.`);
+                            this.updateProgress(`${progressPrefix} рџ“„ Using cached translation for page ${pageNum}.`);
                         }
 
                         // Step 2: Create the overlay with the translated text
@@ -342,7 +354,7 @@ export class TranslateMultiplePagesModal extends Modal {
                     }, pageNum);
 
                     completed++;
-                    this.updateProgress(`${progressPrefix} ✅ Page ${pageNum} complete.`);
+                    this.updateProgress(`${progressPrefix} вњ… Page ${pageNum} complete.`);
 
                     // Manage memory by removing old overlays from the DOM
                     if (this.activeOverlays.length > 5) {
@@ -353,7 +365,7 @@ export class TranslateMultiplePagesModal extends Modal {
                 } catch (err: any) {
                     if (this.isCancelled) break;
                     console.error(`Page ${pageNum} failed permanently after all retries:`, err);
-                    this.updateProgress(`${progressPrefix} ❌ Page ${pageNum} failed: ${err.message || 'Unknown error'}`);
+                    this.updateProgress(`${progressPrefix} вќЊ Page ${pageNum} failed: ${err.message || 'Unknown error'}`);
                     failed++;
                 }
 
@@ -364,7 +376,10 @@ export class TranslateMultiplePagesModal extends Modal {
             }
         } finally {
             this.plugin.settings.autoSaveOverlay = originalAutoSave;
-            const summary = `🏁 Finished: ${completed}/${totalPagesToProcess} succeeded${failed ? `, ${failed} failed` : ''}.`;
+            if (pageToRestore && pageToRestore > 0) {
+                await this.navigateToPage(pdfLeaf, pageToRestore);
+            }
+            const summary = `рџЏЃ Finished: ${completed}/${totalPagesToProcess} succeeded${failed ? `, ${failed} failed` : ''}.`;
             this.updateProgress(summary);
             new Notice(summary, 7000);
         }
@@ -451,9 +466,9 @@ export class TranslateMultiplePagesModal extends Modal {
     }
 
     private async waitForPageAndTextLayer(pageNum: number, timeoutMs: number): Promise<HTMLElement | null> {
-        return this.waitForCondition(async () => {
+        return this.waitForCondition(() => {
             const pageEl = document.querySelector<HTMLElement>(`.page[data-page-number="${pageNum}"] .textLayer`);
-            const hasText = pageEl?.querySelector('span[role="presentation"]')?.textContent?.trim().length ?? 0 > 0;
+            const hasText = ((pageEl?.querySelector('span[role="presentation"]')?.textContent?.trim().length ?? 0) > 0);
             return hasText ? pageEl!.parentElement as HTMLElement : null;
         }, timeoutMs, 250);
     }
@@ -496,3 +511,4 @@ export class TranslateMultiplePagesModal extends Modal {
         return false;
     }
 }
+
