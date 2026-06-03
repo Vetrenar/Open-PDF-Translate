@@ -20,6 +20,16 @@ import {
     PresetManager,
     Preset
 } from './layout-modal';
+import {
+    readPdfSourceFromCache, readPdfSourceRaw, resolvePdfFromSource,
+    setPdfSourceInFrontmatter,
+} from './pdf-source';
+import { OcrTextTranslator } from './ocr-text';
+import { OcrRecognizeModal } from './ocr-modal';
+import { PdfWatcher } from './pdf-watcher';
+import { WatcherQueueModal } from './watcher-modal';
+import { PdfViewerAdapter } from './pdf-dom';
+
 
 export default class OpenRouterTranslatorPlugin extends Plugin {
     settings: OpenRouterTranslatorSettings;
@@ -28,6 +38,8 @@ export default class OpenRouterTranslatorPlugin extends Plugin {
     overlay: OverlayRenderer;
     translation: TranslationEngine;
     processor: TextProcessor;
+    pdfDom: PdfViewerAdapter;
+    watcher: PdfWatcher;
     layoutParserDebug: LayoutParserDebugModule;
     pdfExport: PdfExportService | null = null; // Nullable for mobile
 
@@ -38,6 +50,10 @@ export default class OpenRouterTranslatorPlugin extends Plugin {
     
     // Debounced function to prevent map spamming
     private debouncedBuildMap: () => void;
+
+    // #8: paths the plugin itself just wrote, so we can ignore the resulting
+    // metadataCache 'changed' event and avoid a self-triggered overlay reload.
+    private recentlyWrittenPaths = new Map<string, number>();
 
     // Readiness gate for file-open handler after initial map build
     private resolveReady!: () => void;
@@ -61,10 +77,12 @@ export default class OpenRouterTranslatorPlugin extends Plugin {
         });
 
         // Initialize services
+        this.pdfDom = new PdfViewerAdapter(this.app);
         this.translation = new TranslationEngine(this);
         this.overlay = new OverlayRenderer(this);
         this.processor = new TextProcessor(this);
         this.storage = new TranslationStorage(this);
+        this.watcher = new PdfWatcher(this);
         this.layoutParserDebug = new LayoutParserDebugModule(this);
         
         // Only initialize PDF export on desktop platforms
@@ -84,6 +102,7 @@ export default class OpenRouterTranslatorPlugin extends Plugin {
             this.logDebug("Layout ready. Building initial translation map...");
             await this.buildPdfTranslationMap();
             this.resolveReady();
+            this.watcher.start();
 
             await this.isReady;
             const activeLeaf = this.app.workspace.activeLeaf;
@@ -98,10 +117,14 @@ export default class OpenRouterTranslatorPlugin extends Plugin {
 
         this.registerEvent(this.app.metadataCache.on('changed', (file) => {
             // Only rebuild if a translation file changed its metadata/content
-            if (this.isTranslationFile(file)) {
-                this.logDebug(`Translation file changed: ${file.path}. Rebuilding map.`);
-                this.debouncedBuildMap();
+            if (!this.isTranslationFile(file)) return;
+            // Ignore the event we caused by writing the file ourselves (#8).
+            if (this.isSelfWrite(file.path)) {
+                this.logDebug(`Ignoring self-write for ${file.path}`);
+                return;
             }
+            this.logDebug(`Translation file changed: ${file.path}. Rebuilding map.`);
+            this.debouncedBuildMap();
         }));
 
         // ======= File System Events (Renames/Deletes) =======
@@ -268,6 +291,43 @@ export default class OpenRouterTranslatorPlugin extends Plugin {
             callback: () => this.overlay.toggleOverlayVisibility(),
         });
 
+        // #0: one-time migration / repair of pdf-source links (fixes apostrophe files).
+        this.addCommand({
+            id: 'repair-translation-links',
+            name: 'Repair translation links (pdf-source frontmatter)',
+            callback: () => this.repairAllTranslationLinks(),
+        });
+
+        // #4 (delivery): Python script installation lives in Settings → Layout Engine
+        // (user-initiated button), not a command.
+
+        // OCR engine: recognize scanned/image PDFs into a translated note.
+        this.addCommand({
+            id: 'ocr-recognize-document',
+            name: 'OCR: recognize PDF to translated note (choose pages)…',
+            callback: async () => {
+                const file = this.app.workspace.getActiveFile();
+                if (!file || file.extension !== 'pdf') { new Notice('Open a PDF first.'); return; }
+                new OcrRecognizeModal(this.app, this, file).open();
+            },
+        });
+
+        this.addCommand({
+            id: 'ocr-recognize-current-page',
+            name: 'OCR: recognize current page to translated note',
+            callback: async () => {
+                const file = this.app.workspace.getActiveFile();
+                if (!file || file.extension !== 'pdf') { new Notice('Open a PDF first.'); return; }
+                await new OcrTextTranslator(this).recognizeCurrentPage(file);
+            },
+        });
+
+        this.addCommand({
+            id: 'open-watcher-queue',
+            name: 'Background translation: open watched-folder queue',
+            callback: () => new WatcherQueueModal(this.app, this).open(),
+        });
+
         this.addCommand({
             id: 'toggle-bbox-edit-mode',
             name: 'Toggle BBox Edit Mode',
@@ -326,6 +386,18 @@ export default class OpenRouterTranslatorPlugin extends Plugin {
                file.name.endsWith('.translations.md');
     }
 
+    // #8: record a path the plugin is about to write, so the metadataCache
+    // 'changed' event it produces doesn't trigger a self-reload of the overlay.
+    public markSelfWrite(path: string, ttlMs = 2500): void {
+        this.recentlyWrittenPaths.set(path, Date.now() + ttlMs);
+    }
+    private isSelfWrite(path: string): boolean {
+        const exp = this.recentlyWrittenPaths.get(path);
+        if (exp === undefined) return false;
+        if (Date.now() > exp) { this.recentlyWrittenPaths.delete(path); return false; }
+        return true;
+    }
+
     async activateLayoutSettings(newSettings: LayoutSettings, presetName: string | null) {
         this.layoutSettings = newSettings;
         await this.saveSettings();
@@ -351,65 +423,46 @@ export default class OpenRouterTranslatorPlugin extends Plugin {
         let count = 0;
         for (const mdFile of mdFiles) {
             if (!mdFile.name.endsWith('.translations.md')) continue;
-            
-            const cache = this.app.metadataCache.getFileCache(mdFile);
-            if (!cache?.frontmatter) continue;
 
-            const raw = cache.frontmatter['pdf-source'];
-            if (!raw || typeof raw !== 'string') continue;
-
-            // FIX: Simplified cleaning logic that handles WikiLinks, Quotes, or Plain Paths robustly
-            // 1. Remove wrapping quotes/brackets if present
-            // 2. Remove alias (content after |)
-            let linkPath = raw.trim();
-
-            // Strip [[ ]] if present
-            if (linkPath.startsWith('[[') && linkPath.endsWith(']]')) {
-                linkPath = linkPath.slice(2, -2);
-            } 
-            // Strip quotes if they somehow survived frontmatter parsing (rare but possible)
-            else if ((linkPath.startsWith('"') && linkPath.endsWith('"')) || 
-                     (linkPath.startsWith("'") && linkPath.endsWith("'"))) {
-                linkPath = linkPath.slice(1, -1);
+            // Prefer parsed cache; recover apostrophe-broken files from raw text (#0).
+            let linkPath = readPdfSourceFromCache(this.app, mdFile);
+            if (!linkPath) {
+                const content = await this.app.vault.cachedRead(mdFile);
+                linkPath = readPdfSourceRaw(content);
             }
-
-            // Remove pipe alias
-            if (linkPath.includes('|')) {
-                linkPath = linkPath.split('|')[0];
-            }
-            
-            linkPath = linkPath.trim();
             if (!linkPath) continue;
 
-            let resolved: TFile | null = null;
-
-            // Strategy 1: Try resolving as a link (handles relative paths, wikilinks)
-            resolved = this.app.metadataCache.getFirstLinkpathDest(linkPath, mdFile.path) as TFile;
-
-            // Strategy 2: Fallback - Try resolving as an absolute path in the vault
-            if (!resolved) {
-                const abstractFile = this.app.vault.getAbstractFileByPath(linkPath);
-                if (abstractFile instanceof TFile) {
-                    resolved = abstractFile;
-                }
-            }
-
-            // Strategy 3: Try normalizing path if previous attempts failed
-            if (!resolved) {
-                const normalized = normalizePath(linkPath);
-                const abstractFile = this.app.vault.getAbstractFileByPath(normalized);
-                if (abstractFile instanceof TFile) {
-                    resolved = abstractFile;
-                }
-            }
-
-            if (resolved && resolved.extension === 'pdf') {
+            const resolved = resolvePdfFromSource(this.app, linkPath, mdFile.path);
+            if (resolved) {
                 this.pdfToMdMap.set(resolved.path, mdFile.path);
                 count++;
             }
         }
         
         this.logDebug(`Rebuilt map. Found ${count} translation files.`);
+    }
+
+    // #0: rewrite every translation note into the apostrophe-safe format,
+    // recovering links from raw text for files saved with the old broken format.
+    async repairAllTranslationLinks(): Promise<void> {
+        const files = this.app.vault.getMarkdownFiles()
+            .filter(f => f.name.endsWith('.translations.md') || f.name.endsWith('.translated.md'));
+        let fixed = 0;
+        for (const md of files) {
+            const content = await this.app.vault.read(md);
+            const linkPath = readPdfSourceFromCache(this.app, md) || readPdfSourceRaw(content);
+            if (!linkPath) continue;
+            const pdf = resolvePdfFromSource(this.app, linkPath, md.path);
+            const targetPath = pdf ? pdf.path : linkPath; // keep link even if PDF missing
+            const updated = setPdfSourceInFrontmatter(content, targetPath);
+            if (updated !== content) {
+                this.markSelfWrite(md.path);
+                await this.app.vault.modify(md, updated);
+                fixed++;
+            }
+        }
+        new Notice(`Repaired ${fixed} translation link(s).`);
+        await this.buildPdfTranslationMap();
     }
 
     private async refreshAffectedOverlays() {
@@ -449,6 +502,17 @@ export default class OpenRouterTranslatorPlugin extends Plugin {
         };
         this.layoutSettings = { ...defaultLayoutSettings, ...data.layoutSettings || {} };
 
+        // Migration: OCR-AI is no longer a layout engine. Old configs that set
+        // layoutEngine to 'ocr-api' move to 'python' (closest overlay engine);
+        // OCR is now run via its own commands.
+        if ((this.settings.layoutEngine as string) === 'ocr-api') {
+            this.settings.layoutEngine = 'python';
+        }
+        // OCR is recognize-to-note only now; retire the experimental overlay mode.
+        if (this.settings.ocrProvider && (this.settings.ocrProvider.ocrOutputMode as string) === 'overlay') {
+            this.settings.ocrProvider.ocrOutputMode = 'translation-note';
+        }
+
         if (this.settings.storageLocation) {
             let trimmed = this.settings.storageLocation.trim();
             if (['/', '.', '..', ''].includes(trimmed)) {
@@ -469,25 +533,14 @@ export default class OpenRouterTranslatorPlugin extends Plugin {
     }
 
     getCurrentPageNumber(): number | null {
-        const activeLeaf = this.app.workspace.activeLeaf;
-        if (!activeLeaf || activeLeaf.view.getViewType() !== 'pdf') return null;
-
-        const pdfView: any = activeLeaf.view;
-        const containerEl = pdfView.containerEl;
-        const viewerContainer = containerEl.querySelector('.pdfViewer, #viewer');
-        if (!viewerContainer) return null;
-
-        const pages = viewerContainer.querySelectorAll('.page[data-page-number]');
-        const currentPageEl = this.overlay.getCurrentVisiblePage(pages);
+        const currentPageEl = this.pdfDom.getCurrentVisiblePage();
         if (!currentPageEl) return null;
-
-        const pageNumberStr = currentPageEl.getAttribute('data-page-number');
-        const pageNumber = pageNumberStr ? parseInt(pageNumberStr, 10) : 0;
-        return pageNumber > 0 ? pageNumber : null;
+        return this.pdfDom.getPageNumberOf(currentPageEl);
     }
 
     onunload() {
         console.log('🧩 OpenRouter PDF Translator plugin unloaded');
+        this.watcher?.stop();
         this.layoutParserDebug?.cleanup();
         this.overlay.cleanup();
         this.clearAllOverlays();

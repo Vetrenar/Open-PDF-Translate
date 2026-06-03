@@ -12,13 +12,19 @@ import {
     ButtonComponent,
     Notice,
     requestUrl,
+    Platform,
     TFolder
 } from 'obsidian';
 import OpenRouterTranslatorPlugin from './main';
+import { installPythonScripts } from './python-scripts';
+import { DEFAULT_OCR_TEXT_PROMPT } from './default-prompts';
+import { t } from './i18n';
+import { WatcherQueueModal } from './watcher-modal';
 import {
     AVAILABLE_LANGUAGES,
     DEFAULT_SETTINGS,
     GEMMA_TEMPLATE,
+    DEFAULT_CUSTOM_TEMPLATE,
     // ════════════════════════════════════════════
     // 🆕 Import Ollama‑specific default prompts
     // ════════════════════════════════════════════
@@ -33,68 +39,71 @@ import {
 // === Folder Suggester Component ===
 export class FolderSuggest extends TextComponent {
     app: App;
+    private changeCb: ((value: string) => any) | null = null;
+    private dropdownEl: HTMLElement | null = null;
 
     constructor(app: App, containerEl: HTMLElement) {
         super(containerEl);
         this.app = app;
-        this.setPlaceholder('e.g. My Translations/');
-        this.inputEl.addEventListener('input', this.onInput.bind(this));
-        this.inputEl.addEventListener('blur', this.onBlur.bind(this));
+        this.setPlaceholder('e.g. My Translations/ (empty = next to PDF)');
+        this.inputEl.style.width = '100%';
+        this.inputEl.addEventListener('input', () => { this.fireChange(); this.renderSuggestions(); });
+        this.inputEl.addEventListener('focus', () => this.renderSuggestions());
+        this.inputEl.addEventListener('blur', () => this.scheduleClose());
     }
 
-    onInput() {
+    // Own the change callback so selecting a suggestion also persists.
+    onChange(cb: (value: string) => any): this {
+        this.changeCb = cb;
+        return this;
+    }
+    private fireChange() {
+        if (this.changeCb) this.changeCb(this.getValue());
+    }
+
+    private allFolders(): string[] {
+        return this.app.vault.getAllLoadedFiles()
+            .filter((f): f is TFolder => f instanceof TFolder)
+            .map(f => f.path)
+            .filter(p => p && p !== '/');
+    }
+
+    private renderSuggestions() {
+        this.closeDropdown();
         const query = this.getValue().toLowerCase();
-        const abstractFiles = this.app.vault.getAllLoadedFiles();
-        const folders = abstractFiles.filter(f => f instanceof TFolder).map(f => f.path);
-        
-        const suggestions = folders.filter(p => p.toLowerCase().includes(query));
-        this.setSuggestions(suggestions);
-    }
+        const matches = this.allFolders()
+            .filter(p => p.toLowerCase().includes(query))
+            .slice(0, 12);
+        if (matches.length === 0) return;
 
-    setSuggestions(suggestions: string[]) {
-        const dropdown = this.inputEl.parentElement?.querySelector('.suggestion-dropdown');
-        if (dropdown) dropdown.remove();
+        const drop = this.inputEl.parentElement!.createDiv({ cls: 'pdf-translate-folder-suggest' });
+        drop.style.cssText = [
+            'position:absolute', 'z-index:1000', 'margin-top:2px',
+            'min-width:' + this.inputEl.offsetWidth + 'px',
+            'max-height:200px', 'overflow-y:auto',
+            'background:var(--background-secondary)',
+            'border:1px solid var(--background-modifier-border)',
+            'border-radius:6px', 'box-shadow:0 4px 12px rgba(0,0,0,0.25)',
+        ].join(';');
 
-        if (suggestions.length > 0 && this.getValue()) {
-            const drop = createEl('div', { cls: 'suggestion-dropdown' });
-            drop.style.position = 'absolute';
-            drop.style.top = this.inputEl.offsetTop + this.inputEl.offsetHeight + 'px';
-            drop.style.left = this.inputEl.offsetLeft + 'px';
-            drop.style.width = this.inputEl.offsetWidth + 'px';
-            drop.style.zIndex = '1000';
-            drop.style.background = 'var(--background-secondary)';
-            drop.style.border = '1px solid var(--background-modifier-border)';
-            drop.style.borderRadius = '4px';
-            drop.style.maxHeight = '200px';
-            drop.style.overflowY = 'auto';
-            drop.style.boxShadow = '0 4px 8px rgba(0, 0, 0, 0.2)';
-
-            suggestions.forEach(sug => {
-                const item = createEl('div', { text: sug, cls: 'suggestion-item' });
-                item.style.padding = '6px 10px';
-                item.style.cursor = 'pointer';
-                
-                item.addEventListener('mouseenter', () => item.style.background = 'var(--background-modifier-hover)');
-                item.addEventListener('mouseleave', () => item.style.background = '');
-                
-                item.onclick = () => {
-                    this.setValue(sug);
-                    this.inputEl.dispatchEvent(new Event('blur'));
-                    drop.remove();
-                };
-                drop.appendChild(item);
+        for (const path of matches) {
+            const item = drop.createDiv({ text: path });
+            item.style.cssText = 'padding:6px 10px;cursor:pointer;white-space:nowrap';
+            item.addEventListener('mouseenter', () => item.style.background = 'var(--background-modifier-hover)');
+            item.addEventListener('mouseleave', () => item.style.background = '');
+            // mousedown (not click) so it fires before the input's blur closes the list.
+            item.addEventListener('mousedown', (e) => {
+                e.preventDefault();
+                this.setValue(path);
+                this.fireChange();
+                this.closeDropdown();
             });
-
-            this.inputEl.parentElement?.appendChild(drop);
         }
+        this.dropdownEl = drop;
     }
 
-    onBlur() {
-        setTimeout(() => {
-            const dropdown = this.inputEl.parentElement?.querySelector('.suggestion-dropdown');
-            if (dropdown) dropdown.remove();
-        }, 200);
-    }
+    private scheduleClose() { window.setTimeout(() => this.closeDropdown(), 150); }
+    private closeDropdown() { this.dropdownEl?.remove(); this.dropdownEl = null; }
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -164,7 +173,7 @@ export default class OpenRouterSettingsTab extends PluginSettingTab {
         // OPENAI
         // ==========================================================
         if (provider === 'openai') {
-            new Setting(containerEl).setName('OpenAI Settings').setHeading();
+            new Setting(containerEl).setName(t('openai.section')).setHeading();
 
             new Setting(containerEl)
                 .setName('OpenAI API Key')
@@ -179,52 +188,11 @@ export default class OpenRouterSettingsTab extends PluginSettingTab {
                     text.inputEl.type = 'password';
                 });
 
-            new Setting(containerEl)
-                .setName('Model')
-                .setDesc('Choose an OpenAI model.')
-                .addDropdown(async dd => {
-                    dd.setDisabled(true);
-                    
-                    const defaultModels = ['gpt-4o', 'gpt-4o-mini', 'o1', 'o1-mini', 'gpt-4-turbo', 'gpt-3.5-turbo'];
-                    let models = defaultModels.map(m => ({ id: m, name: m }));
-
-                    if (providerSettings.apiKey) {
-                        try {
-                            const resp = await requestUrl({
-                                url: 'https://api.openai.com/v1/models',
-                                headers: { 'Authorization': `Bearer ${providerSettings.apiKey}` }
-                            });
-                            const data = await resp.json;
-                            if (data.data && Array.isArray(data.data)) {
-                                models = data.data
-                                    .filter((m: any) => m.id.includes('gpt') || m.id.includes('o1'))
-                                    .sort((a: any, b: any) => a.id.localeCompare(b.id));
-                            }
-                        } catch (e) {
-                            console.error('Failed to fetch OpenAI models', e);
-                            new Notice('Could not fetch OpenAI models. Using default list.');
-                        }
-                    }
-
-                    dd.selectEl.empty();
-                    models.forEach(m => dd.addOption(m.id, m.id));
-                    
-                    const currentModel = providerSettings.model || 'gpt-4o';
-                    if (!models.find(m => m.id === currentModel)) {
-                        dd.addOption(currentModel, `${currentModel} (Saved)`);
-                    }
-                    dd.setValue(currentModel);
-                    dd.setDisabled(false);
-
-                    dd.onChange(async v => {
-                        providerSettings.model = v;
-                        await this.plugin.saveSettings();
-                    });
-                });
+            this.buildModelSetting(containerEl, 'openai', providerSettings, 'gpt-4o');
 
             new Setting(containerEl)
-                .setName('Temperature')
-                .setDesc('Controls randomness (0 = deterministic, 1 = creative). Recommended: 0.3 for translation. Note: O1/O3 models ignore this setting.')
+                .setName(t('provider.temperature.label'))
+                .setDesc(t('provider.temperature.desc'))
                 .addSlider(slider => slider
                     .setLimits(0, 1, 0.1)
                     .setValue(providerSettings.temperature ?? 0.3)
@@ -235,8 +203,8 @@ export default class OpenRouterSettingsTab extends PluginSettingTab {
                     }));
 
             new Setting(containerEl)
-                .setName('Enable Reasoning')
-                .setDesc('Enable extended thinking for O1/O3 models. Increases accuracy for complex translations but may increase latency.')
+                .setName(t('provider.reasoning.label'))
+                .setDesc(t('provider.reasoning.desc'))
                 .addToggle(toggle => toggle
                     .setValue(providerSettings.enableReasoning ?? false)
                     .onChange(async (value) => {
@@ -248,7 +216,7 @@ export default class OpenRouterSettingsTab extends PluginSettingTab {
         // GOOGLE GEMINI
         // ==========================================================
         } else if (provider === 'gemini') {
-            new Setting(containerEl).setName('Google Gemini Settings').setHeading();
+            new Setting(containerEl).setName(t('gemini.section')).setHeading();
 
             new Setting(containerEl)
                 .setName('Gemini API Key')
@@ -263,47 +231,11 @@ export default class OpenRouterSettingsTab extends PluginSettingTab {
                     text.inputEl.type = 'password';
                 });
 
-            new Setting(containerEl)
-                .setName('Model')
-                .setDesc('Choose a Gemini model.')
-                .addDropdown(async dd => {
-                    dd.setDisabled(true);
-
-                    const defaultModels = ['gemini-2.0-flash-thinking-exp', 'gemini-1.5-flash', 'gemini-1.5-pro', 'gemini-1.0-pro'];
-                    let models = defaultModels.map(m => ({ name: `models/${m}`, displayName: m }));
-
-                    if (providerSettings.apiKey) {
-                        try {
-                            const resp = await requestUrl(
-                                `https://generativelanguage.googleapis.com/v1beta/models?key=${providerSettings.apiKey}`
-                            );
-                            const data = await resp.json;
-                            if (data.models && Array.isArray(data.models)) {
-                                models = data.models
-                                    .filter((m: any) => m.name.includes('gemini'))
-                                    .map((m: any) => ({ name: m.name, displayName: m.displayName || m.name }));
-                            }
-                        } catch (e) {
-                            console.error('Failed to fetch Gemini models', e);
-                        }
-                    }
-
-                    dd.selectEl.empty();
-                    models.forEach(m => dd.addOption(m.name, m.displayName));
-                    
-                    const currentModel = providerSettings.model || 'models/gemini-1.5-flash';
-                    dd.setValue(currentModel);
-                    dd.setDisabled(false);
-
-                    dd.onChange(async v => {
-                        providerSettings.model = v;
-                        await this.plugin.saveSettings();
-                    });
-                });
+            this.buildModelSetting(containerEl, 'gemini', providerSettings, 'models/gemini-1.5-flash');
 
             new Setting(containerEl)
-                .setName('Temperature')
-                .setDesc('Controls randomness (0 = deterministic, 1 = creative). Recommended: 0.3 for translation.')
+                .setName(t('provider.temperature.label'))
+                .setDesc(t('provider.temperature.desc'))
                 .addSlider(slider => slider
                     .setLimits(0, 1, 0.1)
                     .setValue(providerSettings.temperature ?? 0.3)
@@ -327,7 +259,7 @@ export default class OpenRouterSettingsTab extends PluginSettingTab {
         // OPENROUTER
         // ==========================================================
         } else if (provider === 'openrouter') {
-            new Setting(containerEl).setName('OpenRouter Settings').setHeading();
+            new Setting(containerEl).setName(t('openrouter.section')).setHeading();
 
             new Setting(containerEl)
                 .setName('OpenRouter API Key')
@@ -342,41 +274,11 @@ export default class OpenRouterSettingsTab extends PluginSettingTab {
                     text.inputEl.type = 'password';
                 });
 
-            new Setting(containerEl)
-                .setName('Model')
-                .setDesc('Choose a model (e.g., google/gemini-flash-1.5, deepseek/deepseek-r1)')
-                .addDropdown(async dd => {
-                    dd.setDisabled(true);
-                    dd.addOption('', 'Loading models...');
-                    
-                    try {
-                        const resp = await requestUrl('https://openrouter.ai/api/v1/models');
-                        const data = await resp.json;
-                        const models = (Array.isArray(data.data) ? data.data : [])
-                            .sort((a: any, b: any) => a.name.localeCompare(b.name));
-
-                        dd.selectEl.empty();
-                        models.forEach((m: any) => dd.addOption(m.id, `${m.name} (${m.id})`));
-                        
-                        dd.setValue(providerSettings.model || 'google/gemini-flash-1.5');
-                    } catch (err) {
-                        console.error('Failed to load models from OpenRouter:', err);
-                        dd.selectEl.empty();
-                        dd.addOption(providerSettings.model || 'google/gemini-flash-1.5', 'Default');
-                        dd.setValue(providerSettings.model || 'google/gemini-flash-1.5');
-                        new Notice('⚠️ Could not load models. Using current setting.');
-                    }
-                    dd.setDisabled(false);
-
-                    dd.onChange(async v => {
-                        providerSettings.model = v;
-                        await this.plugin.saveSettings();
-                    });
-                });
+            this.buildModelSetting(containerEl, 'openrouter', providerSettings, 'google/gemini-flash-1.5');
 
             new Setting(containerEl)
-                .setName('Temperature')
-                .setDesc('Controls randomness (0 = deterministic, 1 = creative). Recommended: 0.3 for translation.')
+                .setName(t('provider.temperature.label'))
+                .setDesc(t('provider.temperature.desc'))
                 .addSlider(slider => slider
                     .setLimits(0, 1, 0.1)
                     .setValue(providerSettings.temperature ?? 0.3)
@@ -387,8 +289,8 @@ export default class OpenRouterSettingsTab extends PluginSettingTab {
                     }));
 
             new Setting(containerEl)
-                .setName('Enable Reasoning')
-                .setDesc('Enable extended thinking for compatible models (DeepSeek R1, QwQ, O1, etc.). May increase latency.')
+                .setName(t('provider.reasoning.label'))
+                .setDesc(t('provider.reasoning.desc'))
                 .addToggle(toggle => toggle
                     .setValue(providerSettings.enableReasoning ?? false)
                     .onChange(async (value) => {
@@ -400,11 +302,11 @@ export default class OpenRouterSettingsTab extends PluginSettingTab {
         // OLLAMA
         // ==========================================================
         } else if (provider === 'ollama') {
-            new Setting(containerEl).setName('Ollama (Local) Settings').setHeading();
+            new Setting(containerEl).setName(t('ollama.section')).setHeading();
 
             new Setting(containerEl)
-                .setName('Ollama API Endpoint')
-                .setDesc('The local URL for your Ollama server.')
+                .setName(t('ollama.endpoint.label'))
+                .setDesc(t('ollama.endpoint.desc'))
                 .addText(text => text
                     .setPlaceholder('http://localhost:11434')
                     .setValue(providerSettings.apiEndpoint || '')
@@ -414,43 +316,11 @@ export default class OpenRouterSettingsTab extends PluginSettingTab {
                         this.display();
                     }));
 
-            new Setting(containerEl)
-                .setName('Model')
-                .setDesc('Choose a local model to use.')
-                .addDropdown(async dd => {
-                    dd.setDisabled(true);
-                    dd.addOption('', 'Fetching local models...');
-                    
-                    const endpoint = providerSettings.apiEndpoint || 'http://localhost:11434';
-                    try {
-                        const resp = await requestUrl({ url: `${endpoint}/api/tags` });
-                        const data = await resp.json;
-                        
-                        dd.selectEl.empty();
-                        if (data.models && data.models.length > 0) {
-                             data.models.forEach((m: any) => dd.addOption(m.name, m.name));
-                             dd.setValue(providerSettings.model || data.models[0].name);
-                        } else {
-                            dd.addOption('', 'No models found');
-                        }
-                    } catch(e) {
-                        console.error("Error fetching Ollama models:", e);
-                        new Notice(`⚠️ Could not connect to Ollama at ${endpoint}.`);
-                        dd.selectEl.empty();
-                        dd.addOption(providerSettings.model || 'llama3', `(Enter model name manually)`);
-                        dd.setValue(providerSettings.model || 'llama3');
-                    }
-                    dd.setDisabled(false);
-
-                    dd.onChange(async v => {
-                        providerSettings.model = v;
-                        await this.plugin.saveSettings();
-                    });
-                });
+            this.buildModelSetting(containerEl, 'ollama', providerSettings, 'llama3');
 
             new Setting(containerEl)
-                .setName('Temperature')
-                .setDesc('Controls randomness (0 = deterministic, 1 = creative). Recommended: 0.3 for translation.')
+                .setName(t('provider.temperature.label'))
+                .setDesc(t('provider.temperature.desc'))
                 .addSlider(slider => slider
                     .setLimits(0, 1, 0.1)
                     .setValue(providerSettings.temperature ?? 0.3)
@@ -474,17 +344,17 @@ export default class OpenRouterSettingsTab extends PluginSettingTab {
         // CUSTOM
         // ==========================================================
         } else if (provider === 'custom') {
-            new Setting(containerEl).setName('Custom Endpoint Settings').setHeading();
+            new Setting(containerEl).setName(t('custom.section')).setHeading();
             
             new Setting(containerEl)
-                .setName('API Endpoint URL')
+                .setName(t('custom.endpoint.label'))
                 .addText(t => t.setValue(providerSettings.apiEndpoint || '').onChange(async v => {
                     providerSettings.apiEndpoint = v; await this.plugin.saveSettings();
                 }));
             
             new Setting(containerEl)
-                .setName('API Key (Optional)')
-                .setDesc('Your API key. Use {apiKey} in Headers if needed.')
+                .setName(t('custom.apikey.label'))
+                .setDesc(t('custom.apikey.desc'))
                 .addText(t => {
                     t.setValue(providerSettings.apiKey || '').onChange(async v => {
                         providerSettings.apiKey = v.trim(); await this.plugin.saveSettings();
@@ -493,14 +363,14 @@ export default class OpenRouterSettingsTab extends PluginSettingTab {
                 });
 
             new Setting(containerEl)
-                .setName('Model Name')
+                .setName(t('custom.model.label'))
                 .addText(t => t.setValue(providerSettings.model || '').onChange(async v => {
                     providerSettings.model = v; await this.plugin.saveSettings();
                 }));
 
             new Setting(containerEl)
-                .setName('Request Headers (JSON)')
-                .setDesc('Use placeholders: {apiKey}')
+                .setName(t('provider.headers.label'))
+                .setDesc(t('provider.headers.desc'))
                 .addTextArea(ta => {
                     ta.setValue(providerSettings.headers || '{}')
                     .onChange(async v => { providerSettings.headers = v; await this.plugin.saveSettings(); });
@@ -549,14 +419,15 @@ export default class OpenRouterSettingsTab extends PluginSettingTab {
         containerEl.createEl('hr');
 
         // --- GENERAL SETTINGS ---
-        new Setting(containerEl).setName('General Settings').setHeading();
+        new Setting(containerEl).setName(t('general.section')).setHeading();
 
         // Storage Location
         new Setting(containerEl)
-            .setName('Translation Storage Location')
-            .setDesc('Choose where to save translation files. Leave empty to save next to each PDF.')
-            .addText(text => {
-                const folderSuggest = new FolderSuggest(this.app, text.inputEl.parentElement!);
+            .setName(t('general.storage.label'))
+            .setDesc(t('general.storage.desc'))
+            .then(setting => {
+                setting.controlEl.style.position = 'relative';
+                const folderSuggest = new FolderSuggest(this.app, setting.controlEl);
                 folderSuggest.setValue(this.plugin.settings.storageLocation);
                 folderSuggest.onChange(async (value) => {
                     this.plugin.settings.storageLocation = value;
@@ -564,8 +435,57 @@ export default class OpenRouterSettingsTab extends PluginSettingTab {
                 });
             });
 
+        // ── Folder Watcher (background translation) ──
+        containerEl.createEl('hr');
+        new Setting(containerEl).setName(t('watcher.section')).setHeading();
+        containerEl.createEl('p', {
+            text: 'Watch a folder for new PDFs and queue them for background translation. This is python-only: it extracts text + coordinates from the file on disk (PyMuPDF) without opening the PDF, then writes a .translations.md. Detection only queues — you trigger translation from the queue.',
+            cls: 'setting-item-description',
+        });
+
         new Setting(containerEl)
-            .setName('Auto-Save Overlay Data')
+            .setName(t('watcher.enable.label'))
+            .setDesc(t('watcher.enable.desc'))
+            .addToggle(t => t.setValue(this.plugin.settings.watcherEnabled).onChange(async v => {
+                this.plugin.settings.watcherEnabled = v;
+                await this.plugin.saveSettings();
+                if (v) this.plugin.watcher.start(); else this.plugin.watcher.stop();
+            }));
+
+        new Setting(containerEl)
+            .setName(t('watcher.folder.label'))
+            .setDesc(t('watcher.folder.desc'))
+            .then(setting => {
+                setting.controlEl.style.position = 'relative';
+                const fs = new FolderSuggest(this.app, setting.controlEl);
+                fs.setValue(this.plugin.settings.watcherFolder || '');
+                fs.onChange(async (value) => {
+                    this.plugin.settings.watcherFolder = value.trim();
+                    await this.plugin.saveSettings();
+                    if (this.plugin.settings.watcherEnabled) this.plugin.watcher.start();
+                });
+            });
+
+        new Setting(containerEl)
+            .setName(t('watcher.queue.label'))
+            .setDesc(t('watcher.queue.desc'))
+            .addButton(b => b.setButtonText(t('watcher.queue.btn.open')).onClick(() => {
+                new WatcherQueueModal(this.app, this.plugin).open();
+            }))
+            .addButton(b => b.setButtonText(t('watcher.queue.btn.scan')).onClick(async () => {
+                const n = await this.plugin.watcher.scanExisting();
+                new Notice(n > 0 ? t('modal.watcher.scan.found',{n}) : t('modal.watcher.scan.none'));
+            }));
+
+        if (this.plugin.settings.layoutEngine !== 'python') {
+            containerEl.createEl('p', {
+                text: '⚠ Background translation needs the Python layout engine (set Layout Engine to Python above). The internal and OCR engines require an open PDF and cannot run in the background.',
+                cls: 'setting-item-description',
+            });
+        }
+
+        new Setting(containerEl)
+            .setName(t('general.autosave.label'))
             .setDesc('Automatically save overlay positions each time you translate.')
             .addToggle(t => t.setValue(this.plugin.settings.autoSaveOverlay).onChange(async v => {
                 this.plugin.settings.autoSaveOverlay = v; await this.plugin.saveSettings();
@@ -573,7 +493,7 @@ export default class OpenRouterSettingsTab extends PluginSettingTab {
 
         // Language Settings
         new Setting(containerEl)
-            .setName('Source Language')
+            .setName(t('general.language.source'))
             .addDropdown(dd => {
                 AVAILABLE_LANGUAGES.forEach(lang => dd.addOption(lang.code, lang.name));
                 dd.setValue(this.plugin.settings.sourceLanguage).onChange(async v => {
@@ -582,7 +502,7 @@ export default class OpenRouterSettingsTab extends PluginSettingTab {
             });
 
         new Setting(containerEl)
-            .setName('Target Language')
+            .setName(t('general.language.target'))
             .addDropdown(dd => {
                 AVAILABLE_LANGUAGES.forEach(lang => dd.addOption(lang.code, lang.name));
                 dd.setValue(this.plugin.settings.targetLanguage).onChange(async v => {
@@ -597,39 +517,96 @@ export default class OpenRouterSettingsTab extends PluginSettingTab {
                 this.plugin.settings.useBatchTranslation = v; await this.plugin.saveSettings();
             }));
 
+        new Setting(containerEl)
+            .setName(t('general.semanticmerge.label'))
+            .setDesc(t('general.semanticmerge.desc'))
+            .addToggle(t => t.setValue(this.plugin.settings.enableSemanticMerging).onChange(async v => {
+                this.plugin.settings.enableSemanticMerging = v; await this.plugin.saveSettings();
+            }));
+
         containerEl.createEl('hr');
         
         // --- PROMPTS ---
-        new Setting(containerEl).setName('Translation Prompts').setHeading();
+        new Setting(containerEl).setName(t('prompts.section')).setHeading();
+
+        // How-to-structure-a-prompt help.
+        const promptHelp = containerEl.createEl('div', { cls: 'setting-item-description' });
+        promptHelp.style.cssText = 'border-left:3px solid var(--interactive-accent);padding:8px 12px;margin:4px 0 12px;background:var(--background-secondary);border-radius:0 6px 6px 0;line-height:1.5;';
+        promptHelp.createEl('p', { text: t('prompts.help.title') }).style.fontWeight = '600';
+
+        const intro = promptHelp.createEl('p');
+        intro.appendText(t('prompts.help.intro'));
+        intro.createEl('b', { text: t('prompts.help.batch') });
+        intro.appendText(t('prompts.help.batch.desc'));
+        intro.createEl('b', { text: t('prompts.help.single') });
+        intro.appendText(t('prompts.help.single.desc'));
+
+        const phTitle = promptHelp.createEl('p');
+        phTitle.createEl('b', { text: 'Placeholders' });
+        phTitle.appendText(' ' + t('prompts.help.placeholders'));
+        const phList = promptHelp.createEl('ul');
+        phList.style.margin = '4px 0 4px 18px';
+        const ph = (code: string, what: string) => {
+            const li = phList.createEl('li');
+            li.createEl('code', { text: code });
+            li.appendText(' — ' + what);
+        };
+        ph('{sourceLang}', t('prompts.help.ph.sourcelang'));
+        ph('{targetLang}', t('prompts.help.ph.targetlang'));
+        ph('{inputText}', t('prompts.help.ph.inputtext'));
+        ph('{lineCount}', t('prompts.help.ph.linecount'));
+
+        const rulesTitle = promptHelp.createEl('p');
+        rulesTitle.createEl('b', { text: t('prompts.help.rules.title') });
+        const rules = promptHelp.createEl('ul');
+        rules.style.margin = '4px 0 4px 18px';
+        rules.createEl('li', { text: t('prompts.help.rules.1') });
+        rules.createEl('li', { text: t('prompts.help.rules.2') });
+        rules.createEl('li', { text: t('prompts.help.rules.3') });
+
+        const tips = promptHelp.createEl('p');
+        tips.createEl('b', { text: t('prompts.help.tips.title') });
+        tips.appendText(': add domain terminology, a glossary, or a tone instruction at the top (e.g. “Use formal legal terminology; keep acronyms untranslated”). Keep the [#N] and {lineCount} rules intact or batch translation will misalign. Use Restore Default if a prompt stops working.');
 
         new Setting(containerEl)
-            .setName('Use Gemma Template')
-            .setDesc('Use a specialized veterinary translation template. When enabled, custom prompts below are ignored.')
+            .setName(t('prompts.special.label'))
+            .setDesc('Some models (e.g. Gemma and other instruction-tuned local models) work best when the whole request is shaped as one template with a {TEXT} placeholder, rather than separate system/user prompts. Enable this to override the batch/single prompts below with the single template.')
             .addToggle(t => t.setValue(this.plugin.settings.useGemmaPrompt).onChange(async v => {
-                this.plugin.settings.useGemmaPrompt = v; 
+                this.plugin.settings.useGemmaPrompt = v;
                 await this.plugin.saveSettings();
                 this.display();
             }));
 
         if (this.plugin.settings.useGemmaPrompt) {
             new Setting(containerEl)
-                .setName('Active Gemma Template (Read-Only)')
-                .setDesc('This specialized template will be used for all translations.')
+                .setName(t('prompts.special.template.label'))
+                .setDesc(t('prompts.special.template.desc'))
                 .then(setting => {
                     setting.controlEl.style.flexDirection = 'column';
                     setting.controlEl.style.alignItems = 'flex-end';
-                    
+
                     const textarea = new TextAreaComponent(setting.controlEl)
-                        .setValue(GEMMA_TEMPLATE);
+                        .setValue(this.plugin.settings.customTemplate || DEFAULT_CUSTOM_TEMPLATE)
+                        .onChange(async v => {
+                            this.plugin.settings.customTemplate = v;
+                            await this.plugin.saveSettings();
+                        });
                     textarea.inputEl.style.width = '100%';
-                    textarea.inputEl.rows = 6;
-                    textarea.setDisabled(true);
+                    textarea.inputEl.rows = 8;
+                    textarea.inputEl.style.fontFamily = 'monospace';
+                    textarea.inputEl.style.fontSize = '12px';
+
+                    new ButtonComponent(setting.controlEl).setButtonText(t('prompts.restore')).onClick(async () => {
+                        this.plugin.settings.customTemplate = DEFAULT_CUSTOM_TEMPLATE;
+                        await this.plugin.saveSettings();
+                        textarea.setValue(DEFAULT_CUSTOM_TEMPLATE);
+                    }).buttonEl.style.marginTop = '8px';
                 });
 
         } else {
             new Setting(containerEl)
-                .setName('Batch Translation Prompt')
-                .setDesc('System prompt for batch translations. Placeholders: {sourceLang}, {targetLang}, {lineCount}, {inputText}')
+                .setName(t('prompts.batch.label'))
+                .setDesc(t('prompts.batch.desc'))
                 .then(setting => {
                     setting.controlEl.style.flexDirection = 'column';
                     setting.controlEl.style.alignItems = 'flex-end';
@@ -641,7 +618,7 @@ export default class OpenRouterSettingsTab extends PluginSettingTab {
                     textarea.inputEl.style.width = '100%';
                     textarea.inputEl.rows = 8;
 
-                    new ButtonComponent(setting.controlEl).setButtonText('Restore Default').onClick(async () => {
+                    new ButtonComponent(setting.controlEl).setButtonText(t('prompts.restore')).onClick(async () => {
                         this.plugin.settings.batchPrompt = DEFAULT_SETTINGS.batchPrompt;
                         await this.plugin.saveSettings();
                         textarea.setValue(DEFAULT_SETTINGS.batchPrompt);
@@ -649,8 +626,8 @@ export default class OpenRouterSettingsTab extends PluginSettingTab {
                 });
 
             new Setting(containerEl)
-                .setName('Single Sentence Prompt')
-                .setDesc('System prompt for single translations. Placeholders: {sourceLang}, {targetLang}')
+                .setName(t('prompts.single.label'))
+                .setDesc(t('prompts.single.desc'))
                 .then(setting => {
                     setting.controlEl.style.flexDirection = 'column';
                     setting.controlEl.style.alignItems = 'flex-end';
@@ -662,7 +639,7 @@ export default class OpenRouterSettingsTab extends PluginSettingTab {
                     textarea.inputEl.style.width = '100%';
                     textarea.inputEl.rows = 4;
 
-                    new ButtonComponent(setting.controlEl).setButtonText('Restore Default').onClick(async () => {
+                    new ButtonComponent(setting.controlEl).setButtonText(t('prompts.restore')).onClick(async () => {
                         this.plugin.settings.singlePrompt = DEFAULT_SETTINGS.singlePrompt;
                         await this.plugin.saveSettings();
                         textarea.setValue(DEFAULT_SETTINGS.singlePrompt);
@@ -670,76 +647,34 @@ export default class OpenRouterSettingsTab extends PluginSettingTab {
                 });
         }
 
-        // --- CUSTOM COPY FORMATS ---
-        containerEl.createEl('hr');
-        new Setting(containerEl).setName('Custom Copy Formats').setHeading();
-
-        const placeholderDesc = createFragment(doc => {
-            doc.createSpan({ text: 'Placeholders: ' });
-            doc.createEl('code', { text: '{text}' });
-            doc.createSpan({ text: ', ' });
-            doc.createEl('code', { text: '{blockquote_text}' });
-            doc.createSpan({ text: ', ' });
-            doc.createEl('code', { text: '{filename}' });
-            doc.createSpan({ text: ', ' });
-            doc.createEl('code', { text: '{pagelink}' });
-            doc.createSpan({ text: ', ' });
-            doc.createEl('code', { text: '{pagenumber}' });
-        });
-
-        const createFormatSetting = (name: string, settingKey: 'calloutFormat' | 'citationFormat' | 'footnoteFormat') => {
-            new Setting(containerEl)
-                .setName(name)
-                .setDesc(placeholderDesc)
-                .then(setting => {
-                    setting.controlEl.style.flexDirection = 'column';
-                    setting.controlEl.style.alignItems = 'flex-end';
-                    
-                    const textarea = new TextAreaComponent(setting.controlEl)
-                        .setValue(this.plugin.settings[settingKey]).onChange(async v => {
-                            this.plugin.settings[settingKey] = v; await this.plugin.saveSettings();
-                        });
-                    textarea.inputEl.style.width = '100%';
-                    textarea.inputEl.rows = 5;
-
-                    new ButtonComponent(setting.controlEl).setButtonText('Restore Default').onClick(async () => {
-                        this.plugin.settings[settingKey] = DEFAULT_SETTINGS[settingKey];
-                        await this.plugin.saveSettings();
-                        textarea.setValue(DEFAULT_SETTINGS[settingKey]);
-                    }).buttonEl.style.marginTop = '8px';
-                });
-        };
-
-        createFormatSetting('Callout Format', 'calloutFormat');
-        createFormatSetting('Citation Format', 'citationFormat');
-        createFormatSetting('Footnote Format', 'footnoteFormat');
+        // (Custom Copy Formats moved down to the Export section.)
 
         // Visuals and Processing
         containerEl.createEl('hr');
-        new Setting(containerEl).setName('Visual & Processing Settings').setHeading();
+        new Setting(containerEl).setName(t('visual.section')).setHeading();
 
         new Setting(containerEl)
-            .setName('Output Font Size Scale')
+            .setName(t('visual.fontscale.label'))
             .addSlider(s => s.setLimits(0.4, 1.2, 0.05).setValue(this.plugin.settings.outputFontSizeScale).setDynamicTooltip().onChange(async v => {
                 this.plugin.settings.outputFontSizeScale = v; await this.plugin.saveSettings();
             }));
 
         new Setting(containerEl)
-            .setName('Output Line Height')
+            .setName(t('visual.lineheight.label'))
             .addSlider(s => s.setLimits(0.5, 2.0, 0.05).setValue(this.plugin.settings.outputLineHeight).setDynamicTooltip().onChange(async v => {
                 this.plugin.settings.outputLineHeight = v; await this.plugin.saveSettings();
             }));
 
         new Setting(containerEl)
-            .setName('Max Batch Input Length')
-            .setDesc('Maximum characters sent at once to prevent API errors.')
+            .setName(t('visual.maxbatch.label'))
+            .setDesc(t('visual.maxbatch.desc'))
             .addSlider(s => s.setLimits(50, 15000, 50).setValue(this.plugin.settings.maxBatchChars).setDynamicTooltip().onChange(async v => {
                 this.plugin.settings.maxBatchChars = v; await this.plugin.saveSettings();
             }));
 
         new Setting(containerEl)
-            .setName('BBox Edit Mode')
-            .setDesc('Enable selecting one or multiple overlay boxes and applying bulk actions from right-click menu.')
+            .setName(t('visual.bboxedit.label'))
+            .setDesc(t('visual.bboxedit.desc'))
             .addToggle(toggle => toggle
                 .setValue(this.plugin.settings.bboxEditMode)
                 .onChange(async (value) => {
@@ -754,20 +689,19 @@ export default class OpenRouterSettingsTab extends PluginSettingTab {
         // ============================================================
 
         containerEl.createEl('hr');
-        containerEl.createEl('h3', { text: 'Layout Engine' });
+        containerEl.createEl('h3', { text: t('engine.section') });
         containerEl.createEl('p', {
-            text: 'Choose how the plugin detects text positions on PDF pages.',
+            text: t('engine.section.desc'),
             cls: 'setting-item-description'
         });
 
         new Setting(containerEl)
-            .setName('Layout Engine')
-            .setDesc('Internal = parse browser text layer. Python = local script. OCR API = send to AI model.')
+            .setName(t('engine.dropdown.label'))
+            .setDesc(t('engine.dropdown.desc'))
             .addDropdown(dd => {
-                dd.addOption('internal', 'Internal (DOM Text Layer)')
-                  .addOption('python', 'External Python Script')
-                  .addOption('ocr-api', 'OCR via AI Model (API)')
-                  .setValue(this.plugin.settings.layoutEngine)
+                dd.addOption('internal', t('engine.opt.internal'))
+                  .addOption('python', t('engine.opt.python'))
+                  .setValue(this.plugin.settings.layoutEngine === 'python' ? 'python' : 'internal')
                   .onChange(async (value: any) => {
                       this.plugin.settings.layoutEngine = value;
                       await this.plugin.saveSettings();
@@ -780,8 +714,8 @@ export default class OpenRouterSettingsTab extends PluginSettingTab {
         // ── Python Engine Settings ──
         if (engine === 'python') {
             new Setting(containerEl)
-                .setName('Python Interpreter Path')
-                .setDesc('Absolute path to your Python executable.')
+                .setName(t('engine.python.path.label'))
+                .setDesc(t('engine.python.path.desc'))
                 .addText(text => text
                     .setPlaceholder('python')
                     .setValue(this.plugin.settings.pythonPath)
@@ -791,8 +725,8 @@ export default class OpenRouterSettingsTab extends PluginSettingTab {
                     }));
 
             new Setting(containerEl)
-                .setName('Layout Script Path')
-                .setDesc('Absolute path to the "layout_engine.py" script.')
+                .setName(t('engine.python.script.label'))
+                .setDesc(t('engine.python.script.desc'))
                 .addText(text => text
                     .setPlaceholder('/path/to/layout_engine.py')
                     .setValue(this.plugin.settings.ocrScriptPath)
@@ -800,21 +734,52 @@ export default class OpenRouterSettingsTab extends PluginSettingTab {
                         this.plugin.settings.ocrScriptPath = value;
                         await this.plugin.saveSettings();
                     }));
+
+            // Install the bundled Python scripts on demand (user-initiated, desktop only).
+            const installSetting = new Setting(containerEl)
+                .setName(t('engine.python.install.label'))
+                .setDesc(t('engine.python.install.desc'));
+            if (Platform.isDesktop) {
+                installSetting.addButton(btn => btn
+                    .setButtonText(t('engine.python.install.btn'))
+                    .setCta()
+                    .onClick(async () => {
+                        btn.setDisabled(true).setButtonText(t('engine.python.install.btn.progress'));
+                        const result = await installPythonScripts(this.plugin, { overwrite: true });
+                        btn.setDisabled(false).setButtonText('Install / Update scripts');
+                        if (result) this.display(); // refresh to show the new resolved path
+                    }));
+            } else {
+                installSetting.setDesc(t('engine.python.desktop.only'));
+            }
         }
 
-        // ── OCR API Engine Settings ──
-        if (engine === 'ocr-api') {
+        // ============================================================
+        // End of Layout Engine Section
+        // ============================================================
+        containerEl.createEl('hr');
+
+        // ============================================================
+        // OCR (AI VISION) — independent subsystem, always available
+        // ============================================================
+        {
             const ocrSettings = this.plugin.settings.ocrProvider;
 
-            containerEl.createEl('h4', { text: 'OCR Model Provider' });
+            new Setting(containerEl).setName(t('ocr.section')).setHeading();
             containerEl.createEl('p', {
-                text: 'Configure the AI model used for OCR. This is separate from your translation model.',
+                text: t('ocr.section.desc'),
+                cls: 'setting-item-description'
+            });
+
+            containerEl.createEl('h4', { text: t('ocr.provider.section') });
+            containerEl.createEl('p', {
+                text: 'The AI model used for recognition. This is separate from your translation model.',
                 cls: 'setting-item-description'
             });
 
             // Provider Selection
             new Setting(containerEl)
-                .setName('OCR Provider')
+                .setName(t('ocr.provider.label'))
                 .addDropdown(dd => {
                     dd.addOption('openrouter', 'OpenRouter')
                       .addOption('openai', 'OpenAI')
@@ -832,8 +797,8 @@ export default class OpenRouterSettingsTab extends PluginSettingTab {
             // API Key (for providers that need it)
             if (['openrouter', 'openai', 'gemini'].includes(ocrSettings.provider)) {
                 new Setting(containerEl)
-                    .setName('OCR API Key')
-                    .setDesc('API key for the OCR model (can be different from translation key).')
+                    .setName(t('ocr.apikey.label'))
+                    .setDesc(t('ocr.apikey.desc'))
                     .addText(text => {
                         text.setPlaceholder('sk-...')
                             .setValue(ocrSettings.apiKey || '')
@@ -1039,49 +1004,68 @@ export default class OpenRouterSettingsTab extends PluginSettingTab {
                     cls: 'setting-item-description'
                 });
             }
-            
-            new Setting(containerEl)
-                .setName('JSON strictness')
-                .setDesc(
-                    ocrSettings.provider === 'ollama'
-                        ? 'Strict = perfect JSON required; Lenient = strict formatting instructions; Repair‑friendly = accept imperfect output (will be auto‑repaired).'
-                        : 'Controls how strictly the model must follow JSON formatting. For Ollama small models, use lenient or repair‑friendly.'
-                )
-                .addDropdown(dd => {
-                    dd.addOption('strict', 'Strict (perfect JSON)')
-                      .addOption('lenient', 'Lenient (strict instructions)')
-                      .addOption('repair-friendly', 'Repair‑friendly (allow imperfect)')
-                      .setValue(ocrSettings.jsonStrictness || 'strict')
-                      .onChange(async (value: 'strict' | 'lenient' | 'repair-friendly') => {
-                          ocrSettings.jsonStrictness = value;
-                          await this.plugin.saveSettings();
-                          this.display();
-                      });
-                });
 
+            // ── OCR Output ──
             containerEl.createEl('hr');
-            containerEl.createEl('h4', { text: 'OCR Workflow' });
+            containerEl.createEl('h4', { text: t('ocr.output.section') });
 
-            // Input Mode
-            new Setting(containerEl)
-                .setName('Input Mode')
-                .setDesc('"Image" = capture page as image and send to vision model. "File Path" = inject file path into prompt (for local models).')
-                .addDropdown(dd => {
-                    dd.addOption('image', 'Image (Vision API)')
-                      .addOption('filepath', 'File Path (in prompt)')
-                      .setValue(ocrSettings.inputMode)
-                      .onChange(async (value: any) => {
-                          ocrSettings.inputMode = value;
-                          await this.plugin.saveSettings();
-                          this.display();
-                      });
-                });
-
-            // Image settings (only if image mode)
-            if (ocrSettings.inputMode === 'image') {
+            {
+                // Output folder (with folder autocomplete)
                 new Setting(containerEl)
-                    .setName('Image Scale')
-                    .setDesc('Resolution multiplier (2x recommended for OCR quality).')
+                    .setName(t('ocr.folder.label'))
+                    .setDesc(t('ocr.folder.desc'))
+                    .then(setting => {
+                        setting.controlEl.style.position = 'relative';
+                        const fs = new FolderSuggest(this.app, setting.controlEl);
+                        fs.setValue(ocrSettings.ocrOutputFolder || '');
+                        fs.onChange(async (value) => {
+                            ocrSettings.ocrOutputFolder = value.trim();
+                            await this.plugin.saveSettings();
+                        });
+                    });
+
+                // Filename pattern
+                new Setting(containerEl)
+                    .setName(t('ocr.pattern.label'))
+                    .setDesc(t('ocr.pattern.desc'))
+                    .addText(text => text
+                        .setPlaceholder('{pdfname}.translated')
+                        .setValue(ocrSettings.ocrOutputFilenamePattern || '{pdfname}.translated')
+                        .onChange(async (value) => {
+                            ocrSettings.ocrOutputFilenamePattern = value.trim() || '{pdfname}.translated';
+                            await this.plugin.saveSettings();
+                        }));
+
+                // Transcription prompt (text mode; no JSON)
+                new Setting(containerEl)
+                    .setName(t('ocr.prompt.label'))
+                    .setDesc(t('ocr.prompt.desc'))
+                    .then(setting => {
+                        setting.controlEl.style.flexDirection = 'column';
+                        setting.controlEl.style.alignItems = 'flex-end';
+                        const ta = new TextAreaComponent(setting.controlEl)
+                            .setValue(ocrSettings.ocrTextPromptTemplate || DEFAULT_OCR_TEXT_PROMPT)
+                            .onChange(async (value) => {
+                                ocrSettings.ocrTextPromptTemplate = value;
+                                await this.plugin.saveSettings();
+                            });
+                        ta.inputEl.style.width = '100%';
+                        ta.inputEl.rows = 8;
+                        ta.inputEl.style.fontFamily = 'monospace';
+                        ta.inputEl.style.fontSize = '12px';
+                        new ButtonComponent(setting.controlEl)
+                            .setButtonText(t('prompts.restore'))
+                            .onClick(async () => {
+                                ocrSettings.ocrTextPromptTemplate = DEFAULT_OCR_TEXT_PROMPT;
+                                await this.plugin.saveSettings();
+                                ta.setValue(DEFAULT_OCR_TEXT_PROMPT);
+                            })
+                            .buttonEl.style.marginTop = '8px';
+                    });
+
+                new Setting(containerEl)
+                    .setName(t('ocr.scale.label'))
+                    .setDesc(t('ocr.scale.desc'))
                     .addSlider(slider => slider
                         .setLimits(1, 4, 0.5)
                         .setValue(ocrSettings.imageScale ?? 2)
@@ -1091,164 +1075,28 @@ export default class OpenRouterSettingsTab extends PluginSettingTab {
                             await this.plugin.saveSettings();
                         }));
 
-                new Setting(containerEl)
-                    .setName('Image Format')
-                    .addDropdown(dd => {
-                        dd.addOption('png', 'PNG (lossless)')
-                          .addOption('jpeg', 'JPEG (smaller)')
-                          .setValue(ocrSettings.imageFormat || 'png')
-                          .onChange(async (value: any) => {
-                              ocrSettings.imageFormat = value;
-                              await this.plugin.saveSettings();
-                          });
-                    });
+                containerEl.createEl('p', {
+                    text: t('ocr.hint'),
+                    cls: 'setting-item-description',
+                });
             }
 
-            // Workflow Mode
-            new Setting(containerEl)
-                .setName('Workflow')
-                .setDesc('"Per page" = OCR on demand when you translate a page. "Full document" = pre-OCR all pages, cache to disk, translate later.')
-                .addDropdown(dd => {
-                    dd.addOption('per-page', 'Per Page (on demand)')
-                      .addOption('full-document', 'Full Document (pre-cache)')
-                      .setValue(ocrSettings.workflowMode)
-                      .onChange(async (value: any) => {
-                          ocrSettings.workflowMode = value;
-                          await this.plugin.saveSettings();
-                      });
-                });
-
-            containerEl.createEl('hr');
-            containerEl.createEl('h4', { text: 'OCR Prompt Template' });
-
-            // Prompt Template
-            new Setting(containerEl)
-                .setName('OCR Prompt')
-                .setDesc('Prompt sent to the OCR model. Placeholders: {{absoluteFilePath}}, {{pageNumber}}, {{totalPages}}')
-                .then(setting => {
-                    setting.controlEl.style.flexDirection = 'column';
-                    setting.controlEl.style.alignItems = 'flex-end';
-
-                    const textarea = new TextAreaComponent(setting.controlEl)
-                        .setValue(ocrSettings.ocrPromptTemplate)
-                        .onChange(async (value) => {
-                            ocrSettings.ocrPromptTemplate = value;
-                            await this.plugin.saveSettings();
-                        });
-                    textarea.inputEl.style.width = '100%';
-                    textarea.inputEl.rows = 12;
-                    textarea.inputEl.style.fontFamily = 'monospace';
-                    textarea.inputEl.style.fontSize = '12px';
-
-                    // 🆕 Restore default button now uses the context‑aware helper
-                    new ButtonComponent(setting.controlEl)
-                        .setButtonText('Restore Default')
-                        .onClick(async () => {
-                            const defaultPrompt = getDefaultOcrPrompt(ocrSettings);
-                            ocrSettings.ocrPromptTemplate = defaultPrompt;
-                            await this.plugin.saveSettings();
-                            textarea.setValue(defaultPrompt);
-                        })
-                        .buttonEl.style.marginTop = '8px';
-                });
-
-            // Custom response path (for custom providers)
-            if (ocrSettings.provider === 'custom') {
-                new Setting(containerEl)
-                    .setName('Response JSON Path')
-                    .setDesc('JSON path to extract content from response (e.g., choices[0].message.content)')
-                    .addText(text => text
-                        .setValue(ocrSettings.responseJsonPath || '')
-                        .onChange(async (value) => {
-                            ocrSettings.responseJsonPath = value;
-                            await this.plugin.saveSettings();
-                        }));
-
-                new Setting(containerEl)
-                    .setName('Custom Headers (JSON)')
-                    .setDesc('Use {apiKey} placeholder.')
-                    .addTextArea(ta => {
-                        ta.setValue(ocrSettings.headers || '{}')
-                          .onChange(async v => {
-                              ocrSettings.headers = v;
-                              await this.plugin.saveSettings();
-                          });
-                        ta.inputEl.rows = 3;
-                    });
-
-                new Setting(containerEl)
-                    .setName('Custom Request Body (JSON Template)')
-                    .setDesc('Placeholders: {model}, {prompt}, {imageBase64}, {imageMimeType}, {temperature}, {maxTokens}')
-                    .addTextArea(ta => {
-                        ta.setValue(ocrSettings.requestBody || '{}')
-                          .onChange(async v => {
-                              ocrSettings.requestBody = v;
-                              await this.plugin.saveSettings();
-                          });
-                        ta.inputEl.rows = 10;
-                    });
-            }
-
-            // Cache Management
-            containerEl.createEl('hr');
-            containerEl.createEl('h4', { text: 'OCR Cache' });
-
-            new Setting(containerEl)
-                .setName('Clear OCR Cache')
-                .setDesc('Remove the cached OCR data for the currently open PDF.')
-                .addButton(btn => btn
-                    .setButtonText('Clear Current PDF Cache')
-                    .setWarning()
-                    .onClick(async () => {
-                        const file = this.plugin.app.workspace.getActiveFile();
-                        if (file && file.extension === 'pdf') {
-                            await this.plugin.ocrLayout.clearCache(file.path);
-                            new Notice('OCR cache cleared for this PDF.');
-                        } else {
-                            new Notice('No PDF is currently open.');
-                        }
-                    }));
-
-            // Test OCR Button
-            new Setting(containerEl)
-                .setName('Test OCR Setup')
-                .setDesc('Run OCR on the current page to verify your settings.')
-                .addButton(btn => btn
-                    .setButtonText('Test Current Page')
-                    .onClick(async () => {
-                        const file = this.plugin.app.workspace.getActiveFile();
-                        const pageEl = this.plugin.getCurrentPageElement();
-                        if (file && file.extension === 'pdf' && pageEl) {
-                            const pageNum = parseInt(pageEl.getAttribute('data-page-number') || '1', 10);
-                            const result = await this.plugin.ocrLayout.ocrPage(file, pageNum, pageEl);
-                            if (result) {
-                                new Notice(`✅ Test passed: found ${result.length} text blocks.`);
-                                console.log('OCR Test Result:', result);
-                            }
-                        } else {
-                            new Notice('Open a PDF and navigate to a page first.');
-                        }
-                    }));
         }
-
-        // ============================================================
-        // End of Layout Engine Section
-        // ============================================================
 
         // ============================================================
         // PDF EXPORT SETTINGS
         // ============================================================
         
         containerEl.createEl('hr');
-        containerEl.createEl('h3', { text: 'PDF Export Settings' });
+        containerEl.createEl('h3', { text: t('export.section') });
         containerEl.createEl('p', {
-            text: 'Export PDFs with translation overlays permanently merged. Requires PyMuPDF (pip install PyMuPDF).',
+            text: t('export.section.desc'),
             cls: 'setting-item-description'
         });
 
         new Setting(containerEl)
-            .setName('PDF Export Script Path')
-            .setDesc('Absolute path to the "pdf_export.py" script.')
+            .setName(t('export.script.label'))
+            .setDesc(t('export.script.desc'))
             .addText(text => text
                 .setPlaceholder('/path/to/pdf_export.py')
                 .setValue(this.plugin.settings.pdfExportScriptPath || '')
@@ -1259,77 +1107,22 @@ export default class OpenRouterSettingsTab extends PluginSettingTab {
 
         // Test Setup Button
         new Setting(containerEl)
-            .setName('Test Export Setup')
-            .setDesc('Verify Python and PyMuPDF installation')
+            .setName(t('export.test.label'))
+            .setDesc(t('export.test.desc'))
             .addButton(button => button
-                .setButtonText('Test Setup')
+                .setButtonText(t('export.test.btn'))
                 .onClick(async () => {
                     await this.testExportSetup();
                 }));
 
-        containerEl.createEl('h4', { text: 'Default Export Options' });
         containerEl.createEl('p', {
-            text: 'These settings are used as defaults when exporting. You can override them in the export modal.',
+            text: 'Export rendering options (font sizing, per-segment color) are controlled per export in the export modal. The exported PDF draws a white background behind each translated block and uses each block\u2019s own text color.',
             cls: 'setting-item-description'
         });
 
-        new Setting(containerEl)
-            .setName('Background Color')
-            .setDesc('Default color for translation overlay backgrounds (hex format, e.g., #FFFFFF)')
-            .addText(text => text
-                .setPlaceholder('#FFFFFF')
-                .setValue(this.plugin.settings.exportBackgroundColor || '#FFFFFF')
-                .onChange(async (value) => {
-                    if (/^#[0-9A-Fa-f]{6}$/.test(value)) {
-                        this.plugin.settings.exportBackgroundColor = value;
-                        await this.plugin.saveSettings();
-                    }
-                }));
-
-        new Setting(containerEl)
-            .setName('Background Opacity')
-            .setDesc('Default opacity for translation backgrounds (0-100)')
-            .addSlider(slider => slider
-                .setLimits(0, 100, 5)
-                .setValue(this.plugin.settings.exportBackgroundOpacity || 90)
-                .setDynamicTooltip()
-                .onChange(async (value) => {
-                    this.plugin.settings.exportBackgroundOpacity = value;
-                    await this.plugin.saveSettings();
-                }));
-
-        new Setting(containerEl)
-            .setName('Text Color')
-            .setDesc('Default color for translated text (hex format, e.g., #000000)')
-            .addText(text => text
-                .setPlaceholder('#000000')
-                .setValue(this.plugin.settings.exportTextColor || '#000000')
-                .onChange(async (value) => {
-                    if (/^#[0-9A-Fa-f]{6}$/.test(value)) {
-                        this.plugin.settings.exportTextColor = value;
-                        await this.plugin.saveSettings();
-                    }
-                }));
-
-        new Setting(containerEl)
-            .setName('Preserve Original Text')
-            .setDesc('By default, keep the original text visible under translations')
-            .addToggle(toggle => toggle
-                .setValue(this.plugin.settings.exportPreserveOriginal ?? true)
-                .onChange(async (value) => {
-                    this.plugin.settings.exportPreserveOriginal = value;
-                    await this.plugin.saveSettings();
-                }));
-
-        new Setting(containerEl)
-            .setName('Auto-Open Exported PDFs')
-            .setDesc('Automatically open PDFs in Obsidian after export completes')
-            .addToggle(toggle => toggle
-                .setValue(this.plugin.settings.exportAutoOpen ?? true)
-                .onChange(async (value) => {
-                    this.plugin.settings.exportAutoOpen = value;
-                    await this.plugin.saveSettings();
-                }));
+        // Custom Copy Formats live here, next to export, since both concern
+        // getting translated content OUT of the plugin.
+        this.renderCopyFormats(containerEl);
 
         // ============================================================
         // End of PDF Export Section
@@ -1337,11 +1130,176 @@ export default class OpenRouterSettingsTab extends PluginSettingTab {
 
         containerEl.createEl('hr');
         new Setting(containerEl)
-            .setName('Debug Mode')
-            .setDesc('Log detailed information to the developer console.')
+            .setName(t('debug.label'))
+            .setDesc(t('debug.desc'))
             .addToggle(t => t.setValue(this.plugin.settings.debugMode).onChange(async v => {
                 this.plugin.settings.debugMode = v; await this.plugin.saveSettings();
             }));
+    }
+
+    /** Custom copy-format templates (callout/citation/footnote). Rendered in
+     *  the Export area since it concerns getting content out of the plugin. */
+    renderCopyFormats(containerEl: HTMLElement): void {
+        containerEl.createEl('hr');
+        new Setting(containerEl).setName(t('export.formats.section')).setHeading();
+
+        const placeholderDesc = createFragment(doc => {
+            doc.createSpan({ text: 'Placeholders: ' });
+            doc.createEl('code', { text: '{text}' });
+            doc.createSpan({ text: ', ' });
+            doc.createEl('code', { text: '{blockquote_text}' });
+            doc.createSpan({ text: ', ' });
+            doc.createEl('code', { text: '{filename}' });
+            doc.createSpan({ text: ', ' });
+            doc.createEl('code', { text: '{pagelink}' });
+            doc.createSpan({ text: ', ' });
+            doc.createEl('code', { text: '{pagenumber}' });
+        });
+
+        const createFormatSetting = (name: string, settingKey: 'calloutFormat' | 'citationFormat' | 'footnoteFormat') => {
+            new Setting(containerEl)
+                .setName(name)
+                .setDesc(placeholderDesc)
+                .then(setting => {
+                    setting.controlEl.style.flexDirection = 'column';
+                    setting.controlEl.style.alignItems = 'flex-end';
+
+                    const textarea = new TextAreaComponent(setting.controlEl)
+                        .setValue(this.plugin.settings[settingKey]).onChange(async v => {
+                            this.plugin.settings[settingKey] = v; await this.plugin.saveSettings();
+                        });
+                    textarea.inputEl.style.width = '100%';
+                    textarea.inputEl.rows = 5;
+
+                    new ButtonComponent(setting.controlEl).setButtonText(t('prompts.restore')).onClick(async () => {
+                        this.plugin.settings[settingKey] = DEFAULT_SETTINGS[settingKey];
+                        await this.plugin.saveSettings();
+                        textarea.setValue(DEFAULT_SETTINGS[settingKey]);
+                    }).buttonEl.style.marginTop = '8px';
+                });
+        };
+
+        createFormatSetting(t('export.formats.callout'), 'calloutFormat');
+        createFormatSetting(t('export.formats.citation'), 'citationFormat');
+        createFormatSetting(t('export.formats.footnote'), 'footnoteFormat');
+    }
+
+    /**
+     * Fetch the list of available model IDs for a translation provider directly
+     * from its API. Returns [] on failure (caller falls back to manual entry).
+     * This replaces hardcoded model lists with live data.
+     */
+    async fetchModelsFor(provider: string, ps: any): Promise<{ id: string; label: string }[]> {
+        try {
+            if (provider === 'openrouter') {
+                const resp = await requestUrl('https://openrouter.ai/api/v1/models');
+                const data = await resp.json;
+                return (Array.isArray(data.data) ? data.data : [])
+                    .map((m: any) => ({ id: m.id, label: `${m.name || m.id}` }))
+                    .sort((a: any, b: any) => a.label.localeCompare(b.label));
+            }
+            if (provider === 'openai') {
+                if (!ps.apiKey) return [];
+                const resp = await requestUrl({
+                    url: 'https://api.openai.com/v1/models',
+                    headers: { 'Authorization': `Bearer ${ps.apiKey}` },
+                });
+                const data = await resp.json;
+                return (Array.isArray(data.data) ? data.data : [])
+                    // Keep chat-capable families; exclude embeddings/audio/image/moderation.
+                    .filter((m: any) => /^(gpt|o\d|chatgpt)/i.test(m.id) &&
+                        !/(embedding|whisper|tts|audio|image|moderation|dall)/i.test(m.id))
+                    .map((m: any) => ({ id: m.id, label: m.id }))
+                    .sort((a: any, b: any) => a.id.localeCompare(b.id));
+            }
+            if (provider === 'gemini') {
+                if (!ps.apiKey) return [];
+                const resp = await requestUrl(
+                    `https://generativelanguage.googleapis.com/v1beta/models?key=${ps.apiKey}`
+                );
+                const data = await resp.json;
+                return (Array.isArray(data.models) ? data.models : [])
+                    .filter((m: any) =>
+                        /gemini/i.test(m.name) &&
+                        (!m.supportedGenerationMethods ||
+                         m.supportedGenerationMethods.includes('generateContent')))
+                    .map((m: any) => ({ id: m.name, label: m.displayName || m.name }));
+            }
+            if (provider === 'ollama') {
+                const endpoint = ps.apiEndpoint || 'http://localhost:11434';
+                const resp = await requestUrl({ url: `${endpoint}/api/tags` });
+                const data = await resp.json;
+                return (Array.isArray(data.models) ? data.models : [])
+                    .map((m: any) => ({ id: m.name, label: m.name }));
+            }
+        } catch (e) {
+            console.error(`Failed to fetch models for ${provider}:`, e);
+        }
+        return [];
+    }
+
+    /**
+     * Build a Model setting: a dropdown populated from the live API plus a
+     * Refresh button, and a manual-entry fallback so unusual/new model IDs are
+     * always reachable even if the API list is incomplete.
+     */
+    buildModelSetting(
+        containerEl: HTMLElement,
+        provider: string,
+        ps: any,
+        fallback: string,
+    ): void {
+        const setting = new Setting(containerEl)
+            .setName('Model')
+            .setDesc('Fetched live from the provider. Use Refresh after entering your key, or type a model ID manually below.');
+
+        let dropdown: import('obsidian').DropdownComponent | null = null;
+
+        const populate = async (models: { id: string; label: string }[]) => {
+            if (!dropdown) return;
+            dropdown.selectEl.empty();
+            if (models.length === 0) {
+                dropdown.addOption('', '(no models — enter manually)');
+            } else {
+                models.forEach(m => dropdown!.addOption(m.id, m.label));
+            }
+            const current = ps.model || fallback;
+            if (current && !models.find(m => m.id === current)) {
+                dropdown.addOption(current, `${current} (saved)`);
+            }
+            dropdown.setValue(current || '');
+        };
+
+        setting.addDropdown(dd => {
+            dropdown = dd;
+            dd.addOption(ps.model || fallback || '', 'Loading…');
+            dd.setValue(ps.model || fallback || '');
+            dd.onChange(async v => { ps.model = v; await this.plugin.saveSettings(); });
+            // Initial fetch.
+            this.fetchModelsFor(provider, ps).then(populate);
+        });
+
+        setting.addExtraButton(b => b
+            .setIcon('refresh-cw')
+            .setTooltip('Refresh model list')
+            .onClick(async () => {
+                new Notice(t('provider.model.refresh.notice.loading'));
+                const models = await this.fetchModelsFor(provider, ps);
+                await populate(models);
+                new Notice(models.length ? t('provider.model.refresh.notice.ok',{n:models.length}) : t('provider.model.refresh.notice.empty'));
+            }));
+
+        // Manual override — always works regardless of the API list.
+        new Setting(containerEl)
+            .setName(t('provider.model.manual.label'))
+            .setDesc(t('provider.model.manual.desc'))
+            .addText(t => t
+                .setPlaceholder(fallback)
+                .setValue(ps.model || '')
+                .onChange(async v => {
+                    const val = v.trim();
+                    if (val) { ps.model = val; await this.plugin.saveSettings(); }
+                }));
     }
 
     /**

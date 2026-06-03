@@ -1,6 +1,6 @@
-﻿// processing.ts вЂ“ FULL OVERHAULED VERSION
+// processing.ts – FULL OVERHAULED VERSION
 // All fixes integrated: robust chunking, [#ID] delimiters for 100% retention,
-// superвЂ‘resilient numberedвЂ‘line parser, automatic fallbacks, full debug logging,
+// super-resilient numbered-line parser, automatic fallbacks, full debug logging,
 // AND structure restoration to preserve original numbering/bullets.
 // No text is ever dropped or left unappended.
 
@@ -23,7 +23,7 @@ export class TextProcessor {
   private styleCache = new Map<HTMLElement, CSSStyleDeclaration>();
   private colorDistanceCache = new Map<string, number>();
 
-  // State вЂ“ now stores BOTH units AND their translated lines
+  // State – now stores BOTH units AND their translated lines
   private lastPreparedUnits: {
     pageElement: HTMLElement;
     units: TranslationUnit[];
@@ -59,6 +59,8 @@ export class TextProcessor {
   }
 
   public async addTextOverlay() {
+    // Standard overlay translation (internal/python only). OCR-AI is a separate
+    // subsystem reached through its own commands, never through here.
     const currentPage = this.plugin.overlay.getCurrentPageElement();
     if (currentPage) {
       await this.addOverlayToPage(currentPage);
@@ -73,11 +75,11 @@ export class TextProcessor {
       if (translatedText) {
         await this.createOverlayWithText(pageElement, translatedText);
         const successfulTranslations = translatedText.split('\n').filter(line => line !== 'Translation missing').length;
-        new Notice(`вњ… Translation complete. Rendered ${successfulTranslations} segment(s).`, 3000);
+        new Notice(`✓ Translation complete. Rendered ${successfulTranslations} segment(s).`, 3000);
       }
     } catch (error: any) {
       console.error("addOverlayToPage process failed:", error);
-      new Notice(`вљ пёЏ Translation failed: ${error.message}`, 4000);
+      new Notice(`⚠ Translation failed: ${error.message}`, 4000);
     }
   }
 
@@ -87,7 +89,7 @@ export class TextProcessor {
     const textLayer = pageElement.querySelector('.textLayer') as HTMLElement;
     const engine = this.plugin.settings.layoutEngine;
 
-    if (engine !== 'ocr-api' && !textLayer) {
+    if (!textLayer && engine === 'internal') {
       new Notice('Text layer not found. Wait for PDF to fully render.');
       return null;
     }
@@ -95,9 +97,6 @@ export class TextProcessor {
     let translationUnits: TranslationUnit[] | null = null;
 
     switch (engine) {
-      case 'ocr-api':
-        translationUnits = await this.prepareOcrApiTranslationUnits(pageElement);
-        break;
       case 'python':
         translationUnits = await this.prepareExternalTranslationUnits(pageElement);
         break;
@@ -112,13 +111,17 @@ export class TextProcessor {
       return null;
     }
 
-    if (this.plugin.settings.enableSemanticMerging) {
+    // Semantic merging is only safe for the internal engine, where geometry
+    // lives in originalSpans. For OCR/python each block is a complete layout
+    // region with its own rect, so merging across regions would drop/!misplace
+    // bounding boxes (the merged unit would keep only the first fragment's rect).
+    if (this.plugin.settings.enableSemanticMerging && engine === 'internal') {
       translationUnits = this.mergeSemanticFragments(translationUnits);
     }
 
     const translatedLines = await this.executeTranslation(translationUnits);
 
-    // Cache everything вЂ“ guarantees perfect 1:1 mapping for overlay creation
+    // Cache everything – guarantees perfect 1:1 mapping for overlay creation
     this.lastPreparedUnits = {
       pageElement,
       units: [...translationUnits],
@@ -143,8 +146,8 @@ export class TextProcessor {
       translationUnits = this.lastPreparedUnits.units;
       translatedLines = this.lastPreparedUnits.translatedLines;
     } else {
-      // No cache вЂ“ cannot safely use the passed translatedText.
-      new Notice('вљ пёЏ Page data expired. Please reвЂ‘translate.', 3000);
+      // No cache – cannot safely use the passed translatedText.
+      new Notice('⚠ Page data expired. Please re-translate.', 3000);
       overlayContainer.remove();
       return;
     }
@@ -361,7 +364,8 @@ export class TextProcessor {
     const terminatorRegex = /[.?!:](?:\s*<\/[^>]+>)*\s*$/;
     const startLowercaseRegex = /^(?:<[^>]+>)*\s*[a-z]/;
 
-    let currentUnit = units[0];
+    // Clone so we never mutate the caller's unit objects/arrays.
+    let currentUnit: TranslationUnit = { ...units[0], originalSpans: [...units[0].originalSpans] };
 
     for (let i = 1; i < units.length; i++) {
       const nextUnit = units[i];
@@ -376,7 +380,7 @@ export class TextProcessor {
         }
       } else {
         mergedUnits.push(currentUnit);
-        currentUnit = nextUnit;
+        currentUnit = { ...nextUnit, originalSpans: [...nextUnit.originalSpans] };
       }
     }
     mergedUnits.push(currentUnit);
@@ -384,7 +388,7 @@ export class TextProcessor {
   }
 
   // ==================== TRANSLATION EXECUTION ====================
-  // ** OVERHAULED ** вЂ“ Uses [#ID] syntax to prevent regex confusion
+  // ** OVERHAULED ** – Uses [#ID] syntax to prevent regex confusion
 
   public async executeTranslation(units: TranslationUnit[]): Promise<string[]> {
     this.translationFailures = [];
@@ -417,7 +421,7 @@ export class TextProcessor {
         }
         
         // 2. Robust Extraction
-        translatedLines = this.extractNumberedLinesRobust(raw, units.length, units.map(u => u.text));
+        translatedLines = await this.extractNumberedLinesRobust(raw, units.length, units.map(u => u.text));
       } else {
         // Sequential fallback
         translatedLines = await this.performSequentialTranslation(units);
@@ -457,7 +461,7 @@ export class TextProcessor {
       const indices: number[] = [];
       let chunkLength = 0;
 
-      // Greedy accumulation вЂ“ always include at least 1 unit to prevent infinite loop.
+      // Greedy accumulation – always include at least 1 unit to prevent infinite loop.
       while (i < units.length) {
         const addedLength = units[i].text.length + 8; // "[#12] " overhead
 
@@ -494,7 +498,7 @@ export class TextProcessor {
       const chunkText = indices.map((idx, localPos) => `[#${localPos + 1}] ${units[idx].text}`).join('\n');
 
       if (this.plugin.settings.debugMode) {
-        console.log(`[Chunk ${chunkCounter}] Translating ${indices.length} unit(s) (global indices ${indices[0]}вЂ“${indices[indices.length - 1]}):\n${chunkText}`);
+        console.log(`[Chunk ${chunkCounter}] Translating ${indices.length} unit(s) (global indices ${indices[0]}–${indices[indices.length - 1]}):\n${chunkText}`);
       }
 
       try {
@@ -506,7 +510,7 @@ export class TextProcessor {
         }
 
         const chunkOriginals = indices.map(idx => units[idx].text);
-        const lines = this.extractNumberedLinesRobust(raw, indices.length, chunkOriginals);
+        const lines = await this.extractNumberedLinesRobust(raw, indices.length, chunkOriginals);
 
         // Validate that we got the right number of lines back before mapping.
         if (lines.length !== indices.length) {
@@ -556,7 +560,7 @@ export class TextProcessor {
     return -1;
   }
 
-  public extractNumberedLines(rawText: string, expectedCount: number, originalTexts: string[] = []): string[] {
+  public async extractNumberedLines(rawText: string, expectedCount: number, originalTexts: string[] = []): Promise<string[]> {
     const fallbacks =
       originalTexts.length >= expectedCount
         ? originalTexts
@@ -567,15 +571,15 @@ export class TextProcessor {
     return this.extractNumberedLinesRobust(rawText, expectedCount, fallbacks);
   }
 
-  // ==================== ROBUST NUMBEREDвЂ‘LINE PARSER ====================
-  // ** OVERHAULED ** вЂ“ Handles [#ID] tags and falls back gracefully
+  // ==================== ROBUST NUMBERED-LINE PARSER ====================
+  // ** OVERHAULED ** – Handles [#ID] tags and falls back gracefully
 
 
-  private extractNumberedLinesRobust(
+  private async extractNumberedLinesRobust(
     rawText: string,
     expectedCount: number,
     originalTexts: string[]
-  ): string[] {
+  ): Promise<string[]> {
     // 1. Sanitize AI Output
     let cleanText = rawText
       .replace(/```(?:json|text)?/g, '')
@@ -585,22 +589,17 @@ export class TextProcessor {
 
     const result = Array(expectedCount).fill('Translation missing');
 
-    // STRATEGY A: Specific Tag Matching "[#1] ..."
-    // The lookahead requires \n before the next tag, OR allows the tag to appear
-    // mid-line (no preceding \n) by also checking for (?=\[#\d+\]) directly.
-    // This catches LLMs that emit everything on one line.
-    const tagRegex = /(?:^|\n)[\s*_]*\[#(\d+)\][\s*_]*(?:[:.-])?\s*([\s\S]*?)(?=(?:\n[\s*_]*\[#\d+\])|$)/g;
-
-    let match;
+    // STRATEGY A: Position-independent [#N] tag splitting.
+    // Splitting on the tags themselves finds a [#N] anywhere — multiple per
+    // line, or mid-line after a wrap — which the old line-anchored regex missed.
+    // parts = [pre, "1", text1, "2", text2, ...]
+    const parts = cleanText.split(/\[#(\d+)\]/);
     let foundCount = 0;
 
-    tagRegex.lastIndex = 0;
-
-    while ((match = tagRegex.exec(cleanText)) !== null) {
-      const num = parseInt(match[1], 10);
-      const text = match[2].trim();
-
-      if (num > 0 && num <= expectedCount) {
+    for (let k = 1; k < parts.length; k += 2) {
+      const num = parseInt(parts[k], 10);
+      const text = (parts[k + 1] ?? '').replace(/^[\s:.\-*_]+/, '').trim();
+      if (num >= 1 && num <= expectedCount && text) {
         result[num - 1] = text;
         foundCount++;
       }
@@ -609,21 +608,27 @@ export class TextProcessor {
     // If we found at least half the expected tags, trust Strategy A.
     // (A partial match is still better than misaligned line-splitting.)
     if (foundCount >= Math.ceil(expectedCount / 2)) {
-      if (foundCount < expectedCount && this.plugin.settings.debugMode) {
-        console.warn(
-          `extractNumberedLinesRobust [Strategy A]: Found ${foundCount}/${expectedCount} tags. ` +
-          `Missing segments will fall back to originals.`
-        );
+      // Re-translate only the holes individually rather than silently reverting.
+      let revertedCount = 0;
+      for (let i = 0; i < expectedCount; i++) {
+        if (result[i] !== 'Translation missing') continue;
+        try {
+          const retry = await this.plugin.translation.translateWithOpenRouter(originalTexts[i] ?? '');
+          const clean = (retry || '').trim();
+          if (clean) {
+            result[i] = clean;
+          } else {
+            result[i] = originalTexts[i] ?? 'Translation missing';
+            revertedCount++;
+          }
+        } catch {
+          result[i] = originalTexts[i] ?? 'Translation missing';
+          revertedCount++;
+        }
       }
 
-      // Fill any remaining 'Translation missing' holes with originals so nothing is lost.
-      for (let i = 0; i < expectedCount; i++) {
-        if (result[i] === 'Translation missing') {
-          if (this.plugin.settings.debugMode) {
-            console.warn(`Segment [#${i + 1}] not found in AI output. Reverting to original.`);
-          }
-          result[i] = originalTexts[i] ?? 'Translation missing';
-        }
+      if (revertedCount > 0) {
+        new Notice(`${revertedCount} of ${expectedCount} segment(s) could not be aligned and kept their original text.`, 5000);
       }
       return result;
     }
@@ -662,7 +667,7 @@ export class TextProcessor {
       return result;
     }
 
-    // STRATEGY D: Last resort вЂ“ fill with originals, log warning
+    // STRATEGY D: Last resort – fill with originals, log warning
     console.warn(
       `extractNumberedLinesRobust: All strategies failed for ${expectedCount} segments. ` +
       `Raw output had ${candidateLines.length} candidate lines. Reverting all to originals.`
@@ -671,11 +676,11 @@ export class TextProcessor {
   }
 
   // ==================== CRITICAL SAFEGUARD: STRUCTURE RESTORATION ====================
-  // ** NEW ** вЂ“ forces original list markers back onto translations
+  // ** NEW ** – forces original list markers back onto translations
 
   private restoreStructure(units: TranslationUnit[], translatedLines: string[]): string[] {
-    // Regex matches: "1.", "1.1", "2.1.3", "a)", "-", "вЂў"
-    const listMarkersRegex = /^(\d{1,2}\.\d{1,2}(\.\d{1,2})?|\d{1,3}[\.\)]|[a-z][\.\)]|[-вЂў*])\s+/i;
+    // Regex matches: "1.", "1.1", "2.1.3", "a)", "-", "•"
+    const listMarkersRegex = /^(\d{1,2}\.\d{1,2}(\.\d{1,2})?|\d{1,3}[\.\)]|[a-z][\.\)]|[-•*])\s+/i;
 
     return translatedLines.map((line, index) => {
       if (line === 'Translation missing') return line;
@@ -697,8 +702,8 @@ export class TextProcessor {
       // 2. Translation has marker, but it might be wrong (e.g. LLM wrote "1." instead of "2.1")
       if (translationMatch[1] !== marker) {
         // If the marker is purely numeric/bullet, we trust the original layout.
-        // We avoid replacing word-like starts (e.g. "Chapter 1" vs "CapГ­tulo 1" is fine).
-        if (/^[\d\.\-вЂў]+$/.test(marker)) {
+        // We avoid replacing word-like starts (e.g. "Chapter 1" vs "Capítulo 1" is fine).
+        if (/^[\d\.\-•]+$/.test(marker)) {
              return `${marker} ${line.replace(listMarkersRegex, '').trim()}`;
         }
       }
@@ -710,15 +715,22 @@ export class TextProcessor {
   // ==================== SEQUENTIAL TRANSLATION ====================
 
   private async performSequentialTranslation(units: TranslationUnit[]): Promise<string[]> {
-    return Promise.all(units.map(async (unit, i) => {
+    const results: string[] = new Array(units.length);
+    const delayMs = (this.plugin.settings as any).sequentialDelayMs ?? 150;
+
+    for (let i = 0; i < units.length; i++) {
       try {
-        return await this.plugin.translation.translateWithOpenRouter(unit.text);
+        results[i] = await this.plugin.translation.translateWithOpenRouter(units[i].text);
       } catch (error: any) {
         this.plugin.logDebug(`Translation failed for segment ${i}:`, error);
         this.translationFailures.push({ segmentIndex: i, error: error.message || 'Unknown error' });
-        return "Translation missing";
+        results[i] = 'Translation missing';
       }
-    }));
+      if (i < units.length - 1 && delayMs > 0) {
+        await new Promise(r => setTimeout(r, delayMs));
+      }
+    }
+    return results;
   }
 
   // ==================== RENDERING ====================
@@ -731,8 +743,8 @@ export class TextProcessor {
   ) {
     const engine = this.plugin.settings.layoutEngine;
 
-    // ----- EXTERNAL LAYOUT (python / ocr-api) -----
-    if (engine === 'python' || engine === 'ocr-api') {
+    // ----- EXTERNAL LAYOUT (python) -----
+    if (engine === 'python') {
       const pageNumber = parseInt(pageElement.getAttribute('data-page-number') || '0', 10);
       const activeFile = this.plugin.app.workspace.getActiveFile();
 
@@ -741,6 +753,20 @@ export class TextProcessor {
           const extRect = unit._externalRect;
           const extFont = unit._externalFont;
           if (!extRect) return null;
+
+          // Guard against degenerate / out-of-range rects from the layout source.
+          // These previously rendered as zero-size boxes pinned to the bottom-right.
+          const { l, t, w, h } = extRect;
+          const valid =
+            Number.isFinite(l) && Number.isFinite(t) &&
+            Number.isFinite(w) && Number.isFinite(h) &&
+            w > 0.001 && h > 0.001 &&        // has real area (normalized units)
+            l >= -0.01 && t >= -0.01 &&       // not off the top-left
+            l <= 1.01 && t <= 1.01;           // origin within the page
+          if (!valid) {
+            this.plugin.logDebug(`Dropping degenerate external rect for segment ${index}:`, extRect);
+            return null;
+          }
 
           return {
             selector: '',
@@ -771,16 +797,17 @@ export class TextProcessor {
     }
 
     // ----- INTERNAL LAYOUT (DOM) -----
-    const reassembledParagraphs = new Map<string, { originalSpans: HTMLSpanElement[]; translatedText: string; }>();
+    const reassembledParagraphs = new Map<string, { originalSpans: HTMLSpanElement[]; translatedText: string; originalText: string; }>();
     units.forEach((unit, index) => {
       const { paragraphId, originalSpans } = unit;
       const translatedLine = translatedLines[index];
       if (!reassembledParagraphs.has(paragraphId)) {
-        reassembledParagraphs.set(paragraphId, { originalSpans: [], translatedText: '' });
+        reassembledParagraphs.set(paragraphId, { originalSpans: [], translatedText: '', originalText: '' });
       }
       const group = reassembledParagraphs.get(paragraphId)!;
       group.originalSpans.push(...originalSpans);
       group.translatedText += (group.translatedText ? ' ' : '') + translatedLine;
+      group.originalText += (group.originalText ? ' ' : '') + (unit.text || '');
     });
 
     const mergedUnits: TranslationUnit[] = [];
@@ -790,7 +817,7 @@ export class TextProcessor {
         id: paragraphId,
         paragraphId: paragraphId,
         originalSpans: group.originalSpans,
-        text: ''
+        text: group.originalText
       });
       mergedTranslatedLines.push(group.translatedText);
     });
@@ -839,7 +866,7 @@ export class TextProcessor {
     const text = (span.textContent || '').trim();
     if (rect.width <= 1 || rect.height <= 1 || !text) return false;
     if (/^\d{1,3}$/.test(text)) return false;
-    if (text.length === 1 && /[вЂў\-вЂўВ»В«]/.test(text)) return false;
+    if (text.length === 1 && /[•\-»«]/.test(text)) return false;
     if (text.startsWith('http')) return false;
     return true;
   }

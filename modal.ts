@@ -1,5 +1,6 @@
-﻿// modal.ts
+// modal.ts
 import { Modal, Setting, Notice, ButtonComponent, TFile } from 'obsidian';
+import { t } from './i18n';
 import OpenRouterTranslatorPlugin from './main';
 
 /**
@@ -66,12 +67,12 @@ export class TranslateMultiplePagesModal extends Modal {
             return;
         }
 
-        this.titleEl.setText('Translate Multiple Pages');
-        contentEl.createEl('p', { text: `File: ${this.file.basename}` });
+        this.titleEl.setText(t('modal.translate.title'));
+        contentEl.createEl('p', { text: `${t('modal.translate.file')} ${this.file.basename}` });
 
         this.totalPages = await this.estimateTotalPages();
         this.endPage = this.totalPages;
-        contentEl.createEl('p', { text: `Estimated total pages: ${this.totalPages}` });
+        contentEl.createEl('p', { text: `${t('modal.translate.total')} ${this.totalPages}` });
 
         this.renderSettings(contentEl);
 
@@ -186,7 +187,7 @@ export class TranslateMultiplePagesModal extends Modal {
      */
     private renderActionButtons(container: HTMLElement) {
         const startButton = new ButtonComponent(container)
-            .setButtonText('Start Translation')
+            .setButtonText(t('modal.translate.btn.start'))
             .setCta()
             .onClick(async () => {
                 if (this.startPage > this.endPage) {
@@ -254,15 +255,11 @@ export class TranslateMultiplePagesModal extends Modal {
      * The main logic loop for processing a range of pages.
      */
     private async translatePageRange(pdfFile: TFile, startPage: number, endPage: number): Promise<void> {
-        const activeLeaf = this.app.workspace.activeLeaf;
-        const activeIsPdfLeaf = !!activeLeaf && activeLeaf.view.getViewType() === 'pdf';
         const activeFile = this.app.workspace.getActiveFile();
         const shouldRestorePage = !!activeFile && activeFile.path === pdfFile.path;
         const pageToRestore = shouldRestorePage ? this.plugin.getCurrentPageNumber() : null;
 
-        const pdfLeaf = (activeIsPdfLeaf ? activeLeaf : null)
-            || this.app.workspace.getLeavesOfType('pdf')[0]
-            || this.app.workspace.getMostRecentLeaf();
+        const pdfLeaf = this.plugin.pdfDom.resolveLeafForFile(pdfFile);
         if (!pdfLeaf) {
             throw new Error('No available workspace leaf to open PDF.');
         }
@@ -273,7 +270,7 @@ export class TranslateMultiplePagesModal extends Modal {
             if (!isAlreadyOpen) {
                 await pdfLeaf.openFile(pdfFile);
             }
-            if (!await this.waitForEl('.pdfViewer', 10000)) throw new Error('Failed to load PDF viewer.');
+            if (!await this.waitForEl(pdfLeaf, '.pdfViewer', 10000)) throw new Error('Failed to load PDF viewer.');
         } catch (err) {
             throw new Error('Could not open the specified PDF file.');
         }
@@ -304,7 +301,7 @@ export class TranslateMultiplePagesModal extends Modal {
 
                 const pageNum = processingQueue.shift()!;
                 const progressPrefix = `[${completed + 1}/${totalPagesToProcess}]`;
-                this.updateProgress(`${progressPrefix} рџ”„ Processing page ${pageNum}...`);
+                this.updateProgress(`${progressPrefix} ↻ Processing page ${pageNum}...`);
 
                 try {
                     // MODIFIED: Reworked the core logic with caching and verification
@@ -312,13 +309,13 @@ export class TranslateMultiplePagesModal extends Modal {
                         const navSuccess = await this.navigateToPage(pdfLeaf, pageNum);
                         if (!navSuccess) throw new Error('Navigation failed.');
 
-                        const pageEl = await this.waitForPageAndTextLayer(pageNum, 30000);
+                        const pageEl = await this.waitForPageAndTextLayer(pdfLeaf, pageNum, 30000);
                         if (!pageEl) throw new Error('Page or text layer failed to render.');
 
                         // Step 1: Get translation (from cache or new API call)
                         let translatedText = this.translationCache.get(pageNum);
                         if (!translatedText) {
-                            this.updateProgress(`${progressPrefix} вњЌпёЏ Translating page ${pageNum}...`);
+                            this.updateProgress(`${progressPrefix} ✍ Translating page ${pageNum}...`);
                             // ASSUMPTION: You need a method that only does the translation and returns a string.
                             translatedText = await this.plugin.processor.translatePageContent(pageEl);
                             if (!translatedText || translatedText.trim() === '') {
@@ -326,7 +323,7 @@ export class TranslateMultiplePagesModal extends Modal {
                             }
                             this.translationCache.set(pageNum, translatedText); // Cache the successful translation
                         } else {
-                            this.updateProgress(`${progressPrefix} рџ“„ Using cached translation for page ${pageNum}.`);
+                            this.updateProgress(`${progressPrefix} 📄 Using cached translation for page ${pageNum}.`);
                         }
 
                         // Step 2: Create the overlay with the translated text
@@ -354,7 +351,7 @@ export class TranslateMultiplePagesModal extends Modal {
                     }, pageNum);
 
                     completed++;
-                    this.updateProgress(`${progressPrefix} вњ… Page ${pageNum} complete.`);
+                    this.updateProgress(`${progressPrefix} ✓ Page ${pageNum} complete.`);
 
                     // Manage memory by removing old overlays from the DOM
                     if (this.activeOverlays.length > 5) {
@@ -379,7 +376,7 @@ export class TranslateMultiplePagesModal extends Modal {
             if (pageToRestore && pageToRestore > 0) {
                 await this.navigateToPage(pdfLeaf, pageToRestore);
             }
-            const summary = `рџЏЃ Finished: ${completed}/${totalPagesToProcess} succeeded${failed ? `, ${failed} failed` : ''}.`;
+            const summary = `Ѓ Finished: ${completed}/${totalPagesToProcess} succeeded${failed ? `, ${failed} failed` : ''}.`;
             this.updateProgress(summary);
             new Notice(summary, 7000);
         }
@@ -436,18 +433,28 @@ export class TranslateMultiplePagesModal extends Modal {
         }
     }
 
+    // #1: resolve the DOM subtree for a specific pdf leaf so lookups never hit
+    // another open PDF tab. Falls back to document only if the leaf has no container.
+    private leafRoot(pdfLeaf: any): ParentNode {
+        return this.plugin.pdfDom.getLeafContainer(pdfLeaf) ?? document;
+    }
+
+    private resolveLeafForFile(file: TFile): any {
+        return this.plugin.pdfDom.resolveLeafForFile(file);
+    }
+
     private async estimateTotalPages(): Promise<number> {
         await this.sleep(500);
-        const viewer = await this.waitForEl('.pdfViewer', 8000);
-        return viewer?.querySelectorAll('.page[data-page-number]').length || 1;
+        const leaf = this.resolveLeafForFile(this.file);
+        const total = await this.plugin.pdfDom.getTotalPages(leaf, /* forceLast */ true);
+        return total || 1;
     }
 
     private async navigateToPage(pdfLeaf: any, pageNum: number): Promise<boolean> {
         if (this.isCancelled) return false;
 
-        const pdfView = pdfLeaf.view;
-        const pageEl = document.querySelector<HTMLElement>(`.page[data-page-number="${pageNum}"]`);
-        if (!pdfView || !pageEl) {
+        const pageEl = this.plugin.pdfDom.getPageElement(pageNum, pdfLeaf);
+        if (!(pdfLeaf as any)?.view || !pageEl) {
             console.error(`PDF view or page element ${pageNum} not found.`);
             return false;
         }
@@ -465,11 +472,11 @@ export class TranslateMultiplePagesModal extends Modal {
         return true;
     }
 
-    private async waitForPageAndTextLayer(pageNum: number, timeoutMs: number): Promise<HTMLElement | null> {
+    private async waitForPageAndTextLayer(pdfLeaf: any, pageNum: number, timeoutMs: number): Promise<HTMLElement | null> {
         return this.waitForCondition(() => {
-            const pageEl = document.querySelector<HTMLElement>(`.page[data-page-number="${pageNum}"] .textLayer`);
-            const hasText = ((pageEl?.querySelector('span[role="presentation"]')?.textContent?.trim().length ?? 0) > 0);
-            return hasText ? pageEl!.parentElement as HTMLElement : null;
+            const tl = this.plugin.pdfDom.getTextLayer(pageNum, pdfLeaf);
+            const hasText = ((tl?.querySelector('span[role="presentation"]')?.textContent?.trim().length ?? 0) > 0);
+            return hasText ? (tl!.parentElement as HTMLElement) : null;
         }, timeoutMs, 250);
     }
 
@@ -480,8 +487,9 @@ export class TranslateMultiplePagesModal extends Modal {
         });
     }
 
-    private async waitForEl(selector: string, timeoutMs: number): Promise<HTMLElement | null> {
-        return this.waitForCondition(() => document.querySelector<HTMLElement>(selector), timeoutMs);
+    private async waitForEl(pdfLeaf: any, selector: string, timeoutMs: number): Promise<HTMLElement | null> {
+        const root = this.leafRoot(pdfLeaf);
+        return this.waitForCondition(() => root.querySelector<HTMLElement>(selector), timeoutMs);
     }
 
     private async waitForCondition<T>(

@@ -1,13 +1,11 @@
 // translation.ts
 import { requestUrl, Notice, RequestUrlParam } from 'obsidian';
 import OpenRouterTranslatorPlugin from './main';
-import { AVAILABLE_LANGUAGES } from './types';
+import { AVAILABLE_LANGUAGES, GEMMA_TEMPLATE as NEUTRAL_TEMPLATE } from './types';
 
-// The template definition (Fallback if not in types.ts)
-export const GEMMA_TEMPLATE = `You are a professional {SOURCE_LANG} ({SOURCE_CODE}) to {TARGET_LANG} ({TARGET_CODE}) translator, with specialisation in veterinary medicine. Your goal is to accurately convey the meaning and nuances of the original {SOURCE_LANG} text while adhering to {TARGET_LANG} grammar, vocabulary, and cultural sensitivities.
-Produce only the {TARGET_LANG} translation, without any additional explanations or commentary. Don't translate acronyms, leave them in original language. Please translate the following {SOURCE_LANG} text into {TARGET_LANG}:
-
-{TEXT}`;
+// Neutral, domain-agnostic fallback template (used only if the editable
+// custom template is empty). Single source of truth lives in types.ts.
+export const GEMMA_TEMPLATE = NEUTRAL_TEMPLATE;
 
 export class TranslationEngine {
     private plugin: OpenRouterTranslatorPlugin;
@@ -61,6 +59,13 @@ export class TranslationEngine {
 
     // === High-Level Translation Methods ===
 
+    /** The active "special template" text: user's editable customTemplate,
+     *  falling back to the legacy default if unset. */
+    private activeTemplate(): string {
+        const t = (this.plugin.settings as any).customTemplate;
+        return (typeof t === 'string' && t.trim()) ? t : GEMMA_TEMPLATE;
+    }
+
     /**
      * Translates a batch of text.
      * Note: If using Gemma Template, we must inject numbering instructions, 
@@ -74,7 +79,7 @@ export class TranslationEngine {
 
         if (useGemma) {
             // 1. Remove {TEXT} from the base template because we need to format the input specifically for batching
-            const baseTemplate = GEMMA_TEMPLATE.replace('{TEXT}', '').trim();
+            const baseTemplate = this.activeTemplate().replace('{TEXT}', '').trim();
             
             // 2. Add strict instructions for Numbered Lines so processing.ts can parse it
             const batchInstruction = `
@@ -113,7 +118,7 @@ Do NOT translate the numbers. Maintain the list structure. No extra commentary.
 
         if (useGemma) {
             // In Gemma mode, the text is baked into the System Prompt via {TEXT}
-            finalSystemPrompt = this.applyTemplateVariables(GEMMA_TEMPLATE, text);
+            finalSystemPrompt = this.applyTemplateVariables(this.activeTemplate(), text);
         } else {
             // Standard Mode
             let template = this.plugin.settings.singlePrompt;
@@ -175,7 +180,7 @@ Do NOT translate the numbers. Maintain the list structure. No extra commentary.
      * @param originalText The raw text (used for User role if not baked into System).
      * @param isBakedIn If true, the text is already inside fullPrompt, so User content should be minimal.
      */
-    private getRequestConfig(fullPrompt: string, originalText: string, isBakedIn: boolean): { url: string; options: RequestUrlParam } {
+    private getRequestConfig(fullPrompt: string, originalText: string, isBakedIn: boolean, maxTokens: number): { url: string; options: RequestUrlParam } {
         const providerId = this.plugin.settings.apiProvider;
         const provider = this.plugin.settings.providerSettings[providerId];
         
@@ -206,7 +211,8 @@ Do NOT translate the numbers. Maintain the list structure. No extra commentary.
                         { role: 'system', content: systemContent },
                         { role: 'user', content: userContent }
                     ],
-                    temperature: provider.temperature ?? 0.3
+                    temperature: provider.temperature ?? 0.3,
+                    max_tokens: maxTokens
                 };
                 
                 // Add reasoning effort for compatible models
@@ -230,13 +236,15 @@ Do NOT translate the numbers. Maintain the list structure. No extra commentary.
                 
                 // O1/O3 models handle temperature and reasoning differently
                 if (provider.model?.includes('o1') || provider.model?.includes('o3')) {
-                    // These models don't support temperature parameter
+                    // These models don't support temperature; tokens use max_completion_tokens
+                    body.max_completion_tokens = maxTokens;
                     if (provider.enableReasoning) {
                         body.reasoning_effort = 'high'; // Options: 'low', 'medium', 'high'
                     }
                 } else {
                     // Standard models use temperature
                     body.temperature = provider.temperature ?? 0.3;
+                    body.max_tokens = maxTokens;
                 }
                 break;
 
@@ -252,7 +260,8 @@ Do NOT translate the numbers. Maintain the list structure. No extra commentary.
                         ]
                     }],
                     generationConfig: {
-                        temperature: provider.temperature ?? 0.3
+                        temperature: provider.temperature ?? 0.3,
+                        maxOutputTokens: maxTokens
                     }
                 };
                 
@@ -274,7 +283,8 @@ Do NOT translate the numbers. Maintain the list structure. No extra commentary.
                         { role: 'user', content: userContent }
                     ],
                     options: {
-                        temperature: provider.temperature ?? 0.3
+                        temperature: provider.temperature ?? 0.3,
+                        num_predict: maxTokens
                     }
                 };
                 break;
@@ -294,7 +304,8 @@ Do NOT translate the numbers. Maintain the list structure. No extra commentary.
                         .replace(/{model}/g, provider.model || '')
                         .replace(/{systemPrompt}/g, this.escapeJsonString(systemContent))
                         .replace(/{userPrompt}/g, this.escapeJsonString(userContent))
-                        .replace(/{temperature}/g, (provider.temperature ?? 0.3).toString());
+                        .replace(/{temperature}/g, (provider.temperature ?? 0.3).toString())
+                        .replace(/{maxTokens}/g, String(maxTokens));
                     try { body = JSON.parse(populatedBody); } 
                     catch (e) { throw new Error('Failed to parse custom request body JSON.'); }
                 } else {
@@ -309,6 +320,7 @@ Do NOT translate the numbers. Maintain the list structure. No extra commentary.
         return {
             url,
             options: {
+                url,
                 method: 'POST',
                 headers,
                 body: JSON.stringify(body),
@@ -335,15 +347,13 @@ Do NOT translate the numbers. Maintain the list structure. No extra commentary.
                 const useGemma = (this.plugin.settings as any).useGemmaPrompt;
                 const textBakedIn = useGemma || systemPrompt.includes(originalText.substring(0, 50));
 
-                const { url, options } = this.getRequestConfig(systemPrompt, originalText, textBakedIn);
-                
-                const controller = new AbortController();
-                const timeoutMs = providerId === 'gemini' ? 60000 : (providerId === 'ollama' ? 120000 : 45000);
-                const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
-                options.signal = controller.signal;
+                const { url, options } = this.getRequestConfig(systemPrompt, originalText, textBakedIn, this.computeMaxTokens(systemPrompt, originalText));
 
-                const response = await requestUrl({ url, ...options });
-                clearTimeout(timeoutId);
+                // requestUrl ignores AbortSignal, so we race it against a real timeout instead.
+                const timeoutMs = providerId === 'gemini' ? 60000 : (providerId === 'ollama' ? 120000 : 45000);
+                delete (options as any).signal;
+
+                const response = await this.withTimeout(requestUrl(options), timeoutMs);
 
                 // DIAGNOSTIC: Log the full response if debug mode is enabled
                 if (this.plugin.settings.debugMode) {
@@ -411,7 +421,7 @@ Do NOT translate the numbers. Maintain the list structure. No extra commentary.
                 throw new Error(userFriendlyError);
 
             } catch (err: any) {
-                if (err.name === 'AbortError') {
+                if (err.name === 'AbortError' || err.name === 'TimeoutError') {
                     if (attempt < MAX_RETRIES) {
                         new Notice(`Request timed out. Retrying (${attempt}/${MAX_RETRIES})...`);
                         continue;
@@ -436,5 +446,31 @@ Do NOT translate the numbers. Maintain the list structure. No extra commentary.
 
     async sleep(ms: number): Promise<void> {
         return new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+    /**
+     * Budget output tokens from input size. Translations are usually similar in
+     * length to the source; ~1 token ≈ 3 chars, +50% headroom for languages that
+     * expand and for the [#N] tags, clamped to the provider/top-level cap.
+     */
+    private computeMaxTokens(systemPrompt: string, originalText: string): number {
+        const approxInputTokens = Math.ceil((systemPrompt.length + originalText.length) / 3);
+        // Reuse the only existing token ceiling in settings (OCR provider's maxTokens).
+        const cap = this.plugin.settings.ocrProvider?.maxTokens || 8192;
+        return Math.min(cap, Math.max(512, Math.ceil(approxInputTokens * 1.5)));
+    }
+
+    /** Reject after `ms` if the wrapped promise hasn't settled (requestUrl can't be aborted). */
+    private withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
+        return new Promise<T>((resolve, reject) => {
+            const id = setTimeout(
+                () => reject(Object.assign(new Error('Request timed out'), { name: 'TimeoutError' })),
+                ms,
+            );
+            p.then(
+                (v) => { clearTimeout(id); resolve(v); },
+                (e) => { clearTimeout(id); reject(e); },
+            );
+        });
     }
 }

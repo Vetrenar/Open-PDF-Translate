@@ -2,6 +2,10 @@
 import { TFile, TFolder, normalizePath, Notice, parseYaml, App } from 'obsidian';
 import OpenRouterTranslatorPlugin from './main';
 import { SavedOverlay, OverlayPositionData } from './types';
+import {
+    formatPdfSourceLine, readPdfSourceFromCache, readPdfSourceRaw,
+    resolvePdfFromSource, setPdfSourceInFrontmatter,
+} from './pdf-source';
 
 /**
  * VERSION HISTORY:
@@ -9,7 +13,7 @@ import { SavedOverlay, OverlayPositionData } from './types';
  * v2: Base64 metadata in a table
  * v3: Current improved format (JSON in %% comments, no table)
  */
-const STORAGE_FORMAT_VERSION = 3;
+export const STORAGE_FORMAT_VERSION = 3;
 
 /**
  * Manages storage and retrieval of translation overlays in individual .translations.md files.
@@ -91,7 +95,7 @@ export class TranslationStorage {
      */
     generateMarkdownForOverlay(savedOverlay: SavedOverlay, pdfFile: TFile): string {
         const frontmatter = `---
-pdf-source: '[[${pdfFile.path}]]'
+${formatPdfSourceLine(pdfFile.path)}
 timestamp: ${new Date(savedOverlay.timestamp).toISOString()}
 format-version: ${STORAGE_FORMAT_VERSION}
 ---
@@ -414,10 +418,12 @@ format-version: ${STORAGE_FORMAT_VERSION}
         const markdownContent = this.generateMarkdownForOverlay(savedOverlay, activeFile);
 
         if (translationFile) {
+            this.plugin.markSelfWrite(translationFile.path);
             await this.app.vault.modify(translationFile, markdownContent);
         } else {
             const translationPath = this.getTranslationFilePath(activeFile);
             await this.ensureStorageFolder();
+            this.plugin.markSelfWrite(translationPath);
             await this.app.vault.create(translationPath, markdownContent);
             // Sync map
             this.plugin.pdfToMdMap.set(activeFile.path, translationPath);
@@ -538,6 +544,7 @@ format-version: ${STORAGE_FORMAT_VERSION}
                 new Notice(`Translation file deleted for ${activeFile.basename}`);
             } else {
                 const markdownContent = this.generateMarkdownForOverlay(savedOverlay, activeFile);
+                this.plugin.markSelfWrite(translationFile.path);
                 await this.app.vault.modify(translationFile, markdownContent);
                 new Notice(`Overlay deleted for page ${currentPageNumber}`);
             }
@@ -554,79 +561,17 @@ format-version: ${STORAGE_FORMAT_VERSION}
      * Uses the closest .page[data-page-number] to determine the page number.
      */
     extractPositionData(textLayer: HTMLElement, overlayContainer: Element): OverlayPositionData[] {
-        const positionData: OverlayPositionData[] = [];
-        const overlays = overlayContainer.querySelectorAll<HTMLElement>('.pdf-text-overlay-reflow');
+        // Delegate to the canonical implementation in OverlayRenderer, which is
+        // leaf-scoped (via the PDF adapter) instead of using a global
+        // document.querySelector. (#15 dedupe.)
         const textLayerRect = textLayer.getBoundingClientRect();
-
-        // Get page number from the closest .page element
-        const pageElement = overlayContainer.closest('.page[data-page-number]') as HTMLElement | null;
-        const pageNumber = pageElement ? parseInt(pageElement.getAttribute('data-page-number') || '0', 10) : 0;
-
         if (textLayerRect.width === 0 || textLayerRect.height === 0) {
             console.error('PDF Translator: Text layer has zero dimensions');
             return [];
         }
-
-        // Get scale for normalization (zoom-independent relative fonts)
-        const pdfViewer = document.querySelector('.pdfViewer, #viewer') as HTMLElement;
-        const saveScale = parseFloat(pdfViewer?.style.getPropertyValue('--scale-factor') || '1');
-        if (isNaN(saveScale) || saveScale <= 0) {
-            console.warn('PDF Translator: Invalid saveScale, using 1.0');
-        }
-
-        overlays.forEach(overlay => {
-            const originalText = overlay.getAttribute('data-original-text') || '';
-            const translatedDiv = overlay.querySelector('div');
-            const translatedText = translatedDiv ? translatedDiv.innerHTML : (overlay.textContent || '');
-            const rect = overlay.getBoundingClientRect();
-
-            const relativeRect = {
-                left: (rect.left - textLayerRect.left) / textLayerRect.width,
-                top: (rect.top - textLayerRect.top) / textLayerRect.height,
-                width: rect.width / textLayerRect.width,
-                height: rect.height / textLayerRect.height,
-            };
-
-            // Extract from attributes (set in overlay.ts createReflowOverlay)
-            const fontSizesStr = overlay.getAttribute('data-original-font-sizes') || '';
-            let absoluteFontSizes: number[] = [];
-            if (fontSizesStr) {
-                try {
-                    absoluteFontSizes = JSON.parse(fontSizesStr);
-                } catch (e) {
-                    console.warn('PDF Translator: Failed to parse font sizes from attribute', e);
-                }
-            }
-
-            // Normalize to relative (divide by saveScale)
-            const relativeFontSizes = absoluteFontSizes.length > 0 && saveScale > 0
-                ? absoluteFontSizes.map(fs => fs / saveScale)
-                : [];
-
-            // Compute avg relative for fontSize
-            const avgRelative = relativeFontSizes.length > 0
-                ? relativeFontSizes.reduce((a, b) => a + b, 0) / relativeFontSizes.length
-                : undefined;
-
-            const fontFamily = overlay.getAttribute('data-font-family') || overlay.style.fontFamily || undefined;
-
-            const overlayData: OverlayPositionData = {
-                selector: '',
-                textContent: originalText,
-                relativeRect,
-                page: pageNumber,
-                translatedText,
-                // Set relative font data
-                fontSize: avgRelative,
-                fontFamily,
-                originalFontSizes: relativeFontSizes,
-            };
-
-            positionData.push(overlayData);
-        });
-
-        return positionData;
+        return this.plugin.overlay.extractPositionDataFrom(textLayer, overlayContainer, textLayerRect);
     }
+
 
     // ============================================================
     // Helpers for re-translation modal (read/write convenience)
@@ -660,10 +605,12 @@ format-version: ${STORAGE_FORMAT_VERSION}
         const markdownContent = this.generateMarkdownForOverlay(savedOverlay, pdfFile);
 
         if (existing) {
+            this.plugin.markSelfWrite(existing.path);
             await this.app.vault.modify(existing, markdownContent);
         } else {
             const translationPath = this.getTranslationFilePath(pdfFile);
             await this.ensureStorageFolder();
+            this.plugin.markSelfWrite(translationPath);
             await this.app.vault.create(translationPath, markdownContent);
             this.plugin.pdfToMdMap.set(pdfFile.path, translationPath);
             if (this.plugin.settings.debugMode) {
@@ -728,10 +675,12 @@ format-version: ${STORAGE_FORMAT_VERSION}
 
             if (mdFile) {
                 // File exists, so modify it.
+                this.plugin.markSelfWrite(mdFile.path);
                 await this.app.vault.modify(mdFile, md);
             } else {
                 // CREATE PATH: File does not exist, so create it.
                 await this.ensureStorageFolder();
+                this.plugin.markSelfWrite(translationPath);
                 await this.app.vault.create(translationPath, md);
                 // This map update is now safely inside the sequential queue
                 this.plugin.pdfToMdMap.set(pdfFile.path, translationPath);
@@ -780,53 +729,21 @@ format-version: ${STORAGE_FORMAT_VERSION}
                 continue;
             }
 
-            const raw = cache.frontmatter['pdf-source'];
-            if (!raw || typeof raw !== 'string') {
-                // Frontmatter exists but no pdf-source — orphan
+            // Prefer parsed cache; recover apostrophe-broken files from raw text.
+            let linkPath = readPdfSourceFromCache(this.app, mdFile);
+            if (!linkPath) {
+                const content = await this.app.vault.cachedRead(mdFile);
+                linkPath = readPdfSourceRaw(content);
+            }
+            if (!linkPath) {
                 orphans.push({ mdFile, pdfSource: '(missing pdf-source)' });
                 continue;
             }
 
-            // Clean the link path using the same logic as buildPdfTranslationMap
-            let linkPath = raw.trim();
-
-            if (linkPath.startsWith('[[') && linkPath.endsWith(']]')) {
-                linkPath = linkPath.slice(2, -2);
-            } else if (
-                (linkPath.startsWith('"') && linkPath.endsWith('"')) ||
-                (linkPath.startsWith("'") && linkPath.endsWith("'"))
-            ) {
-                linkPath = linkPath.slice(1, -1);
-            }
-
-            if (linkPath.includes('|')) {
-                linkPath = linkPath.split('|')[0];
-            }
-
-            linkPath = linkPath.trim();
-            if (!linkPath) {
-                orphans.push({ mdFile, pdfSource: '(empty pdf-source)' });
-                continue;
-            }
-
-            // Try to resolve the PDF file using the same strategies as buildPdfTranslationMap
-            let resolved: TFile | null = null;
-
-            resolved = this.app.metadataCache.getFirstLinkpathDest(linkPath, mdFile.path) as TFile;
-
-            if (!resolved) {
-                const abstractFile = this.app.vault.getAbstractFileByPath(linkPath);
-                if (abstractFile instanceof TFile) resolved = abstractFile;
-            }
-
-            if (!resolved) {
-                const normalized = normalizePath(linkPath);
-                const abstractFile = this.app.vault.getAbstractFileByPath(normalized);
-                if (abstractFile instanceof TFile) resolved = abstractFile;
-            }
+            const resolved = resolvePdfFromSource(this.app, linkPath, mdFile.path);
 
             // If PDF doesn't exist (or isn't a PDF), this is an orphan
-            if (!resolved || resolved.extension !== 'pdf') {
+            if (!resolved) {
                 orphans.push({ mdFile, pdfSource: linkPath });
             }
         }
@@ -839,45 +756,18 @@ format-version: ${STORAGE_FORMAT_VERSION}
      * Repairs stale links after renames or moves. Keeps the original single-quoted wikilink format.
      */
     async ensurePdfSourceLinkPointsTo(fileMd: TFile, pdfFile: TFile): Promise<void> {
-        const cache = this.app.metadataCache.getFileCache(fileMd);
-        const fm = cache?.frontmatter;
-        if (!fm) return;
-
-        const raw = fm['pdf-source'];
-        if (typeof raw !== 'string') return;
-
-        // Extract link path from '[[link]]' or [[link]]; handle aliases [[path|alias]]
-        const singleQuoted = raw.match(/^'\[\[(.+?)\]\]'$/);
-        const bare = !singleQuoted && raw.match(/^\[\[(.+?)\]\]$/);
-        const linkRaw = singleQuoted ? singleQuoted[1] : (bare ? bare[1] : raw.trim());
-        const linkPath = linkRaw.split('|')[0].trim();
-
-        const resolved = this.app.metadataCache.getFirstLinkpathDest(linkPath, fileMd.path);
-        if (resolved && resolved.path === pdfFile.path) {
-            // Already correct
-            return;
-        }
-
-        // Build replacement string keeping single-quoted wikilink
-        const newTarget = `[[${pdfFile.path}]]`;
-
-        // Read, replace frontmatter line, write back
         const content = await this.app.vault.read(fileMd);
-        const updated = content.replace(
-            /^---[\s\S]*?---/,
-            (fmBlock) => {
-                if (/^pdf-source:\s*/m.test(fmBlock)) {
-                    return fmBlock.replace(/^(pdf-source:\s*).*/m, `$1'[[${pdfFile.path}]]'`);
-                } else {
-                    // Insert if somehow missing
-                    const parts = fmBlock.split('\n');
-                    parts.splice(1, 0, `pdf-source: '[[${pdfFile.path}]]'`);
-                    return parts.join('\n');
-                }
-            }
-        );
 
+        // Prefer parsed cache; fall back to raw recovery for old broken files.
+        let linkPath = readPdfSourceFromCache(this.app, fileMd);
+        if (!linkPath) linkPath = readPdfSourceRaw(content);
+
+        const resolved = resolvePdfFromSource(this.app, linkPath, fileMd.path);
+        if (resolved && resolved.path === pdfFile.path) return; // already correct
+
+        const updated = setPdfSourceInFrontmatter(content, pdfFile.path);
         if (updated !== content) {
+            this.plugin.markSelfWrite(fileMd.path);
             await this.app.vault.modify(fileMd, updated);
         }
     }

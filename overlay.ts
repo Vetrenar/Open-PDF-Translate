@@ -53,6 +53,7 @@ export class OverlayRenderer {
     private pageIntersectionObserver: IntersectionObserver | null = null;
     // Enhanced scroll safeguard properties
     private scrollThrottleTimeout: ReturnType<typeof setTimeout> | null = null;
+    private visibilityDebounceTimeout: ReturnType<typeof setTimeout> | null = null;
     private scrollHandler: (() => void) | null = null;
     private scrollableContainer: HTMLElement | null = null;
     private loadedOverlayPages: Set<number> = new Set();
@@ -654,7 +655,7 @@ export class OverlayRenderer {
             `;
             document.body.appendChild(stagingContainer);
 
-            const pageOverlaySets: { pageElement: HTMLElement, overlays: HTMLElement[] }[] = [];
+            const pageOverlaySets: { pageNumber: number, pageElement: HTMLElement, overlays: HTMLElement[] }[] = [];
 
             // Step 1: prepare overlays for all visible pages in parallel
             await Promise.all(visiblePages.map(async pageElement => {
@@ -662,6 +663,7 @@ export class OverlayRenderer {
                 if (!pageNumberStr) return;
                 const pageNumber = parseInt(pageNumberStr, 10);
                 if (!this.pagesWithOverlays.has(pageNumber)) return;
+                if (this.inFlightPageLoads.has(pageNumber)) return; // a load owns this page (#9)
                 const pageData = this.cachedOverlayData?.pageOverlays[pageNumber];
                 if (!pageData || pageData.length === 0) return;
 
@@ -706,7 +708,7 @@ export class OverlayRenderer {
                         this.logDebug(`Error staging overlay for page ${pageNumber}`, err);
                     }
                 }
-                pageOverlaySets.push({ pageElement: overlayContainer, overlays });
+                pageOverlaySets.push({ pageNumber, pageElement: overlayContainer, overlays });
             }));
 
             // Step 2: batch adjustments in one RAF
@@ -721,16 +723,12 @@ export class OverlayRenderer {
             }));
 
             // Step 3: move overlays to their actual containers and mark as loaded
-            for (const { pageElement, overlays } of pageOverlaySets) {
+            for (const { pageNumber, pageElement, overlays } of pageOverlaySets) {
                 for (const el of overlays) {
                     pageElement.appendChild(el);
                 }
-                // Mark page as loaded
-                const pageNumberStr = pageElement.dataset?.dataset?.pageNumber; // Note: likely a typo in original, should be pageElement.dataset.pageNumber
-                if (pageNumberStr) {
-                    const pageNumber = parseInt(pageNumberStr, 10);
-                    this.loadedOverlayPages.add(pageNumber);
-                }
+                // Mark page as loaded (previously read pageElement.dataset.dataset — always undefined)
+                this.loadedOverlayPages.add(pageNumber);
             }
 
             stagingContainer.remove();
@@ -768,13 +766,11 @@ export class OverlayRenderer {
 
     public toggleOverlayVisibility(): void {
         this.isOverlayVisible = !this.isOverlayVisible;
-        const timeoutKey = 'visibilityTimeout';
-        const cachedTimeout = this.memoCache.get(timeoutKey);
-        if (cachedTimeout) {
-            clearTimeout(cachedTimeout.value as NodeJS.Timeout);
-        }
-        const timeout = setTimeout(() => this.updateAllOverlayVisibility(), DEBOUNCE_DELAY);
-        this.memoCache.set(timeoutKey, { value: timeout, timestamp: Date.now() });
+        if (this.visibilityDebounceTimeout) clearTimeout(this.visibilityDebounceTimeout);
+        this.visibilityDebounceTimeout = setTimeout(() => {
+            this.visibilityDebounceTimeout = null;
+            this.updateAllOverlayVisibility();
+        }, DEBOUNCE_DELAY);
 
         new Notice(`Overlay ${this.isOverlayVisible ? 'shown' : 'hidden'}`);
         this.plugin.settings.showOverlayByDefault = this.isOverlayVisible;
@@ -815,22 +811,18 @@ export class OverlayRenderer {
     }
 
     public getActivePDFLeaf(): any | null {
-        const activeLeaf = this.plugin.app.workspace.activeLeaf;
-        return (activeLeaf?.view?.getViewType() === 'pdf') ? activeLeaf : null;
+        return this.plugin.pdfDom.getActivePdfLeaf();
     }
 
     public getPDFPagesForLeaf(leaf: any): NodeListOf<HTMLElement> | null {
-        const viewerContainer = leaf?.view?.containerEl?.querySelector('.pdfViewer, #viewer') as HTMLElement | null;
+        const viewerContainer = this.plugin.pdfDom.getViewerRoot(leaf);
         return viewerContainer?.querySelectorAll('.page[data-page-number]') || null;
     }
 
     public getCurrentPageElement(): HTMLElement | null {
         return this.getMemoized('currentPage', () => {
             try {
-                const activeLeaf = this.getActivePDFLeaf();
-                if (!activeLeaf) return null;
-                const pages = this.getPDFPagesForLeaf(activeLeaf);
-                return this.getCurrentVisiblePage(pages);
+                return this.plugin.pdfDom.getCurrentVisiblePage();
             } catch (error) {
                 this.logDebug('getCurrentPageElement error:', error);
                 return null;
@@ -841,26 +833,23 @@ export class OverlayRenderer {
     public getCurrentPageTextLayer(): HTMLElement | null {
         return this.getMemoized('currentTextLayer', () => {
             const currentPage = this.getCurrentPageElement();
-            return currentPage ? currentPage.querySelector('.textLayer') as HTMLElement : null;
+            return currentPage ? this.plugin.pdfDom.getTextLayerOf(currentPage) : null;
         });
     }
 
     public getCurrentVisiblePage(pages: NodeListOf<HTMLElement> | null): HTMLElement | null {
-        if (!pages || pages.length === 0) return null;
-
+        // Kept for backward compatibility; the adapter owns the real logic.
+        if (!pages || pages.length === 0) return this.plugin.pdfDom.getCurrentVisiblePage();
         let bestPage: HTMLElement | null = null;
         let maxVisibleArea = -1;
-
         for (const page of Array.from(pages)) {
             const rect = page.getBoundingClientRect();
             if (rect.width === 0 || rect.height === 0) continue;
-
             const viewportHeight = window.innerHeight;
             const visibleTop = Math.max(0, rect.top);
             const visibleBottom = Math.min(viewportHeight, rect.bottom);
             const visibleHeight = Math.max(0, visibleBottom - visibleTop);
             const visibleArea = visibleHeight * rect.width;
-
             if (visibleArea > maxVisibleArea) {
                 maxVisibleArea = visibleArea;
                 bestPage = page;
@@ -874,31 +863,10 @@ export class OverlayRenderer {
     // ============================================================
 
     public async waitForPdfTextLayer(pageNumber: number): Promise<HTMLElement | null> {
-        if (pageNumber <= 0) {
-            this.logDebug('waitForPdfTextLayer: Invalid page number');
-            return null;
-        }
-        const activeLeaf = this.getActivePDFLeaf();
-        if (!activeLeaf) return null;
-
-        return new Promise((resolve) => {
-            const startTime = Date.now();
-            const interval = setInterval(() => {
-                if (Date.now() - startTime > OVERLAY_WAIT_TIMEOUT) {
-                    clearInterval(interval);
-                    this.logDebug(`Timeout waiting for text layer on page ${pageNumber}`);
-                    resolve(null);
-                    return;
-                }
-                const pages = this.getPDFPagesForLeaf(activeLeaf);
-                const page = pages ? Array.from(pages).find(p => parseInt(p.dataset.pageNumber || '0') === pageNumber) : null;
-                const textLayer = page?.querySelector('.textLayer');
-                if (textLayer) {
-                    clearInterval(interval);
-                    resolve(textLayer as HTMLElement);
-                }
-            }, OVERLAY_CHECK_INTERVAL);
-        });
+        return this.plugin.pdfDom.waitForTextLayer(
+            pageNumber,
+            { timeoutMs: OVERLAY_WAIT_TIMEOUT, intervalMs: OVERLAY_CHECK_INTERVAL },
+        );
     }
 
     // Note: bringToTop is now handled by uiRenderer and is private there
@@ -1020,9 +988,12 @@ export class OverlayRenderer {
             return;
         }
 
-        if (this.inFlightPageLoads.has(pageNumber) && !force) {
-            await this.inFlightPageLoads.get(pageNumber);
-            return;
+        // Always chain behind any in-flight load for this page (#9).
+        const existing = this.inFlightPageLoads.get(pageNumber);
+        if (existing) {
+            await existing.catch(() => {});
+            // A non-forced caller is satisfied by the load that just completed.
+            if (!force) return;
         }
 
         const loadPromise = (async () => {
@@ -1073,7 +1044,10 @@ export class OverlayRenderer {
         try {
             await loadPromise;
         } finally {
-            this.inFlightPageLoads.delete(pageNumber);
+            // Only clear if we're still the current entry (a later forced load may have replaced us).
+            if (this.inFlightPageLoads.get(pageNumber) === loadPromise) {
+                this.inFlightPageLoads.delete(pageNumber);
+            }
         }
     }
 
@@ -1150,20 +1124,16 @@ export class OverlayRenderer {
         }
     }
 
-    private extractPositionDataFrom(textLayer: HTMLElement, overlayContainer: Element, textLayerRect: DOMRect): OverlayPositionData[] {
+    public extractPositionDataFrom(textLayer: HTMLElement, overlayContainer: Element, textLayerRect: DOMRect): OverlayPositionData[] {
         if (!textLayer || !overlayContainer) {
             return [];
         }
 
         const positionData: OverlayPositionData[] = [];
-        const overlays = overlayContainer.querySelectorAll<HTMLElement>('.pdf-text-overlay-reflow');
+        const overlays = Array.from(overlayContainer.querySelectorAll<HTMLElement>('.pdf-text-overlay-reflow'));
         const pageNumber = this.plugin.getCurrentPageNumber() ?? 0;
 
-        const pdfViewer = textLayer.closest('.pdfViewer, #viewer') as HTMLElement | null;
-        const saveScale = parseFloat(pdfViewer?.style.getPropertyValue('--scale-factor') || '1');
-        if (isNaN(saveScale) || saveScale <= 0) {
-            this.logDebug('Invalid saveScale; falling back to 1.0');
-        }
+        const saveScale = this.plugin.pdfDom.getScaleFactorFromPage(textLayer);
 
         for (const overlay of overlays) {
             try {
@@ -1271,6 +1241,10 @@ export class OverlayRenderer {
         if (this.zoomDebounceTimeout) {
             clearTimeout(this.zoomDebounceTimeout);
             this.zoomDebounceTimeout = null;
+        }
+        if (this.visibilityDebounceTimeout) {
+            clearTimeout(this.visibilityDebounceTimeout);
+            this.visibilityDebounceTimeout = null;
         }
 
         // Reset state tracking

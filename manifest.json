@@ -1,9 +1,9 @@
 {
 	"id": "open-pdf-translate",
 	"name": "OPEN PDF Translate",
-	"version": "1.5.0",
-	"minAppVersion": "0.15.0",
-	"description": "Translate PDF documents with overlay, supports OpenRouter, OpenAI, Gemini, Ollama, and custom endpoints. Includes layout detection,  and persistent storage of translations..",
+	"version": "1.6.0",
+	"minAppVersion": "1.4.0",
+	"description": "Translate PDF documents with overlay, supports OpenRouter, OpenAI, Gemini, Ollama, and custom endpoints. Includes layout detection, AI OCR Vision and persistent storage of translations.",
 	"author": "Vetrenar",
 	"isDesktopOnly": false,
 	"authorURL": "https://github.com/Vetrenar/Open-PDF-Translate"

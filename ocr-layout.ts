@@ -1,4 +1,4 @@
-﻿// ocr-layout.ts вЂ” FULLY UPGRADED WITH ITERATIVE CORRECTION & ROBUST JSON REPAIR
+// ocr-layout.ts — FULLY UPGRADED WITH ITERATIVE CORRECTION & ROBUST JSON REPAIR
 
 import { Notice, TFile, normalizePath, requestUrl } from 'obsidian';
 import OpenRouterTranslatorPlugin from './main';
@@ -18,7 +18,7 @@ export class OcrLayoutService {
     // Track in-progress operations to prevent duplicates
     private activeOperations: Map<string, Promise<any>> = new Map();
 
-    // JSON repair statistics for debugging smallвЂ‘model robustness
+    // JSON repair statistics for debugging small-model robustness
     private repairStats = { totalAttempts: 0, successfulRepairs: 0 };
 
     constructor(plugin: OpenRouterTranslatorPlugin) {
@@ -111,7 +111,7 @@ export class OcrLayoutService {
         const MAX_PARSE_ATTEMPTS = ocrSettings.provider === 'ollama' ? 2 : 1; // Ollama small models get one retry
         let lastError: string | null = null;
 
-        new Notice(`рџ”Ќ Running OCR on page ${pageNumber}...`);
+        new Notice(`Ќ Running OCR on page ${pageNumber}...`);
 
         try {
             // 1. Capture page image or prepare file path
@@ -177,12 +177,12 @@ export class OcrLayoutService {
                         // Log repair success in debug mode
                         if (attempt > 1 && this.plugin.settings.debugMode) {
                             this.plugin.logDebug(
-                                `вњ… OCR parsing succeeded on attempt ${attempt} after repair. ` +
+                                `✓ OCR parsing succeeded on attempt ${attempt} after repair. ` +
                                 `Total repairs today: ${this.repairStats.successfulRepairs}/${this.repairStats.totalAttempts}`
                             );
                         }
 
-                        new Notice(`вњ… OCR complete: ${blocks.length} blocks found on page ${pageNumber}.`);
+                        new Notice(`✓ OCR complete: ${blocks.length} blocks found on page ${pageNumber}.`);
 
                         return blocks.map(b => ({
                             id: b.id,
@@ -201,7 +201,7 @@ export class OcrLayoutService {
                     if (attempt < MAX_PARSE_ATTEMPTS) {
                         
                         this.plugin.logDebug(
-                            `вљ пёЏ OCR parsing failed (attempt ${attempt}/${MAX_PARSE_ATTEMPTS}). ` +
+                            `⚠ OCR parsing failed (attempt ${attempt}/${MAX_PARSE_ATTEMPTS}). ` +
                             `Retrying with correction prompt... Error: ${lastError.substring(0, 100)}`
                         );
                         
@@ -228,7 +228,7 @@ export class OcrLayoutService {
             // Log repair stats on failure for diagnostics
             if (this.plugin.settings.debugMode && this.repairStats.totalAttempts > 0) {
                 this.plugin.logDebug(
-                    `рџ“Љ OCR Repair Stats: ${this.repairStats.successfulRepairs}/${this.repairStats.totalAttempts} successful repairs`
+                    `Љ OCR Repair Stats: ${this.repairStats.successfulRepairs}/${this.repairStats.totalAttempts} successful repairs`
                 );
             }
 
@@ -243,7 +243,7 @@ export class OcrLayoutService {
             return false;
         }
 
-        new Notice(`рџ”Ќ Starting full document OCR (${totalPages} pages)...`);
+        new Notice(`Ќ Starting full document OCR (${totalPages} pages)...`);
 
         let successCount = 0;
         let failCount = 0;
@@ -275,9 +275,9 @@ export class OcrLayoutService {
         }
 
         if (failCount === 0) {
-            new Notice(`вњ… Full document OCR complete. ${successCount} pages processed.`);
+            new Notice(`✓ Full document OCR complete. ${successCount} pages processed.`);
         } else {
-            new Notice(`вљ пёЏ OCR done: ${successCount} succeeded, ${failCount} failed.`);
+            new Notice(`⚠ OCR done: ${successCount} succeeded, ${failCount} failed.`);
         }
 
         return failCount === 0;
@@ -346,7 +346,7 @@ export class OcrLayoutService {
         let prompt = this.buildPrompt(baseTemplate, pageNumber, absoluteFilePath, null, attempt);
         
         // Append targeted correction instructions based on the error
-        prompt += `\n\nвљ пёЏ PREVIOUS ATTEMPT FAILED вљ пёЏ\n` +
+        prompt += `\n\n⚠ PREVIOUS ATTEMPT FAILED ⚠\n` +
             `Error: "${lastError.substring(0, 150)}"\n` +
             `CORRECTION REQUIRED:\n` +
             `- Output ONLY valid JSON array. NO other text.\n` +
@@ -367,6 +367,14 @@ export class OcrLayoutService {
     // в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
     // PRIVATE: API Communication (Enhanced)
     // в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
+
+    /**
+     * #23: public entry for true-OCR text mode. Returns RAW transcribed text
+     * (no JSON, no coordinates). Used by OcrTextTranslator.
+     */
+    public async ocrPageText(prompt: string, image: CapturedPageImage | null): Promise<string | null> {
+        return this.callOcrModel(prompt, image);
+    }
 
     private async callOcrModel(
         prompt: string, 
@@ -401,7 +409,7 @@ export class OcrLayoutService {
 
             } catch (err: any) {
                 if (attempt === MAX_RETRIES) throw err;
-                this.plugin.logDebug(`вљ пёЏ OCR API attempt ${attempt} failed: ${err.message}. Retrying...`);
+                this.plugin.logDebug(`⚠ OCR API attempt ${attempt} failed: ${err.message}. Retrying...`);
                 await this.sleep(1000 * attempt);
             }
         }
@@ -587,7 +595,7 @@ export class OcrLayoutService {
         const originalResponse = rawResponse.trim();
 
         if (this.plugin.settings.debugMode) {
-            this.plugin.logDebug(`рџ”Ќ Parsing OCR response (attempt ${attempt})`, {
+            this.plugin.logDebug(`Ќ Parsing OCR response (attempt ${attempt})`, {
                 rawLength: originalResponse.length,
                 preview: originalResponse.substring(0, 200)
             });
@@ -614,14 +622,14 @@ export class OcrLayoutService {
 
                 if (blocks.length > 0) {
                     if (name !== 'raw' && this.plugin.settings.debugMode) {
-                        this.plugin.logDebug(`вњ… JSON repaired successfully using strategy: "${name}"`);
+                        this.plugin.logDebug(`✓ JSON repaired successfully using strategy: "${name}"`);
                     }
                     if (name !== 'raw') this.repairStats.successfulRepairs++;
                     return blocks;
                 }
             } catch (e: any) {
                 if (this.plugin.settings.debugMode) {
-                    this.plugin.logDebug(`вљ пёЏ Strategy "${name}" failed: ${e.message?.substring(0, 80)}`);
+                    this.plugin.logDebug(`⚠ Strategy "${name}" failed: ${e.message?.substring(0, 80)}`);
                 }
                 continue;
             }
@@ -631,12 +639,12 @@ export class OcrLayoutService {
         if (attempt === 1) {
             const fallbackBlocks = this.fallbackTextExtraction(originalResponse, pageNumber);
             if (fallbackBlocks.length > 0) {
-                this.plugin.logDebug('вљ пёЏ Using fallback text extraction (no positional data)');
+                this.plugin.logDebug('⚠ Using fallback text extraction (no positional data)');
                 return fallbackBlocks;
             }
         }
 
-        // STEP 4: Total failure вЂ“ provide actionable error
+        // STEP 4: Total failure – provide actionable error
         const errorMessage = this.generateParseErrorMessage(originalResponse);
         console.error('вќЊ OCR JSON parsing failed after all repair strategies:', {
             errorMessage,
@@ -765,18 +773,30 @@ export class OcrLayoutService {
             };
         }
 
+        // Detect whether the model actually supplied coordinates (vs our 0,0,0,0 default).
+        const hasRect = !!(
+            (raw.rect && typeof raw.rect === 'object') ||
+            (raw.bbox && Array.isArray(raw.bbox) && raw.bbox.length === 4) ||
+            (raw.bounds && typeof raw.bounds === 'object')
+        );
+        const validRect = hasRect && rect.w > 0.001 && rect.h > 0.001;
+
         // Warn about non-normalized coordinates (common with filepath mode)
         if ((rect.l > 2 || rect.t > 2 || rect.w > 2 || rect.h > 2) && this.plugin.settings.debugMode) {
             this.plugin.logDebug(
-                `вљ пёЏ Block "${text.substring(0, 20)}" has non-normalized coords. Expected 0-1 range, got:`,
+                `⚠ Block "${text.substring(0, 20)}" has non-normalized coords. Expected 0-1 range, got:`,
                 rect
             );
+        }
+        if (!validRect && this.plugin.settings.debugMode) {
+            this.plugin.logDebug(`⚠ Block "${text.substring(0, 20)}" has no usable coordinates (model omitted rect).`);
         }
 
         return {
             id: raw.id || `ocr-block-${Date.now()}-${index}`,
             text,
             rect,
+            hasValidRect: validRect,
             fontSize: typeof raw.fontSize === 'number' ? raw.fontSize : typeof raw.font_size === 'number' ? raw.font_size : 12,
             fontFamily: raw.fontFamily || raw.font_family || 'sans-serif',
             confidence: raw.confidence,

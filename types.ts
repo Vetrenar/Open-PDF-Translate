@@ -1,5 +1,8 @@
 // types.ts
 import type { Plugin } from 'obsidian';
+import {
+  DEFAULT_SINGLE_PROMPT, DEFAULT_BATCH_PROMPT, DEFAULT_OCR_TEXT_PROMPT,
+} from './default-prompts';
 
 /**
  * Settings for an individual API provider.
@@ -39,6 +42,12 @@ export interface OcrProviderSettings {
   
   // NEW: JSON strictness control for small models
   jsonStrictness?: 'strict' | 'lenient' | 'repair-friendly';
+
+  // #23: true-OCR text mode (translation-only note; no coordinates).
+  ocrTextPromptTemplate?: string;          // transcription prompt (no JSON/bboxes)
+  ocrOutputMode?: 'overlay' | 'translation-note';
+  ocrOutputFolder?: string;                // vault folder for recognized notes ('' = next to PDF)
+  ocrOutputFilenamePattern?: string;       // e.g. '{pdfname}.translated' → <folder>/<pattern>.md
 }
 
 /**
@@ -56,7 +65,9 @@ export interface OpenRouterTranslatorSettings {
   };
   
   // --- Layout Engine Selection ---
-  layoutEngine: 'internal' | 'python' | 'ocr-api';   // replaces useExternalLayout
+  // Overlay engines only. OCR-AI is a separate subsystem (its own commands),
+  // not a layout engine. 'ocr-api' is retained only to migrate old configs.
+  layoutEngine: 'internal' | 'python' | 'ocr-api';   // 'ocr-api' deprecated
   
   // External Layout / Python settings
   pythonPath: string;
@@ -83,6 +94,16 @@ export interface OpenRouterTranslatorSettings {
   enableTranslation: boolean;
   useBatchTranslation: boolean;
   debugMode: boolean;
+
+  // #7: rejoin sentence fragments split across DOM spans before translating.
+  enableSemanticMerging: boolean;
+  // #3: delay (ms) between sequential (non-batch) segment requests.
+  sequentialDelayMs: number;
+
+  // Watcher: detect new PDFs in a folder and queue them for headless
+  // (python) background translation into .translations.md.
+  watcherEnabled: boolean;
+  watcherFolder: string;        // vault-relative folder to watch (non-recursive)
   
   // Language Settings
   sourceLanguage: string;
@@ -112,7 +133,11 @@ export interface OpenRouterTranslatorSettings {
   layoutDebugMode: boolean;
   
   // Custom Prompts
-  useGemmaPrompt: boolean;
+  // "Special template" mode: some models (e.g. Gemma) need the whole request
+  // shaped as one template with {TEXT}. When enabled, this template overrides
+  // the batch/single prompts. The text is user-editable.
+  useGemmaPrompt: boolean;          // flag name kept for back-compat
+  customTemplate?: string;
   batchPrompt: string;
   singlePrompt: string;
   
@@ -142,6 +167,7 @@ export interface OcrBlock {
   fontSize: number;                    // estimated font size in points
   fontFamily: string;                  // 'serif', 'sans-serif', 'monospace', etc.
   confidence?: number;                 // OCR confidence score (0-1)
+  hasValidRect?: boolean;              // model actually supplied usable coordinates
   blockType?: 'text' | 'heading' | 'caption' | 'table' | 'image' | string;
 }
 
@@ -349,9 +375,17 @@ export const AVAILABLE_LANGUAGES = [
 // PROMPT TEMPLATES
 // ════════════════════════════════════════════════════════════════
 
-export const GEMMA_TEMPLATE = `You are a professional {SOURCE_LANG} ({SOURCE_CODE}) to {TARGET_LANG} ({TARGET_CODE}) translator. Your goal is to accurately convey the meaning and nuances of the original {SOURCE_LANG} text while adhering to {TARGET_LANG} grammar, vocabulary, terminology. Produce only the {TARGET_LANG} translation, without any additional explanations or commentary. 
+// Neutral default for the "special template" mode. Users edit this freely.
+// {TEXT} is where the source text is injected; the plugin adds the numbered
+// [#N] segment instructions automatically when batching.
+export const DEFAULT_CUSTOM_TEMPLATE = `You are a professional {SOURCE_LANG} to {TARGET_LANG} translator. Translate the following text accurately and naturally, preserving meaning, terminology, and tone. Output only the {TARGET_LANG} translation with no explanations or commentary.
 
-Be accurate with  grammar, use only correct and actual terminology. Please translate the following {SOURCE_LANG} text into {TARGET_LANG}: {TEXT}`;
+Text to translate:
+{TEXT}`;
+
+// Legacy fallback only (used if a custom template field is somehow empty).
+// Kept neutral and domain-agnostic — no specialization baked in.
+export const GEMMA_TEMPLATE = DEFAULT_CUSTOM_TEMPLATE;
 
 // ════════════════════════════════════════════════════════════════
 // OCR PROMPTS (PROVIDER-OPTIMIZED)
@@ -460,6 +494,10 @@ export const DEFAULT_OCR_PROVIDER_SETTINGS: OcrProviderSettings = {
   workflowMode: 'per-page',
   ocrPromptTemplate: DEFAULT_OCR_PROMPT,
   ocrFullDocPromptTemplate: DEFAULT_OCR_PROMPT,
+  ocrTextPromptTemplate: DEFAULT_OCR_TEXT_PROMPT,
+  ocrOutputMode: 'translation-note',
+  ocrOutputFolder: '',
+  ocrOutputFilenamePattern: '{pdfname}.translated',
   responseFormatInstruction: '',
   responseJsonPath: '',
   imageScale: 2,
@@ -540,6 +578,10 @@ export const DEFAULT_SETTINGS: OpenRouterTranslatorSettings = {
   enableTranslation: true,
   useBatchTranslation: true,
   debugMode: false,
+  enableSemanticMerging: true,
+  sequentialDelayMs: 150,
+  watcherEnabled: false,
+  watcherFolder: '',
   
   // Language Settings
   sourceLanguage: 'auto',
@@ -551,7 +593,7 @@ export const DEFAULT_SETTINGS: OpenRouterTranslatorSettings = {
   overlayOpacity: 99,
   
   // Processing Settings
-  maxBatchChars: 7500,
+  maxBatchChars: 4000,
   mergeOnStyleChange: false,
   
   // Storage Settings
@@ -570,37 +612,13 @@ export const DEFAULT_SETTINGS: OpenRouterTranslatorSettings = {
   
   // Custom Prompts
   useGemmaPrompt: false,
-  
-  // UPDATED BATCH PROMPT to match processing.ts [#ID] logic
-  batchPrompt: `You are a precise document translator, translating between {sourceLang} and {targetLang}. 
+  customTemplate: DEFAULT_CUSTOM_TEMPLATE,
 
-Your task is to translate the provided lines while STRICTLY maintaining a specific separator format.
+  // Neutral, domain-agnostic defaults. The optional "special template"
+  // (useGemmaPrompt + customTemplate) is a separate user-editable override.
+  batchPrompt: DEFAULT_BATCH_PROMPT,
 
-Format Requirements:
-1. The input uses "[#ID]" tags to identify segments.
-2. You MUST return the translation using the EXACT same "[#ID]" tags.
-3. Do not merge lines. Do not delete tags.
-4. Output ONLY the translated segments. No conversational filler.
-
-Example:
-Input:
-[#1] Acute kidney injury (AKI) in dogs.
-[#2] Treatment options include fluid therapy.
-Output:
-[#1] Острое повреждение почек (AKI) у собак.
-[#2] Варианты лечения включают инфузионную терапию.
-
-Translation Rules:
-- Return exactly {lineCount} lines.
-- Use precise  terminology.
-- Do not split paragraphs. One input line = One output line.
-- Do not add conversational text, markdown code blocks, or notes.
-- Ensure 1:1 mapping: if the input has 5 lines, the output must have 5 lines.
-
-Now translate:
-{inputText}`,
-
-  singlePrompt: `Translate from {sourceLang} to {targetLang}. Only output the translation. Preserve formatting and tone.`,
+  singlePrompt: DEFAULT_SINGLE_PROMPT,
   
   // Custom Copy Formats
   calloutFormat: '> [!quote] Translation\n> {blockquote_text}\n>\n> {pagelink}',
