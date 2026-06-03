@@ -1,4 +1,4 @@
-# OpenRouter PDF Translator
+# Open PDF Translate
 
 An [Obsidian](https://obsidian.md/)  plugin that translates PDF documents directly inside your vault. Translated text is displayed as a transparent overlay on top of the original PDF, or written to a separate Markdown note for scanned documents. 
 
