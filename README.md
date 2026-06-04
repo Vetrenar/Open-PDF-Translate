@@ -2,23 +2,8 @@
 
 An [Obsidian](https://obsidian.md/)  plugin that translates PDF documents directly inside your vault. Translated text is displayed as a transparent overlay on top of the original PDF, or written to a separate Markdown note for scanned documents. 
 
----
 
-## Table of Contents
 
-1. [Requirements](https://claude.ai/chat/f101c9a3-53aa-4d1f-a5e4-c331f1198385#requirements)
-2. [Quick Start](https://claude.ai/chat/f101c9a3-53aa-4d1f-a5e4-c331f1198385#quick-start)
-3. [How It Works](https://claude.ai/chat/f101c9a3-53aa-4d1f-a5e4-c331f1198385#how-it-works)
-4. [Layout Engines](https://claude.ai/chat/f101c9a3-53aa-4d1f-a5e4-c331f1198385#layout-engines)
-5. [Providers](https://claude.ai/chat/f101c9a3-53aa-4d1f-a5e4-c331f1198385#providers)
-6. [OCR (AI Vision)](https://claude.ai/chat/f101c9a3-53aa-4d1f-a5e4-c331f1198385#ocr-ai-vision)
-7. [Background Translation (Folder Watcher)](https://claude.ai/chat/f101c9a3-53aa-4d1f-a5e4-c331f1198385#background-translation-folder-watcher)
-8. [Commands Reference](https://claude.ai/chat/f101c9a3-53aa-4d1f-a5e4-c331f1198385#commands-reference)
-9. [Settings Reference](https://claude.ai/chat/f101c9a3-53aa-4d1f-a5e4-c331f1198385#settings-reference)
-10. [Translation Files](https://claude.ai/chat/f101c9a3-53aa-4d1f-a5e4-c331f1198385#translation-files)
-11. [PDF Export](https://claude.ai/chat/f101c9a3-53aa-4d1f-a5e4-c331f1198385#pdf-export)
-12. [Troubleshooting](https://claude.ai/chat/f101c9a3-53aa-4d1f-a5e4-c331f1198385#troubleshooting)
-13. [Languages](https://claude.ai/chat/f101c9a3-53aa-4d1f-a5e4-c331f1198385#languages)
 
 ---
 
