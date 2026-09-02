@@ -1,5 +1,18 @@
-import { spawn } from 'child_process';
-import { Notice, TFile } from 'obsidian';
+// external-layout.ts
+// ─────────────────────────────────────────────────────────────────────────
+// Phase 4 (C1) correction: the previous version imported `spawn` from
+// 'child_process' at the top of the module. That is a static CommonJS
+// import which will crash the plugin on Obsidian Mobile (and any non-
+// desktop Electron build) because `child_process` is undefined outside
+// of Node/Electron. We now:
+//   1. Import `Platform` from 'obsidian' (Notice was already imported).
+//   2. Guard the whole `generateLayout` call site with `Platform.isDesktop`.
+//   3. Lazily obtain `spawn` via `(window as any).require('child_process')`
+//      at call time — same pattern used by `pdf-export.ts` for its Node
+//      modules. This keeps the module load-safe on mobile.
+// ─────────────────────────────────────────────────────────────────────────
+
+import { Notice, Platform, TFile } from 'obsidian';
 import OpenRouterTranslatorPlugin from './main';
 
 export interface ExternalLayoutItem {
@@ -75,8 +88,38 @@ export class ExternalLayoutService {
   /**
    * Runs the Python script to analyze the PDF.
    * Returns the full layout object.
+   *
+   * Phase 4 (C1): This method is now desktop-only. On mobile we throw an
+   * Error before attempting any Node-only operation. Callers are expected
+   * to surface the error to the user (typically via Notice) — most call
+   * sites already catch and report failures.
    */
   public async generateLayout(pdfFile: TFile): Promise<ExternalPageLayout | null> {
+    // ── Phase 4 (C1): Platform guard ───────────────────────────────
+    // `child_process.spawn` is only available on desktop (Electron/Node).
+    // On Obsidian Mobile the static `import { spawn } from 'child_process'`
+    // would crash the plugin at module-load time; we therefore obtain it
+    // lazily here and refuse to run on non-desktop platforms.
+    if (!Platform.isDesktop) {
+      throw new Error('Python layout engine is desktop-only.');
+    }
+
+    const nodeRequire = (window as any).require;
+    if (!nodeRequire) {
+      throw new Error('Cannot require child_process on this platform.');
+    }
+
+    let spawn: (cmd: string, args: string[], options?: any) => any;
+    try {
+      const cp = nodeRequire('child_process');
+      spawn = cp.spawn;
+    } catch (err: any) {
+      throw new Error(`Failed to load child_process: ${err?.message ?? err}`);
+    }
+    if (typeof spawn !== 'function') {
+      throw new Error('child_process.spawn is not available on this platform.');
+    }
+
     const { pythonPath, ocrScriptPath } = this.plugin.settings;
     const filePath = pdfFile.path;
     

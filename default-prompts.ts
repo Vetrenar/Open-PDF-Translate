@@ -72,9 +72,7 @@ export const LAYOUT_ENGINE_DESCRIPTIONS: Record<'internal' | 'python' | 'ocr-api
         'Vision-model OCR. The only option for scanned PDFs with no text layer. Recommended output is a translation-only note (see OCR output mode below); overlay coordinates from vision models are unreliable.',
 };
 
-export const OCR_OUTPUT_MODE_DESCRIPTIONS: Record<'translation-note' | 'overlay', string> = {
+export const OCR_OUTPUT_MODE_DESCRIPTIONS: Record<'translation-note', string> = {
     'translation-note':
         'Recommended. Transcribes each page and writes a translation-only Markdown note linked to the PDF. No overlay, no coordinates — robust for scans.',
-    overlay:
-        'Experimental. Attempts to place translated overlays using coordinates the vision model estimates. Most models do this poorly; expect misplaced or zero-size boxes.',
 };

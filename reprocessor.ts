@@ -3,6 +3,13 @@ import { App, Notice, TFile } from 'obsidian';
 import OpenRouterTranslatorPlugin from './main';
 import { OverlayPositionData, SavedOverlay } from './types';
 import { LayoutResult } from './layout-detector';
+// Phase 7 (V4 Schema): stable per-overlay identifier generator. Stamped on
+// every reprocessed overlay so the saved result has an id that matches what
+// the DOM-extraction and queue paths produce for the same source paragraph —
+// enables merge-by-id-first in updatePageOverlaysAndWrite.
+import { generateOverlayId, getCurrentEngine } from './overlay-id';
+// T1.6/T2.4: shared overlap test (replaces the local dead isOverlapping copy).
+import { isRectOverlapping } from './shared';
 
 /**
  * RegionReprocessor
@@ -18,7 +25,9 @@ export class RegionReprocessor {
     private dragStart: { x: number; y: number } | null = null;
     private box: HTMLDivElement | null = null;
     private readonly plugin: OpenRouterTranslatorPlugin;
-    private readonly debug: boolean;
+    // P0-3c (R-5): `debug` was captured at construction time, so toggling
+    // `debugMode` later had no effect. It is now a getter that reads from
+    // settings on every access.
     private cleanup = new Set<() => void>();
     private isActive = false;
     private frameId: number | null = null;
@@ -26,7 +35,11 @@ export class RegionReprocessor {
 
     constructor(plugin: OpenRouterTranslatorPlugin) {
         this.plugin = plugin;
-        this.debug = plugin.settings.debugMode;
+    }
+
+    /** P0-3c: dynamic debug flag — reflects current settings. */
+    private get debug(): boolean {
+        return this.plugin.settings.debugMode;
     }
 
     /**
@@ -34,11 +47,22 @@ export class RegionReprocessor {
      */
     public start(): void {
         if (this.isActive) {
-            new Notice('Another reprocessing session is active. Canceling previous one.');
-            this.cleanupAll();
+            // P0-3a (R-2): previously called `cleanupAll()` which removes
+            // listeners and clears the cleanup set but does NOT reset
+            // `isActive`. The previous session's `run()` was still awaiting
+            // events from listeners that were just removed — a zombie Promise
+            // hung forever. Calling `finish()` properly cancels the previous
+            // session before starting a new one.
+            new Notice('Canceling previous reprocessing session.');
+            this.finish();
         }
         this.isActive = true;
-        void this.run();
+        // P0-3c: catch any rejection so it doesn't surface as an unhandled
+        // promise rejection in the console (was `void this.run()`).
+        void this.run().catch(err => {
+            console.error('[RegionReprocessor] run() failed:', err);
+            this.finish();
+        });
     }
 
     /**
@@ -66,7 +90,12 @@ export class RegionReprocessor {
             this.finish();
             return;
         }
-        const pageEl = document.querySelector<HTMLElement>(`.page[data-page-number="${pageNumber}"]`);
+        // T4.1 (split-view fix): resolve the page element through the
+        // leaf-scoped adapter instead of a global document.querySelector —
+        // with two PDFs open side by side, the global query returned the
+        // FIRST matching page across ALL leaves, silently operating on the
+        // WRONG file.
+        const pageEl = this.plugin.pdfDom.getPageElement(pageNumber, this.plugin.pdfDom.getActivePdfLeaf());
         if (!pageEl) {
             new Notice('Page is not rendered. Please scroll into view.');
             this.finish();
@@ -92,6 +121,12 @@ export class RegionReprocessor {
             e.stopPropagation();
             if (this.isDragging) return;
             this.isDragging = true;
+            // P2-69 (Phase 12): restart the 15s timer when the user actually
+            // starts dragging. Previously the timer set in `run()` would fire
+            // mid-drag (15s after the user entered shift+drag mode, even if
+            // they were still actively selecting), aborting the selection
+            // mid-flight. The timer is extended on every mousemove below.
+            resetSelectionTimeout();
             this.dragStart = { x: e.clientX, y: e.clientY };
             this.box?.remove();
             this.box = createEl('div', { cls: 'pdf-translation-selection-box' });
@@ -106,19 +141,31 @@ export class RegionReprocessor {
 
         const onMouseMove = (e: MouseEvent) => {
             if (!this.isDragging || !this.dragStart || !this.box) return;
+            // P2-69 (Phase 12): extend the timer while the user is actively
+            // dragging so a slow selection (>15s) is never aborted mid-drag.
+            resetSelectionTimeout();
+            // Phase 15.2 (C16): value-capture pattern. `cleanupAll()` can run
+            // between the rAF schedule and the frame firing (e.g. on Escape),
+            // nulling `this.dragStart` and removing `this.box`. Capturing
+            // both into locals and re-checking `isDragging` inside the
+            // callback prevents dereferencing a stale `null` and also stops
+            // us from mutating a detached DOM node.
+            const start = this.dragStart;  // capture value
+            const box = this.box;          // capture value
             e.preventDefault();
             if (this.frameId !== null) return;
             this.frameId = window.requestAnimationFrame(() => {
                 this.frameId = null;
+                if (!this.isDragging) return;  // re-check after rAF
                 const { clientX, clientY } = e;
-                const { x: startX, y: startY } = this.dragStart!;
+                const { x: startX, y: startY } = start;  // use captured value
                 const left = Math.min(startX, clientX);
                 const top = Math.min(startY, clientY);
                 const width = Math.abs(clientX - startX);
                 const height = Math.abs(clientY - startY);
-                this.box!.style.transform = `translate(${left}px, ${top}px)`;
-                this.box!.style.width = `${width}px`;
-                this.box!.style.height = `${height}px`;
+                box.style.transform = `translate(${left}px, ${top}px)`;
+                box.style.width = `${width}px`;
+                box.style.height = `${height}px`;
             });
         };
 
@@ -127,6 +174,13 @@ export class RegionReprocessor {
             e.preventDefault();
             e.stopPropagation();
             this.isDragging = false;
+            // P2-69 (Phase 12): clear the timer explicitly so a slow mouseup
+            // (or a no-op tiny-drag cancel) doesn't fire the timeout notice
+            // moments after the drag already ended. `cleanupAll()` below also
+            // runs the cleanup-set clear, but being explicit avoids ordering
+            // surprises if a future caller invokes onMouseUp without going
+            // through cleanupAll (e.g. escape-cancellation path).
+            clearSelectionTimeout();
             if (this.frameId !== null) {
                 cancelAnimationFrame(this.frameId);
                 this.frameId = null;
@@ -139,7 +193,13 @@ export class RegionReprocessor {
             );
             this.cleanupAll();
             if (rect.width > 5 && rect.height > 5) {
-                void this.handleRegionReprocessing(rect, pageNumber, file);
+                // P0-3c: catch rejections so they don't surface as unhandled
+                // promise rejections (was `void this.handleRegionReprocessing(...)`).
+                void this.handleRegionReprocessing(rect, pageNumber, file).catch(err => {
+                    console.error('[RegionReprocessor] handleRegionReprocessing failed:', err);
+                    new Notice(`❌ Region reprocessing failed: ${err?.message ?? err}`);
+                    this.finish();
+                });
             } else {
                 this.finish();
             }
@@ -158,14 +218,37 @@ export class RegionReprocessor {
         registerListener(document, 'mouseup', onMouseUp);
         registerListener(document, 'keydown', onKeyDown);
 
-        const timeoutId = window.setTimeout(() => {
+        // P2-69 (Phase 12): the 15s idle-timeout is now mutable so it can be
+        // cleared/extended by onMouseDown / onMouseMove / onMouseUp. Originally
+        // it was a single `const` set once at session start, which fired
+        // mid-drag if the user spent >15s selecting.
+        const SELECTION_TIMEOUT_MS = 15000;
+        let selectionTimeoutId: number | null = window.setTimeout(() => {
             if (this.isActive) {
                 new Notice('Region selection timed out.', 2000);
                 this.cleanupAll();
                 this.finish();
             }
-        }, 15000);
-        this.cleanup.add(() => clearTimeout(timeoutId));
+        }, SELECTION_TIMEOUT_MS);
+        const clearSelectionTimeout = () => {
+            if (selectionTimeoutId !== null) {
+                clearTimeout(selectionTimeoutId);
+                selectionTimeoutId = null;
+            }
+        };
+        const resetSelectionTimeout = () => {
+            if (selectionTimeoutId !== null) {
+                clearTimeout(selectionTimeoutId);
+            }
+            selectionTimeoutId = window.setTimeout(() => {
+                if (this.isActive) {
+                    new Notice('Region selection timed out.', 2000);
+                    this.cleanupAll();
+                    this.finish();
+                }
+            }, SELECTION_TIMEOUT_MS);
+        };
+        this.cleanup.add(clearSelectionTimeout);
     }
 
     /**
@@ -178,7 +261,18 @@ export class RegionReprocessor {
         pageNumber: number,
         file: TFile
     ): Promise<void> {
-        const pageEl = document.querySelector<HTMLElement>(`.page[data-page-number="${pageNumber}"]`);
+        // P1-21 (Phase 12): warn if a background translation worker is
+        // currently active on the same vault. We don't abort — the user may
+        // intentionally want to override the worker's pending output for
+        // this page — but we surface the conflict so they can decide
+        // whether to wait for the worker to drain first.
+        if (this.plugin.pdfLayoutQueue?.isRunning?.()) {
+            new Notice('Background translation in progress. Wait or cancel first.', 5000);
+            // Don't abort — let user decide. Just warn.
+        }
+
+        // T4.1: leaf-scoped resolution (see run() note).
+        const pageEl = this.plugin.pdfDom.getPageElement(pageNumber, this.plugin.pdfDom.getActivePdfLeaf());
         const textLayer = pageEl?.querySelector<HTMLElement>('.textLayer');
         if (!pageEl || !textLayer) {
             new Notice('⚠️ Page or text layer not available.');
@@ -202,7 +296,17 @@ export class RegionReprocessor {
         }
 
         // Step 2: Delegate processing and translation to the main TextProcessor
-        const translationUnits = this.plugin.processor.prepareTranslationUnits(selectedSpans, pageEl);
+        // P0-3 (R-1): CRITICAL — `prepareTranslationUnits` is async and returns
+        // Promise<TranslationUnit[]>. The missing `await` meant `translationUnits`
+        // was a Promise, `translationUnits.length` was `undefined`, the guard
+        // `=== 0` never fired, the Notice printed "Translating undefined segment(s)",
+        // and `executeTranslation(translationUnits)` crashed inside `units.map(...)`
+        // with `TypeError: units.map is not a function`. Region Reprocessing
+        // was completely broken.
+        // Phase 15.1: pass `forceFresh: true` so reprocessing never serves a
+        // stale cached layout for the selected spans — the user explicitly
+        // asked to re-detect & re-translate this region.
+        const translationUnits = await this.plugin.processor.prepareTranslationUnits(selectedSpans, pageEl, true);
         if (!translationUnits || translationUnits.length === 0) {
             new Notice('No translatable segments found in the selected region.');
             this.finish();
@@ -225,11 +329,14 @@ export class RegionReprocessor {
         // --- CORRECTED FONT SIZE CALCULATION ---
         // Get the current scale factor from the PDF viewer container *at the time of selection*.
         const pdfViewer = pageEl.closest('.pdfViewer, #viewer') as HTMLElement | null;
-        const currentScaleFromViewer = parseFloat(pdfViewer?.style.getPropertyValue('--scale-factor') || '1');
+        // P0-3b (R-3): previously the NaN/<=0 branch only warned and continued
+        // — every subsequent font-size computation became NaN (since
+        // `observed / NaN = NaN`) and was persisted to `.translations.md`.
+        // Now we actually fall back to 1.0 so downstream math stays finite.
+        let currentScaleFromViewer = parseFloat(pdfViewer?.style.getPropertyValue('--scale-factor') || '1');
         if (isNaN(currentScaleFromViewer) || currentScaleFromViewer <= 0) {
-             console.warn('[RegionReprocessor] Invalid scale factor found, defaulting to 1.0');
-             // Fallback might be to getComputedStyle transform, but --scale-factor is usually reliable
-             // For now, just warn and proceed, potentially leading to incorrect size if it's truly wrong.
+            console.warn('[RegionReprocessor] Invalid scale factor, falling back to 1.0');
+            currentScaleFromViewer = 1.0;
         }
         // --- END CORRECTED FONT SIZE CALCULATION ---
 
@@ -287,6 +394,16 @@ export class RegionReprocessor {
                 // fontSize is often derived from originalFontSizes or not strictly needed if originalFontSizes is present
                 // If you still want to store it, store the base size:
                 fontSize: baseAvgFontSize,
+                // Phase 7 (V4 Schema): stable id from page + rect@3dec + textContent.
+                // Matches the id produced by overlay.ts extractPositionDataFrom
+                // and pdf-layout-queue.ts buildOverlayData for the same source
+                // paragraph — enables merge-by-id-first in updatePageOverlaysAndWrite.
+                id: generateOverlayId(pageNumber, relativeRect, text || ''),
+                // Phase 8 (V4 Schema): engine stamp from current provider/model.
+                // Reprocessor re-translates via the live TranslationEngine, so
+                // the current settings reflect the engine that produced the
+                // retranslated text.
+                engine: getCurrentEngine(this.plugin),
             });
         }
 
@@ -296,55 +413,100 @@ export class RegionReprocessor {
             return;
         }
 
-        // Step 4: Merge new items, save, and refresh the view (Reprocessor's unique job)
-        const savedOverlay = await this.loadSavedOverlay(file);
-        const pageKey = String(pageNumber);
-        const existingItems = savedOverlay.pageOverlays[pageKey] || [];
-        const nonOverlappingOldItems = existingItems.filter(oldItem =>
-            !newItems.some(newItem => this.isOverlapping(oldItem.relativeRect, newItem.relativeRect))
-        );
+        // Step 4: Save the reprocessed page and refresh the view (Reprocessor's unique job).
+        //
+        // Phase 3 (P0-7): previously this block did a full-file read-modify-write
+        // via `loadSavedOverlay(file)` + manual rect-overlap merge + `saveOverlay`
+        // (which delegated to `writeSavedOverlayForFile` — a full-file overwrite).
+        // That clobbered any concurrent worker writes on OTHER pages — the worker
+        // writes via `updatePageOverlaysAndWrite` (which only touches the pages it
+        // was given), but the reprocessor's stale full-file read could overwrite
+        // those worker pages with their pre-worker state, silently losing data.
+        //
+        // Now we write ONLY the modified page through `updatePageOverlaysAndWrite`
+        // (via `saveOverlay`). Storage's per-page merge-by-rect-overlap preserves
+        // any existing non-overlapping items on this page; other pages on disk are
+        // NOT touched. Phase 7 will swap rect-overlap for merge-by-id-first, but
+        // rect-overlap is sufficient to fix P0-7 (no longer clobbering OTHER pages).
+        //
+        // We construct a minimal SavedOverlay containing only the new items for
+        // the modified page — `saveOverlay` extracts that page and forwards it
+        // to `updatePageOverlaysAndWrite` as `{ [modifiedPage]: items }`.
+        // T1.6 (P0-2 fix): the old code wrote ONLY the region's newItems with
+        // replace:true — silently deleting every OTHER saved overlay on the
+        // page (its own comment promised "existing non-overlapping + new"
+        // but never implemented it). We now read the page's saved items,
+        // drop only those INSIDE the selection region, and write the union.
+        let itemsToWrite = newItems;
+        try {
+            const existing = await this.plugin.storage.readSavedOverlayForFile(file);
+            const pageItems = existing?.overlay?.pageOverlays?.[String(pageNumber)];
+            if (Array.isArray(pageItems) && pageItems.length > 0) {
+                const pageRect = pageEl.getBoundingClientRect();
+                // Selection rect (screen coords) → page-relative fractions.
+                const selLeft = (Math.max(screenRect.left, pageRect.left) - pageRect.left) / pageRect.width;
+                const selRight = (Math.min(screenRect.right, pageRect.right) - pageRect.left) / pageRect.width;
+                const selTop = (Math.max(screenRect.top, pageRect.top) - pageRect.top) / pageRect.height;
+                const selBottom = (Math.min(screenRect.bottom, pageRect.bottom) - pageRect.top) / pageRect.height;
+                const regionRect = {
+                    left: selLeft,
+                    top: selTop,
+                    width: Math.max(0, selRight - selLeft),
+                    height: Math.max(0, selBottom - selTop),
+                };
+                const survivors = pageItems.filter(item =>
+                    !isRectOverlapping(item.relativeRect, regionRect, 0.0005)
+                );
+                itemsToWrite = [...survivors, ...newItems];
+                if (this.debug) {
+                    console.log(`[RegionReprocessor] page ${pageNumber}: kept ${survivors.length} existing, replacing ${pageItems.length - survivors.length}, adding ${newItems.length} new.`);
+                }
+            }
+        } catch (e) {
+            // Read failed → fall back to writing only the new items (the
+            // pre-fix behaviour) rather than aborting the user's work.
+            console.warn('[RegionReprocessor] Failed to read existing overlays for merge; writing region items only.', e);
+        }
 
-        savedOverlay.pageOverlays[pageKey] = [...nonOverlappingOldItems, ...newItems];
-        savedOverlay.timestamp = Date.now();
-
-        await this.saveOverlay(savedOverlay, file);
+        const savedOverlay: SavedOverlay = {
+            fileName: file.basename.replace(/\.pdf$/i, ''),
+            filePath: file.path,
+            timestamp: Date.now(),
+            pageOverlays: { [pageNumber]: itemsToWrite },
+        };
+        await this.saveOverlay(savedOverlay, file, pageNumber);
 
         this.plugin.clearAllOverlays();
-        await this.plugin.storage.loadSavedOverlayForCurrentPage(file, true); // Force reload
+        // Phase 3 (P0-11): use the overlay-side `loadSavedOverlayForCurrentPage`
+        // (leaf-scoped, uses the renderer's in-memory cache as the single source
+        // of truth) instead of the deleted storage-side version.
+        await this.plugin.overlay.loadSavedOverlayForCurrentPage(true);
 
         new Notice(`✅ Reprocessed and saved ${newItems.length} segment(s)`);
         this.finish();
     }
 
-    private async loadSavedOverlay(file: TFile): Promise<SavedOverlay> {
-        const { storage } = this.plugin;
-        const result = await storage.readSavedOverlayForFile(file);
-        return result?.overlay || {
-            fileName: file.basename.replace(/\.pdf$/i, ''),
-            filePath: file.path,
-            timestamp: Date.now(),
-            pageOverlays: {},
-        };
-    }
-
-    private async saveOverlay(savedOverlay: SavedOverlay, file: TFile): Promise<void> {
-        await this.plugin.storage.writeSavedOverlayForFile(file, savedOverlay);
+    /**
+     * Phase 3 (P0-7): writes ONLY the modified page through
+     * `updatePageOverlaysAndWrite`. Storage's per-page merge-by-rect-overlap
+     * preserves non-overlapping existing items on this page; other pages on
+     * disk are NOT touched (fixing the reprocessor-clobbers-worker-on-other-
+     * pages bug).
+     *
+     * `savedOverlay` is expected to contain at least an entry for
+     * `modifiedPage`; any other pages it may carry are ignored — we forward
+     * only `{ [modifiedPage]: items }` to the storage writer.
+     */
+    private async saveOverlay(savedOverlay: SavedOverlay, file: TFile, modifiedPage: number): Promise<void> {
+        const pageKey = String(modifiedPage);
+        const items = savedOverlay.pageOverlays[pageKey] || [];
+        // Bug 2 fix: use REPLACE semantics. Reprocessor builds a fresh set of items
+        // for the modified page (existing non-overlapping + new). MERGE would re-merge
+        // against disk state and could keep stale duplicates when rects drift slightly.
+        await this.plugin.storage.updatePageOverlaysAndWrite(file, { [modifiedPage]: items }, { replace: true });
         if (this.debug) {
-            console.log(`[RegionReprocessor] Saved updates for ${file.path}`);
+            console.log(`[RegionReprocessor] Saved page ${modifiedPage} for ${file.path}`);
         }
-    }
-
-    private isOverlapping(
-        a: { left: number; top: number; width: number; height: number },
-        b: { left: number; top: number; width: number; height: number }
-    ): boolean {
-        const eps = 1e-5;
-        return !(
-            a.left + a.width < b.left - eps ||
-            b.left + b.width < a.left - eps ||
-            a.top + a.height < b.top - eps ||
-            b.top + b.height < a.top - eps
-        );
     }
 
     private cleanupAll(): void {

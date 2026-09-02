@@ -141,6 +141,36 @@ export class PdfViewerAdapter {
         return best;
     }
 
+    /**
+     * P1-20: All pages currently intersecting the viewport (with optional
+     * margin). Previously `getCurrentVisiblePage` returned only ONE page —
+     * the most central one. `toggleOverlayVisibility` and similar actions
+     * that should affect "everything the user can see right now" had to
+     * either iterate all leaves and pages manually (which they did, but
+     * only over already-loaded overlays — pages that hadn't been rendered
+     * yet were silently skipped), or call this method which doesn't exist.
+     *
+     * Now both `toggleOverlayVisibility` and `forceRefreshVisibleOverlays`
+     * use this method to get a stable list of visible pages with a small
+     * lookahead margin so quick scrolls don't miss the next page.
+     */
+    getVisiblePages(leaf?: WorkspaceLeaf | null, marginPx: number = 200): HTMLElement[] {
+        const pages = this.getPages(leaf);
+        if (pages.length === 0) return [];
+        const vh = window.innerHeight;
+        const result: HTMLElement[] = [];
+        for (const page of pages) {
+            const rect = page.getBoundingClientRect();
+            if (rect.width === 0 || rect.height === 0) continue;
+            // Page is "visible" if any part of it (plus the margin) overlaps
+            // the viewport vertically. We don't check horizontal overlap
+            // because Obsidian PDF viewer is always full-width per leaf.
+            if (rect.bottom < -marginPx || rect.top > vh + marginPx) continue;
+            result.push(page);
+        }
+        return result;
+    }
+
     getPageNumberOf(pageEl: HTMLElement): number | null {
         const n = parseInt(pageEl.dataset.pageNumber || '', 10);
         return Number.isFinite(n) ? n : null;

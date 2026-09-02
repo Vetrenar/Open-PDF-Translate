@@ -2,8 +2,13 @@
 import { App, Modal, Notice, Setting, TFile } from 'obsidian';
 import OpenRouterTranslatorPlugin from './main';
 import { SavedOverlay, OverlayPositionData } from './types';
+// Stage 0.5 (Q22): SingletonModal prevents two concurrent retranslate
+// modals from racing on the same `.translations.md` file.
+import { SingletonModal } from './modal-base';
+// Phase 17 (F-D4-1): i18n for the modal title.
+import { t } from './i18n';
 
-export class RetranslateUsingOverlaysModal extends Modal {
+export class RetranslateUsingOverlaysModal extends SingletonModal<RetranslateUsingOverlaysModal> {
   private plugin: OpenRouterTranslatorPlugin;
   private file: TFile;
 
@@ -15,27 +20,52 @@ export class RetranslateUsingOverlaysModal extends Modal {
   private onlyEmpty = false;       // only translate items with empty translatedText
   private confirmOverwrite = true; // show confirmation if overwriting non-empty items
 
+  // P0-4 (Phase 5): cancel signal for the in-progress `runRetranslation`
+  // loop. Set by `onClose()` (which fires when the user clicks Cancel,
+  // presses Esc, or dismisses the modal) and checked inside the per-job
+  // loop and before the final disk write so we don't persist a partial
+  // retranslation that the user explicitly abandoned.
+  private cancelled: boolean = false;
+
   constructor(app: App, plugin: OpenRouterTranslatorPlugin, file: TFile) {
     super(app);
     this.plugin = plugin;
     this.file = file;
   }
 
+  /**
+   * P1-28 (Phase 5): override SingletonModal's reopen behavior. The
+   * default 'replace' would call `existing.close()` on the in-progress
+   * instance, which fires `onClose()` → sets `cancelled = true` →
+   * the running retranslation aborts mid-chunk even though the user
+   * just re-invoked the command (e.g. from the palette to peek at
+   * progress). Returning 'focus' keeps the existing instance alive
+   * and brings it to the front instead.
+   */
+  protected reopenBehavior(): 'focus' | 'replace' {
+    return 'focus';
+  }
+
   onOpen(): void {
-    const { contentEl } = this;
+    const { contentEl, titleEl } = this;
     contentEl.empty();
 
-    contentEl.createEl('h2', { text: 'Re-translate using saved overlay boxes' });
+    // Phase 17 (F-D4-1): was `contentEl.createEl('h2', { text: '...' })`.
+    // Obsidian's Style Guide says modal titles go in `titleEl` (the modal
+    // header), not as an `<h2>` inside the body. Using `titleEl.setText`
+    // also gets us free dark/light theme styling and consistent spacing
+    // with the other modals.
+    titleEl.setText(t('modal.retranslate.title'));
 
     // Scope selector
     let rangeSetting: Setting;
 
     new Setting(contentEl)
-      .setName('Scope')
-      .setDesc('Choose which pages to re-translate')
+      .setName(t('modal.retranslate.scope'))
+      .setDesc(t('modal.retranslate.scope.desc'))
       .addDropdown((dd) => {
-        dd.addOption('current', 'Current page only');
-        dd.addOption('range', 'Page range…');
+        dd.addOption('current', t('modal.retranslate.scope.current'));
+        dd.addOption('range', t('modal.retranslate.scope.range'));
         dd.setValue('current');
         dd.onChange((val) => {
           this.onlyCurrentPage = (val === 'current');
@@ -47,17 +77,17 @@ export class RetranslateUsingOverlaysModal extends Modal {
 
     // Range inputs
     rangeSetting = new Setting(contentEl)
-      .setName('Page range')
-      .setDesc('Inclusive page range (1-based indices)')
+      .setName(t('modal.retranslate.pageRange'))
+      .setDesc(t('modal.retranslate.pageRange.desc'))
       .addText((txt) => {
-        txt.setPlaceholder('From')
+        txt.setPlaceholder(t('modal.retranslate.from'))
           .onChange((val) => {
             const n = parseInt(val, 10);
             this.fromPage = Number.isFinite(n) && n > 0 ? n : null;
           });
       })
       .addText((txt) => {
-        txt.setPlaceholder('To')
+        txt.setPlaceholder(t('modal.retranslate.to'))
           .onChange((val) => {
             const n = parseInt(val, 10);
             this.toPage = Number.isFinite(n) && n > 0 ? n : null;
@@ -68,39 +98,55 @@ export class RetranslateUsingOverlaysModal extends Modal {
 
     // Options
     new Setting(contentEl)
-      .setName('Only re-translate empty items')
-      .setDesc('If enabled, only items with no translated text will be translated.')
+      .setName(t('modal.retranslate.onlyEmpty'))
+      .setDesc(t('modal.retranslate.onlyEmpty.desc'))
       .addToggle((tg) => {
         tg.setValue(this.onlyEmpty)
           .onChange((v) => (this.onlyEmpty = v));
       });
 
     new Setting(contentEl)
-      .setName('Ask before overwriting non-empty items')
-      .setDesc('When unchecked, existing translations will be overwritten without confirmation.')
+      .setName(t('modal.retranslate.confirmOverwrite'))
+      .setDesc(t('modal.retranslate.confirmOverwrite.desc'))
       .addToggle((tg) => {
         tg.setValue(this.confirmOverwrite)
           .onChange((v) => (this.confirmOverwrite = v));
       });
 
     // Actions
+    // Phase 14.3 (F-D4-2): disable Start during the async `runRetranslation()`
+    // so a double-click can't kick off two concurrent retranslation passes on
+    // the same file (they'd race on `updatePageOverlaysAndWrite` and the
+    // second could clobber the first). Cancel stays enabled — user can still
+    // bail out mid-run if needed.
     new Setting(contentEl)
       .addButton((btn) => {
-        btn.setButtonText('Start')
+        btn.setButtonText(t('modal.start'))
           .setCta()
           .onClick(async () => {
+            btn.setDisabled(true);
             try {
               await this.runRetranslation();
               this.close();
             } catch (e: any) {
               console.error(e);
-              new Notice(`Retranslation failed: ${e?.message || 'Unknown error'}`);
+              new Notice(t('modal.retranslate.failed', { error: e?.message || t('modal.retranslate.unknownError') }));
+            } finally {
+              btn.setDisabled(false);
             }
           });
       })
       .addButton((btn) => {
-        btn.setButtonText('Cancel')
-          .onClick(() => this.close());
+        btn.setButtonText(t('modal.cancel'))
+          .onClick(() => {
+            // P0-4 (Phase 5): set the cancel flag BEFORE close() so the
+            // runRetranslation loop sees it on the next iteration check.
+            // `onClose()` also sets it, but setting it here makes the
+            // intent explicit and protects against any future refactor
+            // that changes the onClose ordering.
+            this.cancelled = true;
+            this.close();
+          });
       });
 
     // Small helper style
@@ -113,27 +159,35 @@ export class RetranslateUsingOverlaysModal extends Modal {
   }
 
   onClose(): void {
+    // P0-4 (Phase 5): signal cancel. Covers Esc, backdrop click, and
+    // any other dismiss path that doesn't go through the Cancel button.
+    // The runRetranslation loop checks this flag on every iteration and
+    // before the final disk write.
+    this.cancelled = true;
     this.contentEl.empty();
+    // Stage 0.5 (Q22): MUST call super.onClose() so SingletonModal can
+    // remove us from the per-subclass instances Map.
+    super.onClose();
   }
 
   private async runRetranslation(): Promise<void> {
     // Ensure we have an active page (for default selection and rendering)
     const currentPage = this.plugin.getCurrentPageNumber();
     if (currentPage == null) {
-      new Notice('No active page detected.');
+      new Notice(t('modal.retranslate.noActivePage'));
       return;
     }
 
     // Load the saved overlay file
     const translationFile = await this.plugin.storage.findTranslationFileForPdf(this.file);
     if (!translationFile) {
-      new Notice('No translation file found for this PDF.');
+      new Notice(t('modal.retranslate.noFile'));
       return;
     }
     const md = await this.app.vault.read(translationFile);
     const saved = this.plugin.storage.parseMarkdownOverlay(md, this.file);
     if (!saved) {
-      new Notice('No saved overlays found.');
+      new Notice(t('modal.retranslate.noOverlays'));
       return;
     }
 
@@ -142,7 +196,7 @@ export class RetranslateUsingOverlaysModal extends Modal {
       ? [currentPage]
       : this.buildPageRange();
     if (targetPages.length === 0) {
-      new Notice('Invalid or empty page range.');
+      new Notice(t('modal.retranslate.invalidRange'));
       return;
     }
 
@@ -163,7 +217,7 @@ export class RetranslateUsingOverlaysModal extends Modal {
     }
 
     if (jobs.length === 0) {
-      new Notice('No matching overlay items found for the selected scope.');
+      new Notice(t('modal.retranslate.noMatching'));
       return;
     }
 
@@ -174,24 +228,36 @@ export class RetranslateUsingOverlaysModal extends Modal {
       );
       if (willOverwrite) {
         const proceed = await this.confirm(
-          'Overwrite existing translations?',
-          'Some items already have translated text. Do you want to overwrite them?'
+          t('modal.retranslate.overwriteTitle'),
+          t('modal.retranslate.overwriteMessage')
         );
         if (!proceed) return;
       }
     }
 
     let totalItems = jobs.reduce((acc, j) => acc + j.targetIndexes.length, 0);
-    new Notice(`Re-translating ${totalItems} item(s) across ${jobs.length} page(s)...`, 3000);
+    new Notice(t('modal.retranslate.translatingNotice', { total: String(totalItems), pages: String(jobs.length) }), 3000);
 
     // Execute page by page
     for (const job of jobs) {
+      // P0-4 (Phase 5): check cancel at the top of each iteration so we
+      // don't start a new page's translation work after the user has
+      // dismissed the modal. The await points inside the loop body are
+      // the only places the flag can flip (close() is synchronous from
+      // the user's click but the flag is set before close() runs).
+      if (this.cancelled) break;
       const texts = job.targetIndexes.map(idx => job.pageItems[idx]?.textContent || '');
 
       let translated: string[] = [];
       try {
         if (this.plugin.settings.useBatchTranslation && texts.length > 1) {
-          const numbered = texts.map((t, idx) => `${idx + 1}. ${t}`).join('\n');
+          // T1.7 (P1-2 fix): number segments as [#N] — the ONLY format the
+          // strict parser (extractNumberedLinesRobust, post FIX C3) accepts
+          // and the format the batch prompt itself demands. The old `1. ``
+          // numbering made models mirror the dot-format back, the parser
+          // found zero markers, and EVERY segment silently fell back to its
+          // original text.
+          const numbered = texts.map((t, idx) => `[#${idx + 1}] ${t}`).join('\n');
           const maxChars = this.plugin.settings.maxBatchChars;
           if (numbered.length > maxChars) {
             translated = [];
@@ -200,7 +266,7 @@ export class RetranslateUsingOverlaysModal extends Modal {
             }
           } else {
             const raw = await this.plugin.translation.translateBatch(numbered, texts.length);
-            translated = this.plugin.processor.extractNumberedLines(raw, texts.length, texts);
+            translated = await this.plugin.processor.extractNumberedLines(raw, texts.length, texts);
           }
         } else {
           // Sequential
@@ -233,8 +299,31 @@ export class RetranslateUsingOverlaysModal extends Modal {
 
     // Persist to disk
     saved.timestamp = Date.now();
-    const newMd = this.plugin.storage.generateMarkdownForOverlay(saved, this.file);
-    await this.app.vault.modify(translationFile, newMd);
+
+    // P0-4 (Phase 5): if the user cancelled mid-run, skip the disk write
+    // and the visual refresh — the partial in-memory `saved` object may
+    // contain half-translated pages that the user explicitly abandoned.
+    // We return early with a Notice so the user knows their cancellation
+    // was honored and the on-disk file is unchanged.
+    if (this.cancelled) {
+      new Notice(t('modal.retranslate.cancelled'));
+      return;
+    }
+
+    // T1.7 (P1-3 fix): write ONLY the pages this run actually touched.
+    // The old code serialized the ENTIRE pre-run snapshot with replace:true —
+    // any page the background queue had translated WHILE this modal was
+    // running got rolled back to its pre-modal state (lost update at page
+    // granularity).
+    const touchedPages = new Set(jobs.map(j => j.page));
+    const overlaysByPage: Record<number, OverlayPositionData[]> = {};
+    for (const p of touchedPages) {
+      const v = saved.pageOverlays[String(p)];
+      if (Array.isArray(v)) {
+        overlaysByPage[p] = v as OverlayPositionData[];
+      }
+    }
+    await this.plugin.storage.updatePageOverlaysAndWrite(this.file, overlaysByPage, { replace: true });
 
     // Re-render current visible page if applicable
     const pageToRefresh = this.onlyCurrentPage ? currentPage : this.plugin.getCurrentPageNumber();
@@ -242,7 +331,7 @@ export class RetranslateUsingOverlaysModal extends Modal {
       await this.refreshPageOverlayFromSaved(saved, pageToRefresh);
     }
 
-    new Notice('✅ Re-translation complete.');
+    new Notice(t('modal.retranslate.complete'));
   }
 
   private buildPageRange(): number[] {
@@ -261,9 +350,16 @@ export class RetranslateUsingOverlaysModal extends Modal {
       const textLayer = await this.plugin.overlay.waitForPdfTextLayer(pageNumber);
       if (!textLayer) return;
 
-      // Clear existing overlays on the page
+      // P1-13 (Phase 14): use overlay.clearOverlayFromPage for proper
+      // listener cleanup (uiRenderer.cleanupOverlayElement detaches
+      // per-overlay contextmenu / click / mouseover / mouseleave handlers
+      // and removes the element from trackedOverlayElements). The previous
+      // direct .remove() on the container left those listeners attached to
+      // the detached DOM subtree, leaking memory across retranslates.
       const pageEl = this.getPageElementByNumber(pageNumber);
-      pageEl?.querySelectorAll('.pdf-text-overlay-container')?.forEach(el => el.remove());
+      if (pageEl) {
+        this.plugin.overlay?.clearOverlayFromPage?.(pageEl);
+      }
 
       // Render from saved data
       this.plugin.overlay.renderSavedOverlay(pageData, pageNumber);
@@ -272,42 +368,59 @@ export class RetranslateUsingOverlaysModal extends Modal {
     }
   }
 
-  // Use overlay helper if present; otherwise use a local query
+  // T4.1: leaf-scoped page lookup through the PdfViewerAdapter. The old
+  // global document.querySelector grabbed the first matching page across ALL
+  // open PDF leaves — in split-view the retranslated overlay was rendered
+  // onto the WRONG file's page.
   private getPageElementByNumber(pageNumber: number): HTMLElement | null {
-    // Prefer plugin.overlay.getPageElementByNumber if available
-    const anyOverlay: any = this.plugin.overlay as any;
-    if (typeof anyOverlay.getPageElementByNumber === 'function') {
-      return anyOverlay.getPageElementByNumber(pageNumber);
-    }
-    const viewer = document.querySelector('.pdfViewer, #viewer');
-    if (!viewer) return null;
-    return viewer.querySelector(`.page[data-page-number="${pageNumber}"]`) as HTMLElement | null;
+    return this.plugin.pdfDom.getPageElement(
+      pageNumber,
+      this.plugin.pdfDom.getActivePdfLeaf(),
+    );
   }
 
   private async confirm(title: string, message: string): Promise<boolean> {
     return new Promise<boolean>((resolve) => {
       const dlg = new Modal(this.app);
+      // P0-7: previously, if the user dismissed the dialog via Esc or by
+      // clicking the backdrop, `dlg.close()` ran, `onClose` emptied the
+      // contentEl, but `resolve()` was NEVER called. The Promise hung
+      // forever, `await this.confirm(...)` in `runRetranslation` never
+      // returned, and the whole retranslate workflow was permanently stuck.
+      // The `resolved` guard ensures we only resolve once even if both a
+      // button click and the onClose fire (race window during close).
+      let resolved = false;
+      const done = (v: boolean) => {
+        if (resolved) return;
+        resolved = true;
+        resolve(v);
+      };
       dlg.contentEl.createEl('h3', { text: title });
       dlg.contentEl.createEl('p', { text: message });
 
       new Setting(dlg.contentEl)
         .addButton((btn) => {
-          btn.setButtonText('Cancel')
+          btn.setButtonText(t('modal.cancel'))
             .onClick(() => {
               dlg.close();
-              resolve(false);
+              done(false);
             });
         })
         .addButton((btn) => {
           btn.setCta();
-          btn.setButtonText('Overwrite')
+          btn.setButtonText(t('modal.translate.overwrite'))
             .onClick(() => {
               dlg.close();
-              resolve(true);
+              done(true);
             });
         });
 
-      dlg.onClose = () => dlg.contentEl.empty();
+      // P0-7: fallback resolve on close — covers Esc, backdrop click, and
+      // any other dismiss path that doesn't go through the buttons.
+      dlg.onClose = () => {
+        dlg.contentEl.empty();
+        done(false);
+      };
       dlg.open();
     });
   }

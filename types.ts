@@ -4,6 +4,12 @@ import {
   DEFAULT_SINGLE_PROMPT, DEFAULT_BATCH_PROMPT, DEFAULT_OCR_TEXT_PROMPT,
 } from './default-prompts';
 
+// Re-export the canonical provider-id union from the registry so that
+// every other module (settings UI, translation engine, OCR engine, main)
+// references a single source of truth.
+import type { ALL_PROVIDER_IDS } from './providers';
+import { buildDefaultProviderSettings } from './providers';
+
 /**
  * Settings for an individual API provider.
  */
@@ -21,8 +27,11 @@ export interface ProviderSettings {
 /**
  * Settings for the OCR‑based layout provider.
  */
+/** Any registered provider id (openrouter, openai, gemini, ollama, anthropic, deepseek, xai, groq, mistral, together, qwen, lmstudio, vllm, custom). */
+export type ApiProviderId = typeof ALL_PROVIDER_IDS[number];
+
 export interface OcrProviderSettings {
-  provider: 'openrouter' | 'ollama' | 'openai' | 'gemini' | 'custom';
+  provider: ApiProviderId;
   apiKey: string;
   model: string;
   apiEndpoint?: string;
@@ -31,21 +40,20 @@ export interface OcrProviderSettings {
   temperature: number;
   maxTokens: number;
   inputMode: 'image' | 'filepath';        // how to send the page to the LLM
-  workflowMode: 'per-page' | 'full-document';
   ocrPromptTemplate: string;             // prompt for a single page
-  ocrFullDocPromptTemplate: string;      // optional, for batch OCR
   responseFormatInstruction: string;     // extra instructions for JSON output
   responseJsonPath: string;              // JMESPath to extract array from response
   imageScale: number;                    // scale factor when capturing screenshot
   imageFormat: 'png' | 'jpeg';
   imageQuality: number;
-  
+
   // NEW: JSON strictness control for small models
   jsonStrictness?: 'strict' | 'lenient' | 'repair-friendly';
 
   // #23: true-OCR text mode (translation-only note; no coordinates).
+  // Phase 2 (C3): 'overlay' mode removed — only 'translation-note' is supported.
   ocrTextPromptTemplate?: string;          // transcription prompt (no JSON/bboxes)
-  ocrOutputMode?: 'overlay' | 'translation-note';
+  ocrOutputMode?: 'translation-note';
   ocrOutputFolder?: string;                // vault folder for recognized notes ('' = next to PDF)
   ocrOutputFilenamePattern?: string;       // e.g. '{pdfname}.translated' → <folder>/<pattern>.md
 }
@@ -55,48 +63,49 @@ export interface OcrProviderSettings {
  */
 export interface OpenRouterTranslatorSettings {
   // --- Provider Management ---
-  apiProvider: 'openrouter' | 'ollama' | 'openai' | 'gemini' | 'custom';
-  providerSettings: {
-    openrouter: ProviderSettings;
-    ollama: ProviderSettings;
-    openai: ProviderSettings;
-    gemini: ProviderSettings;
-    custom: ProviderSettings;
+  apiProvider: ApiProviderId;
+  // Provider settings are now keyed by ApiProviderId, but stored as a
+  // Record so new providers from the registry are picked up automatically
+  // without changing this type. Missing keys are filled in by loadSettings().
+  providerSettings: Partial<Record<ApiProviderId, ProviderSettings>> & {
+    // Pre-existing keys preserved for type-narrowing in legacy code paths.
+    openrouter?: ProviderSettings;
+    ollama?: ProviderSettings;
+    openai?: ProviderSettings;
+    gemini?: ProviderSettings;
+    custom?: ProviderSettings;
   };
-  
+
   // --- Layout Engine Selection ---
   // Overlay engines only. OCR-AI is a separate subsystem (its own commands),
   // not a layout engine. 'ocr-api' is retained only to migrate old configs.
   layoutEngine: 'internal' | 'python' | 'ocr-api';   // 'ocr-api' deprecated
-  
+
   // External Layout / Python settings
   pythonPath: string;
   ocrScriptPath: string;
-  
+
   // --- OCR API Settings ---
   ocrProvider: OcrProviderSettings;
-  
-  // --- PDF Export Settings ---
-  mergeScriptPath: string;
-  exportOutputDirectory: string;
-  exportTextColor: string;
-  exportTextOpacity: number;
-  exportFontSizeScale: number;
-  exportAsAnnotation: boolean;
-  // Legacy/compat keys used by settings UI
-  pdfExportScriptPath?: string;
-  exportBackgroundColor?: string;
-  exportBackgroundOpacity?: number;
-  exportPreserveOriginal?: boolean;
-  exportAutoOpen?: boolean;
-  
+
+  // Stage 0.1 (Q17 cleanup): the following 18 fields were removed because
+  // they were write-only (set by Settings UI / presets but never read by
+  // any production code path):
+  //   mergeScriptPath, exportOutputDirectory, exportTextColor,
+  //   exportTextOpacity, exportFontSizeScale, exportAsAnnotation,
+  //   pdfExportScriptPath, exportBackgroundColor, exportBackgroundOpacity,
+  //   exportPreserveOriginal, exportAutoOpen, mergeOnStyleChange,
+  //   enableSemanticMerging, autoRefreshOverlay,
+  //   useIndividualMarkdownStorage, indexFilePath, manualRefinementMode,
+  //   clickToShowMode.
+  // `loadSettings()` strips them from saved data so old data.json files
+  // don't carry dead weight forward.
+
   // Translation Behavior
   enableTranslation: boolean;
   useBatchTranslation: boolean;
   debugMode: boolean;
 
-  // #7: rejoin sentence fragments split across DOM spans before translating.
-  enableSemanticMerging: boolean;
   // #3: delay (ms) between sequential (non-batch) segment requests.
   sequentialDelayMs: number;
 
@@ -104,34 +113,50 @@ export interface OpenRouterTranslatorSettings {
   // (python) background translation into .translations.md.
   watcherEnabled: boolean;
   watcherFolder: string;        // vault-relative folder to watch (non-recursive)
-  
+
   // Language Settings
   sourceLanguage: string;
   targetLanguage: string;
-  
+
   // Visual Settings
   outputFontSizeScale: number;
   outputLineHeight: number;
-  overlayOpacity: number;
-  
+  overlayOpacity: number;  // 0.0–1.0 float (legacy values 0–100 are migrated on load)
+  /** When true, PDF source line breaks (<br>) are preserved in translations. Default: false. */
+  preserveSourceLineBreaks: boolean;
+
   // Processing Settings
   maxBatchChars: number;
-  mergeOnStyleChange: boolean;
-  
+  /**
+   * Number of pages to translate in parallel during background (watcher)
+   * translation. Extraction stays sequential (pdfjs blocks main thread),
+   * but translation API calls run in parallel.
+   * Default: 3. Set to 1 for strict sequential (rate-limit sensitive APIs).
+   */
+  backgroundTranslationConcurrency: number;
+
   // Storage Settings
   autoSaveOverlay: boolean;
-  autoRefreshOverlay: boolean;
   storageLocation: string;
-  useIndividualMarkdownStorage: boolean;
-  indexFilePath: string;
-  
+
   // UI Settings
-  manualRefinementMode: boolean;
   showOverlayByDefault: boolean;
-  clickToShowMode: boolean;
   bboxEditMode: boolean;
   layoutDebugMode: boolean;
-  
+
+  // Stage 2.4 (NEW): Rule-based paragraph filter. Rules are regex patterns
+  // that prevent matching paragraphs from being sent to the LLM — they
+  // keep their original text in the overlay. Stored in data.json.
+  paragraphFilterRules: import('./paragraph-filter').ParagraphFilterRule[];
+
+  // ─── Settings UI level (Progressive Disclosure) ───
+  // 'quick'     → only Provider + API Key + Model (3 settings)
+  // 'standard'  → + Translation, Visual, Storage, Prompts (~15 settings)
+  // 'advanced'  → all 62 settings (OCR, Watcher, Layout, Export, UI, Debug)
+  settingsLevel: 'quick' | 'standard' | 'advanced';
+  // Phase 5 (N6): `currentPreset` field removed — presets.ts deleted and
+  // renderPresetChips() removed from settings.ts; nothing reads this anymore.
+
   // Custom Prompts
   // "Special template" mode: some models (e.g. Gemma) need the whole request
   // shaped as one template with {TEXT}. When enabled, this template overrides
@@ -140,7 +165,7 @@ export interface OpenRouterTranslatorSettings {
   customTemplate?: string;
   batchPrompt: string;
   singlePrompt: string;
-  
+
   // Custom Copy Formats
   calloutFormat: string;
   citationFormat: string;
@@ -219,11 +244,20 @@ export interface TranslationUnit {
   text: string;
   id: string;
   paragraphId: string;
+  // P0-2: declared optional — populated by `tryGetCachedUnits` in
+  // processing.ts when a TranslationUnit is built from cached
+  // `.translations.md` data (no live DOM spans). When present, the renderer
+  // uses these instead of measuring originalSpans.
   _externalRect?: { l: number; t: number; w: number; h: number };
   _externalFont?: { family: string; size: number; sizes: number[] };
 }
 
 export interface OverlayPositionData {
+  // Phase 11 (C8): optional stable id stamped onto each rendered overlay as
+  // `data-translation-id`. Lets the renderer reconcile stale overlays with
+  // freshly-reloaded saved data without spurious diffs (matches by id
+  // instead of by text/position only).
+  id?: string;
   selector: string;
   textContent: string;
   relativeRect: {
@@ -239,6 +273,16 @@ export interface OverlayPositionData {
     relativeSizes: number[];
     referenceHeight: number;
   };
+  /**
+   * T4.3 (v5): MANUAL style adjustments from the overlay context menu —
+   * persisted ONLY when the user made them (dataset.styleAdjusted), in
+   * dedicated fields so they can never be confused with `fontSize` (the
+   * ORIGINAL dominant size used as a sizing hint by some paths).
+   * adjustedFontSize is scale-free px (÷ viewer scale at save time).
+   */
+  adjustedFontSize?: number;
+  /** T4.3 (v5): manual line-height override (unitless multiplier). */
+  adjustedLineHeight?: number;
   fontSize?: number;
   fontFamily?: string;
   originalFontSizes?: number[];
@@ -266,63 +310,11 @@ export interface SavedOverlay {
   indexLine?: number;
 }
 
-export interface OverlayElementData {
-  data: OverlayPositionData;
-  element: HTMLElement;
-  bbox: DOMRect;
-}
-
-export interface PdfExportSettings {
-  pythonPath: string;
-  pdfExportScriptPath: string;
-  exportBackgroundColor: string;
-  exportBackgroundOpacity: number;
-  exportTextColor: string;
-  exportPreserveOriginal: boolean;
-  exportAutoOpen: boolean;
-}
-
-export interface MergePayload {
-  pdfPath: string;
-  translations: {
-    page: number;
-    items: Array<{
-      text: string;
-      rect: { left: number; top: number; width: number; height: number };
-      fontSize: number;
-      fontFamily?: string;
-    }>;
-  }[];
-  options: {
-    textColor: string;
-    textOpacity: number;
-    fontSizeScale: number;
-    addAsAnnotation: boolean;
-  };
-  outputDirectory?: string;
-}
-
-export interface MergeResult {
-  success: boolean;
-  outputPath: string;
-  pagesProcessed: number;
-  error?: string;
-}
-
-export interface SavedOverlayData {
-  pageOverlays: Record<number, PdfTranslationOverlay[]>;
-  pageDimensions: Record<number, { width: number; height: number }>;
-}
-
-export interface PdfTranslationOverlay {
-  translatedText?: string;
-  originalText?: string;
-  region: { l: number; t: number; w: number; h: number };
-  fontSizes?: number[];
-  fontFamily?: string;
-  color?: string;
-  opacity?: number;
-}
+// Stage 0.1 (Q17): 6 dead type interfaces removed (OverlayElementData,
+// PdfExportSettings, MergePayload, MergeResult, SavedOverlayData,
+// PdfTranslationOverlay). They were declared but never imported by any
+// other module — leftover from the v4→v5 storage refactor that replaced
+// the merge workflow with `pdf_export.py` and `updatePageOverlaysAndWrite`.
 
 // ════════════════════════════════════════════════════════════════
 // SUPPORTED LANGUAGES
@@ -491,9 +483,12 @@ export const DEFAULT_OCR_PROVIDER_SETTINGS: OcrProviderSettings = {
   temperature: 0.1,
   maxTokens: 8192,
   inputMode: 'image',
-  workflowMode: 'per-page',
+  // Phase 5 (N6): `workflowMode` and `ocrFullDocPromptTemplate` removed —
+  // `workflowMode` was never read by any code path (per-page is the only
+  // mode that actually runs), and `ocrFullDocPromptTemplate` had no
+  // consumer after the batch-OCR feature was shelved. loadSettings() in
+  // main.ts strips any leftover values from old data.json files.
   ocrPromptTemplate: DEFAULT_OCR_PROMPT,
-  ocrFullDocPromptTemplate: DEFAULT_OCR_PROMPT,
   ocrTextPromptTemplate: DEFAULT_OCR_TEXT_PROMPT,
   ocrOutputMode: 'translation-note',
   ocrOutputFolder: '',
@@ -513,103 +508,71 @@ export const DEFAULT_OCR_PROVIDER_SETTINGS: OcrProviderSettings = {
 export const DEFAULT_SETTINGS: OpenRouterTranslatorSettings = {
   // --- Provider-Aware Defaults ---
   apiProvider: 'openrouter',
-  providerSettings: {
-    openrouter: {
-      apiKey: '',
-      model: 'google/gemini-flash-1.5',
-      temperature: 0.3,
-      enableReasoning: false,
-    },
-    openai: {
-      apiKey: '',
-      model: 'gpt-4o',
-      temperature: 0.3,
-      enableReasoning: false,
-    },
-    gemini: {
-      apiKey: '',
-      model: 'models/gemini-1.5-flash',
-      temperature: 0.3,
-      enableReasoning: false,
-    },
-    ollama: {
-      apiEndpoint: 'http://localhost:11434',
-      model: 'llama3',
-      temperature: 0.3,
-      enableReasoning: false,
-    },
-    custom: {
-      apiEndpoint: '',
-      apiKey: '',
-      model: '',
-      temperature: 0.3,
-      enableReasoning: false,
-      headers: '{\n  "Content-Type": "application/json",\n  "Authorization": "Bearer {apiKey}"\n}',
-      requestBody: '{\n  "model": "{model}",\n  "messages": [\n    {\n      "role": "system",\n      "content": "{systemPrompt}"\n    },\n    {\n      "role": "user",\n      "content": "{userPrompt}"\n    }\n  ],\n  "temperature": {temperature}\n}',
-      responsePath: 'choices[0].message.content',
-    },
-  },
-  
+  // Generated from the registry — every registered provider gets a
+  // starter ProviderSettings with sensible defaults.
+  providerSettings: buildDefaultProviderSettings() as OpenRouterTranslatorSettings['providerSettings'],
+
   // --- Layout Engine (replaces useExternalLayout) ---
   layoutEngine: 'internal',
-  
+
   // External Layout / Python settings
   pythonPath: 'python',
   ocrScriptPath: '',
-  
+
   // --- OCR Provider ---
   ocrProvider: { ...DEFAULT_OCR_PROVIDER_SETTINGS },
-  
-  // --- PDF Export Settings ---
-  mergeScriptPath: '',
-  exportOutputDirectory: '',
-  exportTextColor: '#000000',
-  exportTextOpacity: 1.0,
-  exportFontSizeScale: 0.95,
-  exportAsAnnotation: true,
-  // Legacy/compat defaults
-  pdfExportScriptPath: '',
-  exportBackgroundColor: '#FFFFFF',
-  exportBackgroundOpacity: 90,
-  exportPreserveOriginal: true,
-  exportAutoOpen: true,
-  
+
+  // Stage 0.1 (Q17): 18 dead settings fields removed from DEFAULT_SETTINGS.
+  // See interface above for the full list of removed fields.
+
   // Translation Behavior
   enableTranslation: true,
   useBatchTranslation: true,
   debugMode: false,
-  enableSemanticMerging: true,
   sequentialDelayMs: 150,
   watcherEnabled: false,
   watcherFolder: '',
-  
+
   // Language Settings
   sourceLanguage: 'auto',
   targetLanguage: 'en',
-  
+
   // Visual Settings
   outputFontSizeScale: 0.95,
   outputLineHeight: 1.45,
-  overlayOpacity: 99,
-  
+  overlayOpacity: 0.95,
+  // Phase 7: when true, replicate PDF source line breaks (<br>) in the
+  // translation. Default false — translation should flow naturally and
+  // wrap only at bbox width. Mirrors old behavior for users who want it.
+  preserveSourceLineBreaks: false,
+
   // Processing Settings
   maxBatchChars: 4000,
-  mergeOnStyleChange: false,
-  
+  backgroundTranslationConcurrency: 3,
+
   // Storage Settings
-  autoSaveOverlay: false,
-  autoRefreshOverlay: true,
+  autoSaveOverlay: true,
   storageLocation: '',
-  useIndividualMarkdownStorage: true,
-  indexFilePath: 'Index.md',
-  
+
   // UI Settings
-  manualRefinementMode: false,
   showOverlayByDefault: true,
-  clickToShowMode: false,
   bboxEditMode: false,
   layoutDebugMode: false,
-  
+
+  // Stage 2.4 (NEW): default paragraph filter rules — 2 enabled presets.
+  paragraphFilterRules: [
+    // VERIFICATION FIX: whole-text anchored patterns (no 'm' flag in
+    // compileRules) + Unicode-aware single-letter rule. See paragraph-filter.ts.
+    { id: 'preset-page-numbers', name: 'Page numbers', pattern: '^\\d{1,4}$', enabled: true },
+    { id: 'preset-single-letter', name: 'Single letter', pattern: '^\\p{L}$', enabled: true },
+  ],
+
+  // Progressive Disclosure: default to 'standard' so new users see the
+  // essential settings without being overwhelmed, but can drop to 'quick'
+  // for a 3-field setup or expand to 'advanced' for everything.
+  settingsLevel: 'standard',
+  // Phase 5: `currentPreset` default removed (field is gone from interface).
+
   // Custom Prompts
   useGemmaPrompt: false,
   customTemplate: DEFAULT_CUSTOM_TEMPLATE,
@@ -619,7 +582,7 @@ export const DEFAULT_SETTINGS: OpenRouterTranslatorSettings = {
   batchPrompt: DEFAULT_BATCH_PROMPT,
 
   singlePrompt: DEFAULT_SINGLE_PROMPT,
-  
+
   // Custom Copy Formats
   calloutFormat: '> [!quote] Translation\n> {blockquote_text}\n>\n> {pagelink}',
   citationFormat: '{blockquote_text}\n> — {filename}, page {pagenumber}',

@@ -1,6 +1,7 @@
 import { Menu, Notice, TFile, TFolder, normalizePath } from 'obsidian';
 import type OpenRouterTranslatorPlugin from './main';
 import type { LayoutResult } from './layout-detector';
+import { uuid } from './overlay-id';
 
 interface DebugRectAbsolute {
     left: number;
@@ -222,7 +223,7 @@ export class LayoutParserDebugModule {
         );
 
         const manual: ManualBoxRecord = {
-            id: `manual-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+            id: `manual-${uuid()}`,
             createdAt: new Date().toISOString(),
             source: 'manual-context-draw',
             pageNumber,
@@ -617,7 +618,7 @@ export class LayoutParserDebugModule {
         });
 
         return {
-            id: `det-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+            id: `det-${uuid()}`,
             createdAt: new Date().toISOString(),
             source,
             pageNumber,

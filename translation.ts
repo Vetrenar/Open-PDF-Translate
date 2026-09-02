@@ -1,11 +1,18 @@
 // translation.ts
 import { requestUrl, Notice, RequestUrlParam } from 'obsidian';
 import OpenRouterTranslatorPlugin from './main';
-import { AVAILABLE_LANGUAGES, GEMMA_TEMPLATE as NEUTRAL_TEMPLATE } from './types';
+import { AVAILABLE_LANGUAGES, GEMMA_TEMPLATE } from './types';
+import {
+    buildRequest,
+    extractResponseContent,
+    getProvider,
+    getMaxOutputTokens,
+} from './providers';
+// T2.4: shared timeout helper (was duplicated in ocr-layout.ts).
+import { withTimeout } from './shared';
 
 // Neutral, domain-agnostic fallback template (used only if the editable
 // custom template is empty). Single source of truth lives in types.ts.
-export const GEMMA_TEMPLATE = NEUTRAL_TEMPLATE;
 
 export class TranslationEngine {
     private plugin: OpenRouterTranslatorPlugin;
@@ -38,23 +45,64 @@ export class TranslationEngine {
     // === Template Processing ===
 
     /**
-     * Replaces placeholders in the prompt template.
-     * Supports both standard Plugin variables and Custom/Gemma variables.
+     * Stage 1.1 (Q3): Replaces placeholders in the prompt template.
+     *
+     * Unified variable naming: all variables support `{UPPER_CASE}` form
+     * (preferred, visually distinct from markdown syntax). Lowercase forms
+     * (`{sourceLang}`, `{targetLang}`, `{lineCount}`, `{inputText}`) are
+     * preserved as backward-compat aliases — old custom templates continue
+     * to work without modification.
+     *
+     * Full variable reference:
+     *   {SOURCE_LANG}   / {sourceLang}   — source language display name (e.g. "English")
+     *   {TARGET_LANG}   / {targetLang}   — target language display name (e.g. "Russian")
+     *   {SOURCE_CODE}                    — source language ISO code (e.g. "en")
+     *   {TARGET_CODE}                    — target language ISO code (e.g. "ru")
+     *   {LINE_COUNT}   / {lineCount}     — number of segments in batch mode
+     *   {TEXT}         / {inputText}     — the text to translate
+     *
+     * Note: {SOURCE_CODE} / {TARGET_CODE} exist only in UPPERCASE form
+     * (no lowercase alias) — they were added after the lowercase forms
+     * were established and weren't backported. Keeping it that way to
+     * avoid introducing new aliases that could collide with user text.
      */
     private applyTemplateVariables(template: string, textContent: string, lineCount: number = 0): string {
+        const sourceLangName = this.getSourceLangName();
+        const targetLangName = this.getTargetLangName();
+        const sourceLangCode = this.getSourceLangCode();
+        const targetLangCode = this.getTargetLangCode();
+        const lineCountStr = lineCount.toString();
+
+        // Phase 6 (P0-12): use FUNCTION-FORM replacements (`() => value`)
+        // instead of plain string values. `String.prototype.replace`
+        // interprets `$&`, `$1`-`$9`, `$10`+, `$$`, `$\``, `$'` in the
+        // replacement string as capture-group references. If any of the
+        // substituted values contains a literal `$` followed by a digit
+        // (e.g. user text like "Cost: $5 $10", LaTeX "$x^2$", regex
+        // "/\d+/", or even a translated string that itself contains `$`),
+        // those sequences get silently mangled — `$$` collapses to `$`,
+        // `$5` becomes the 5th capture group (empty for our placeholder
+        // regex), `$&` becomes the matched placeholder, etc. Function-form
+        // replacements bypass this special-casing entirely: the return
+        // value is inserted verbatim. See providers.ts:870-879 for the
+        // same fix applied to custom-template `{apiKey}`/`{model}`/etc.
         return template
-            // Standard Plugin Variables
-            .replace(/{sourceLang}/g, this.getSourceLangName())
-            .replace(/{targetLang}/g, this.getTargetLangName())
-            .replace(/{lineCount}/g, lineCount.toString())
-            .replace(/{inputText}/g, textContent)
-            
-            // Custom / Gemma Variables (UPPERCASE)
-            .replace(/{SOURCE_LANG}/g, this.getSourceLangName())
-            .replace(/{TARGET_LANG}/g, this.getTargetLangName())
-            .replace(/{SOURCE_CODE}/g, this.getSourceLangCode())
-            .replace(/{TARGET_CODE}/g, this.getTargetLangCode())
-            .replace(/{TEXT}/g, textContent);
+            // ── Preferred {UPPER_CASE} form ─────────────────────────────
+            .replace(/{SOURCE_LANG}/g, () => sourceLangName)
+            .replace(/{TARGET_LANG}/g, () => targetLangName)
+            .replace(/{SOURCE_CODE}/g, () => sourceLangCode)
+            .replace(/{TARGET_CODE}/g, () => targetLangCode)
+            .replace(/{LINE_COUNT}/g, () => lineCountStr)
+            .replace(/{TEXT}/g, () => textContent)
+
+            // ── Lowercase aliases (backward compat) ─────────────────────
+            // Stage 1.1 (Q3): old custom templates may use {sourceLang} /
+            // {targetLang} / {lineCount} / {inputText}. Preserve them so
+            // user-edited templates don't silently break.
+            .replace(/{sourceLang}/g, () => sourceLangName)
+            .replace(/{targetLang}/g, () => targetLangName)
+            .replace(/{lineCount}/g, () => lineCountStr)
+            .replace(/{inputText}/g, () => textContent);
     }
 
     // === High-Level Translation Methods ===
@@ -79,17 +127,21 @@ export class TranslationEngine {
 
         if (useGemma) {
             // 1. Remove {TEXT} from the base template because we need to format the input specifically for batching
-            const baseTemplate = this.activeTemplate().replace('{TEXT}', '').trim();
+            // P2-33: replaceAll — user templates may contain multiple {TEXT} placeholders.
+            const baseTemplate = this.activeTemplate().replaceAll('{TEXT}', '').trim();
             
             // 2. Add strict instructions for Numbered Lines so processing.ts can parse it
+            // FIX C3: use [#N] format (matching Standard branch) so extractNumberedLinesRobust
+            // can parse with strict regex. Previous "1. 2." format caused 100% fallback to
+            // originals when strict regex was introduced.
             const batchInstruction = `
             
 COMMAND: Translate the following numbered lines from {SOURCE_LANG} to {TARGET_LANG}.
 Return exactly {lineCount} lines in this format:
-1. Translated text
-2. Translated text
+[#1] Translated text
+[#2] Translated text
 ...
-Do NOT translate the numbers. Maintain the list structure. No extra commentary.
+Do NOT translate the [#N] markers. Maintain the list structure. No extra commentary.
 
 {TEXT}`;
             
@@ -97,8 +149,15 @@ Do NOT translate the numbers. Maintain the list structure. No extra commentary.
         } else {
             // Standard Mode
             let template = this.plugin.settings.batchPrompt;
-            // Ensure input text is placed if the user used {inputText}
-            if (template.includes('{inputText}')) {
+            // Ensure input text is placed if the user used {inputText} or {TEXT}.
+            // P2-34: previously only {inputText} was checked, so users who used
+            // the {TEXT} alias silently fell through to the append fallback —
+            // which substituted {TEXT} with '' (losing the user's intent for
+            // where the text should appear inside the template) AND appended
+            // the text at the end. Both placeholders are documented aliases
+            // for the same purpose (see applyTemplateVariables docstring), so
+            // both should trigger the substitution path.
+            if (template.includes('{inputText}') || template.includes('{TEXT}')) {
                  finalSystemPrompt = this.applyTemplateVariables(template, originalText, expectedLineCount);
             } else {
                  // Fallback if user messed up the prompt
@@ -106,7 +165,13 @@ Do NOT translate the numbers. Maintain the list structure. No extra commentary.
             }
         }
 
-        return await this.makeApiCall(finalSystemPrompt, originalText, true);
+        // P2-35: textBakedIn is explicit — in every branch above, originalText
+        // ends up inside finalSystemPrompt (via {TEXT}/{inputText} substitution
+        // or via the fallback append). The previous substring heuristic
+        // (`systemPrompt.includes(originalText.substring(0, 50))`) was
+        // unreliable for short text and false-positive-prone when the same
+        // prefix appeared inside a templated example.
+        return await this.makeApiCall(finalSystemPrompt, originalText, true, true);
     }
 
     /**
@@ -122,219 +187,82 @@ Do NOT translate the numbers. Maintain the list structure. No extra commentary.
         } else {
             // Standard Mode
             let template = this.plugin.settings.singlePrompt;
-            if (template.includes('{inputText}')) {
+            // T1.9: accept BOTH documented placeholders — `{inputText}` and
+            // its `{TEXT}` alias — mirroring the batch branch (P2-34). A
+            // user template containing `{TEXT}` used to silently fall into
+            // the fallback concatenation, losing the user's chosen position
+            // of the text inside the prompt.
+            if (template.includes('{inputText}') || template.includes('{TEXT}')) {
                 finalSystemPrompt = this.applyTemplateVariables(template, text);
             } else {
                 finalSystemPrompt = this.applyTemplateVariables(template, '') + `\n\n${text}`;
             }
         }
 
-        return await this.makeApiCall(finalSystemPrompt, text, false);
+        // P2-35: textBakedIn is explicit (see translateBatch for rationale).
+        return await this.makeApiCall(finalSystemPrompt, text, false, true);
     }
 
     // === Low-Level API Communication ===
 
-    private getPropertyByPath(obj: any, path: string): string | undefined {
-        const keys = path.replace(/\[(\w+)\]/g, '.$1').replace(/^\./, '').split('.');
-        let result = obj;
-        for (const key of keys) {
-            if (result === null || result === undefined) return undefined;
-            result = result[key];
-        }
-        return result;
-    }
-    
-    private escapeJsonString(str: string): string {
-        return str.replace(/\\/g, '\\\\')
-                  .replace(/"/g, '\\"')
-                  .replace(/\n/g, '\\n')
-                  .replace(/\r/g, '\\r')
-                  .replace(/\t/g, '\\t');
-    }
-
-    /**
-     * Check if a model supports reasoning/thinking mode
-     */
-    private supportsReasoning(modelId?: string): boolean {
-        if (!modelId) return false;
-        
-        const reasoningModels = [
-            'o1',                    // OpenAI O1 series
-            'o3',                    // OpenAI O3 series  
-            'deepseek-r1',           // DeepSeek R1 reasoner
-            'deepseek-reasoner',     // DeepSeek reasoner variants
-            'qwen-qwq',              // Qwen with reasoning
-            'qwq',                   // Qwen QwQ
-            'thinking',              // Gemini thinking models
-            'gemini-2.0-flash-thinking'
-        ];
-        
-        return reasoningModels.some(pattern => 
-            modelId.toLowerCase().includes(pattern)
-        );
-    }
-
     /**
      * Constructs the request URL, headers, and body.
+     * Delegates to providers.ts buildRequest() — single source of truth.
      * @param fullPrompt The fully constructed system prompt (which might contain the text already).
      * @param originalText The raw text (used for User role if not baked into System).
      * @param isBakedIn If true, the text is already inside fullPrompt, so User content should be minimal.
      */
     private getRequestConfig(fullPrompt: string, originalText: string, isBakedIn: boolean, maxTokens: number): { url: string; options: RequestUrlParam } {
         const providerId = this.plugin.settings.apiProvider;
-        const provider = this.plugin.settings.providerSettings[providerId];
-        
-        let url: string;
-        let body: any;
-        let headers: Record<string, string> = { 'Content-Type': 'application/json' };
+        const provider = this.plugin.settings.providerSettings[providerId] || {};
+        const def = getProvider(providerId);
+        if (!def) throw new Error(`Unknown provider: ${providerId}`);
 
-        // Determine Content Distribution
-        // If using Gemma Template, text is in System. User prompt should be empty-ish to avoid double tokens.
-        // If using Standard, text is usually in User prompt (unless user edited Standard to use {inputText}).
+        // Auth/key validation up front (registry doesn't know which providers REQUIRE a key).
+        if (def.auth.kind !== 'none' && !provider.apiKey) {
+            throw new Error(`${def.label} API key is missing.`);
+        }
+        if (def.protocol === 'ollama' && !provider.apiEndpoint && !def.defaultEndpoint) {
+            throw new Error('Ollama endpoint is missing.');
+        }
+        if (def.protocol === 'custom' && !provider.apiEndpoint) {
+            throw new Error('Custom API endpoint is missing.');
+        }
+
+        // Determine content distribution
         const useGemma = (this.plugin.settings as any).useGemmaPrompt;
-        
-        // Logic: If the prompt template ALREADY replaced {TEXT} or {inputText}, we don't want to send it again.
         const systemContent = fullPrompt;
         const userContent = isBakedIn ? 'Translate.' : originalText;
 
-        switch (providerId) {
-            case 'openrouter':
-                if (!provider.apiKey) throw new Error('OpenRouter API key is missing.');
-                url = 'https://openrouter.ai/api/v1/chat/completions';
-                headers['Authorization'] = `Bearer ${provider.apiKey}`;
-                headers['HTTP-Referer'] = 'https://obsidian.md';
-                headers['X-Title'] = 'Obsidian PDF Translator';
-                
-                body = {
-                    model: provider.model,
-                    messages: [
-                        { role: 'system', content: systemContent },
-                        { role: 'user', content: userContent }
-                    ],
-                    temperature: provider.temperature ?? 0.3,
-                    max_tokens: maxTokens
-                };
-                
-                // Add reasoning effort for compatible models
-                if (provider.enableReasoning && this.supportsReasoning(provider.model)) {
-                    body.reasoning = { effort: 'high' };
-                }
-                break;
-
-            case 'openai':
-                if (!provider.apiKey) throw new Error('OpenAI API key is missing.');
-                url = 'https://api.openai.com/v1/chat/completions';
-                headers['Authorization'] = `Bearer ${provider.apiKey}`;
-                
-                body = {
-                    model: provider.model,
-                    messages: [
-                        { role: 'system', content: systemContent },
-                        { role: 'user', content: userContent }
-                    ]
-                };
-                
-                // O1/O3 models handle temperature and reasoning differently
-                if (provider.model?.includes('o1') || provider.model?.includes('o3')) {
-                    // These models don't support temperature; tokens use max_completion_tokens
-                    body.max_completion_tokens = maxTokens;
-                    if (provider.enableReasoning) {
-                        body.reasoning_effort = 'high'; // Options: 'low', 'medium', 'high'
-                    }
-                } else {
-                    // Standard models use temperature
-                    body.temperature = provider.temperature ?? 0.3;
-                    body.max_tokens = maxTokens;
-                }
-                break;
-
-            case 'gemini':
-                if (!provider.apiKey) throw new Error('Gemini API key is missing.');
-                const geminiModel = provider.model?.replace('models/', '') || 'gemini-1.5-flash';
-                url = `https://generativelanguage.googleapis.com/v1beta/models/${geminiModel}:generateContent?key=${provider.apiKey}`;
-                
-                body = {
-                    contents: [{
-                        parts: [
-                            { text: systemContent + '\n\n' + userContent }
-                        ]
-                    }],
-                    generationConfig: {
-                        temperature: provider.temperature ?? 0.3,
-                        maxOutputTokens: maxTokens
-                    }
-                };
-                
-                // Enable thinking mode for Gemini 2.0 Flash Thinking
-                if (provider.enableReasoning && geminiModel.toLowerCase().includes('thinking')) {
-                    body.generationConfig.thinkingMode = 'THINKING_MODE_ENABLED';
-                }
-                break;
-
-            case 'ollama':
-                if (!provider.apiEndpoint) throw new Error('Ollama endpoint is missing.');
-                const endpoint = provider.apiEndpoint.endsWith('/') ? provider.apiEndpoint.slice(0, -1) : provider.apiEndpoint;
-                url = `${endpoint}/api/chat`;
-                body = {
-                    model: provider.model,
-                    stream: false,
-                    messages: [
-                        { role: 'system', content: systemContent },
-                        { role: 'user', content: userContent }
-                    ],
-                    options: {
-                        temperature: provider.temperature ?? 0.3,
-                        num_predict: maxTokens
-                    }
-                };
-                break;
-
-            case 'custom':
-                if (!provider.apiEndpoint) throw new Error('Custom API endpoint is missing.');
-                url = provider.apiEndpoint;
-                
-                if (provider.headers) {
-                    const populatedHeaders = provider.headers.replace(/{apiKey}/g, provider.apiKey || '');
-                    try { headers = { ...headers, ...JSON.parse(populatedHeaders) }; } 
-                    catch (e) { throw new Error('Failed to parse custom headers JSON.'); }
-                }
-
-                if (provider.requestBody) {
-                    const populatedBody = provider.requestBody
-                        .replace(/{model}/g, provider.model || '')
-                        .replace(/{systemPrompt}/g, this.escapeJsonString(systemContent))
-                        .replace(/{userPrompt}/g, this.escapeJsonString(userContent))
-                        .replace(/{temperature}/g, (provider.temperature ?? 0.3).toString())
-                        .replace(/{maxTokens}/g, String(maxTokens));
-                    try { body = JSON.parse(populatedBody); } 
-                    catch (e) { throw new Error('Failed to parse custom request body JSON.'); }
-                } else {
-                     throw new Error('Custom request body setting is missing.');
-                }
-                break;
-
-            default:
-                throw new Error(`Unsupported API provider: ${providerId}`);
-        }
+        const built = buildRequest({
+            providerId,
+            ps: provider,
+            systemPrompt: systemContent,
+            userPrompt: userContent,
+            image: null,
+            maxTokens,
+        });
 
         return {
-            url,
+            url: built.url,
             options: {
-                url,
+                url: built.url,
                 method: 'POST',
-                headers,
-                body: JSON.stringify(body),
+                headers: built.headers,
+                body: JSON.stringify(built.body),
                 throw: false,
-            }
+            } as RequestUrlParam,
         };
     }
 
-    async makeApiCall(systemPrompt: string, originalText: string, isBatch: boolean): Promise<string> {
+    async makeApiCall(systemPrompt: string, originalText: string, isBatch: boolean, textBakedIn: boolean): Promise<string> {
         const providerId = this.plugin.settings.apiProvider;
-        const providerSettings = this.plugin.settings.providerSettings[providerId];
+        const providerSettings = this.plugin.settings.providerSettings[providerId] || {};
+        const def = getProvider(providerId);
 
-        if (providerId === 'openrouter' && providerSettings.model?.includes('qwen') && !this.warnedAboutQwen) {
-            new Notice('Warning: Some Qwen models have low rate limits.', 6000);
+        // Provider-aware Qwen rate-limit warning (OpenRouter + DashScope).
+        if (def && /qwen|qwq/i.test(providerSettings.model || '') && providerId === 'openrouter' && !this.warnedAboutQwen) {
+            new Notice('Warning: Some Qwen models have low rate limits on OpenRouter.', 6000);
             this.warnedAboutQwen = true;
         }
 
@@ -343,17 +271,15 @@ Do NOT translate the numbers. Maintain the list structure. No extra commentary.
 
         for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
             try {
-                // Determine if the text was already baked into the system prompt
-                const useGemma = (this.plugin.settings as any).useGemmaPrompt;
-                const textBakedIn = useGemma || systemPrompt.includes(originalText.substring(0, 50));
-
-                const { url, options } = this.getRequestConfig(systemPrompt, originalText, textBakedIn, this.computeMaxTokens(systemPrompt, originalText));
+                const { url, options } = this.getRequestConfig(systemPrompt, originalText, textBakedIn, this.computeMaxTokens());
 
                 // requestUrl ignores AbortSignal, so we race it against a real timeout instead.
-                const timeoutMs = providerId === 'gemini' ? 60000 : (providerId === 'ollama' ? 120000 : 45000);
-                delete (options as any).signal;
+                // Local servers (ollama) tend to be slower; cloud providers default to 45s.
+                const isLocal = def?.category === 'local';
+                const isGemini = def?.protocol === 'gemini';
+                const timeoutMs = isGemini ? 60000 : (isLocal ? 120000 : 45000);
 
-                const response = await this.withTimeout(requestUrl(options), timeoutMs);
+                const response = await withTimeout(requestUrl(options), timeoutMs);
 
                 // DIAGNOSTIC: Log the full response if debug mode is enabled
                 if (this.plugin.settings.debugMode) {
@@ -364,20 +290,76 @@ Do NOT translate the numbers. Maintain the list structure. No extra commentary.
                 }
 
                 if (response.status === 200) {
-                    let responsePath = 'choices[0].message.content';
-                    if (providerId === 'ollama') responsePath = 'message.content';
-                    else if (providerId === 'gemini') responsePath = 'candidates[0].content.parts[0].text';
-                    else if (providerId === 'custom') responsePath = providerSettings.responsePath || responsePath;
+                    // Use registry to extract content (provider-aware path).
+                    const customPath = def?.protocol === 'custom' ? providerSettings.responsePath : undefined;
+                    const translatedText = extractResponseContent(providerId, response.json, customPath);
 
-                    const translatedText = this.getPropertyByPath(response.json, responsePath);
-                    
-                    if (!translatedText) {
-                        console.log("Full Response:", response.json);
-                        console.log("Expected Path:", responsePath);
+                    // FIX: detect truncated responses. Reasoning models often hit
+                    // max_tokens mid-translation — the response is technically valid
+                    // (200 OK) but incomplete. Log a warning so the user can diagnose
+                    // (reduce maxBatchChars or increase maxTokens).
+                    // P2-32: per-provider truncation signals. OpenAI/OpenRouter/Mistral/
+                    // DashScope use choices[0].finish_reason='length'. Gemini uses
+                    // candidates[0].finishReason='MAX_TOKENS'. Anthropic uses
+                    // stop_reason='max_tokens'. Ollama uses done_reason='length'.
+                    const finishReason = response.json?.choices?.[0]?.finish_reason;
+                    if (finishReason === 'length' || finishReason === 'MAX_TOKENS') {
+                        const reasoningTokens = response.json?.usage?.completion_tokens_details?.reasoning_tokens ?? 0;
+                        const completionTokens = response.json?.usage?.completion_tokens ?? 0;
+                        console.warn(
+                            `[makeApiCall] Response truncated (finish_reason: ${finishReason}). ` +
+                            `Model used ${reasoningTokens} reasoning tokens out of ${completionTokens} completion tokens. ` +
+                            `Translation may be incomplete. Consider: ` +
+                            `(1) reduce maxBatchChars, (2) disable reasoning for this model, ` +
+                            `(3) use a non-reasoning model. ` +
+                            `Content preview: ${(translatedText || '').substring(0, 100)}...`
+                        );
+                    }
+                    const geminiFinishReason = response.json?.candidates?.[0]?.finishReason;
+                    if (geminiFinishReason === 'MAX_TOKENS') {
+                        console.warn(
+                            `[makeApiCall] Response truncated (Gemini finishReason: MAX_TOKENS). ` +
+                            `Translation may be incomplete. Consider: ` +
+                            `(1) reduce maxBatchChars, (2) increase provider maxOutputTokens, ` +
+                            `(3) use a model with a larger output budget. ` +
+                            `Content preview: ${(translatedText || '').substring(0, 100)}...`
+                        );
+                    }
+                    const anthropicStopReason = response.json?.stop_reason;
+                    if (anthropicStopReason === 'max_tokens') {
+                        console.warn(
+                            `[makeApiCall] Response truncated (Anthropic stop_reason: max_tokens). ` +
+                            `Translation may be incomplete. Consider: ` +
+                            `(1) reduce maxBatchChars, (2) increase provider maxOutputTokens, ` +
+                            `(3) if thinking is enabled, lower thinking.budget_tokens to leave more room for output. ` +
+                            `Content preview: ${(translatedText || '').substring(0, 100)}...`
+                        );
+                    }
+                    const ollamaDoneReason = response.json?.done_reason;
+                    if (ollamaDoneReason === 'length') {
+                        console.warn(
+                            `[makeApiCall] Response truncated (Ollama done_reason: length). ` +
+                            `Translation may be incomplete. Consider: ` +
+                            `(1) reduce maxBatchChars, (2) increase num_predict in Ollama options, ` +
+                            `(3) use a model with a larger context window. ` +
+                            `Content preview: ${(translatedText || '').substring(0, 100)}...`
+                        );
+                    }
+
+                    // FIX: distinguish null (path not found / malformed response) from
+                    // empty string (legitimate empty translation). extractResponseContent
+                    // returns null when the response shape doesn't match; it returns ''
+                    // when the path exists but the content is empty. Only null should
+                    // trigger "Empty response" error — empty string is valid (e.g., LLM
+                    // returned nothing for a trivial input).
+                    if (translatedText === null) {
+                        console.warn("Empty response from API or invalid response path.", response.json);
+                        console.warn("Provider:", providerId, "Protocol:", def?.protocol);
                         throw new Error('Empty response from API or invalid response path.');
                     }
 
-                    return translatedText.trim();
+                    // Empty string is valid — return as-is (trim may make it empty)
+                    return (translatedText || '').trim();
                 }
 
                 // Error Handling
@@ -396,7 +378,33 @@ Do NOT translate the numbers. Maintain the list structure. No extra commentary.
                     if (attempt === MAX_RETRIES) {
                         throw new Error(`Rate limit exceeded after ${MAX_RETRIES} attempts. Please wait and try again.`);
                     }
-                    const delay = BASE_DELAY * Math.pow(2, attempt - 1) + Math.random() * 500;
+                    // Phase 13.5: honor `Retry-After` header when present.
+                    // Tries to parse the header as seconds first (the common
+                    // form), then falls back to an HTTP-date, and finally to
+                    // the previous exponential backoff. The final delay is
+                    // capped at 5 min (P2-31: was 30s, raised to 5 min so
+                    // background translation can honor longer provider-side
+                    // rate-limit windows — e.g. OpenRouter returns 300s for
+                    // daily quota resets, Anthropic returns 60s for spike
+                    // backoff). Interactive translation runs through the same
+                    // path; the Obsidian Notice on each retry keeps the user
+                    // informed so a 5 min wait is acceptable.
+                    const retryAfter = (response as any)?.headers?.['retry-after'];
+                    let delay: number;
+                    if (retryAfter) {
+                        const seconds = parseInt(retryAfter, 10);
+                        if (!isNaN(seconds)) {
+                            delay = Math.max(seconds * 1000, BASE_DELAY);
+                        } else {
+                            const date = new Date(retryAfter);
+                            delay = !isNaN(date.getTime())
+                                ? Math.max(date.getTime() - Date.now(), BASE_DELAY)
+                                : BASE_DELAY * Math.pow(2, attempt - 1);
+                        }
+                    } else {
+                        delay = BASE_DELAY * Math.pow(2, attempt - 1) + Math.random() * 500;
+                    }
+                    delay = Math.min(delay, 300000); // Cap at 5 min (P2-31)
                     console.log(`Rate limit hit. Retrying in ${delay}ms...`);
                     await this.sleep(delay);
                     continue;
@@ -404,26 +412,49 @@ Do NOT translate the numbers. Maintain the list structure. No extra commentary.
                 
                 // Provider-specific error messages
                 let userFriendlyError = `API Error - HTTP ${response.status}`;
+                // P1-1: mark 4xx (except 429 Too Many Requests) as
+                // non-retryable. Retrying 400/401/403/404 is wasteful —
+                // the API key, model name, or request shape won't change
+                // between attempts, so the user just waits through 3 retries
+                // (~7 seconds of exponential backoff) before seeing the
+                // failure. Only 429 (rate limit), 408 (Request Timeout),
+                // and 5xx (provider error) deserve a retry.
+                let nonRetryable = false;
                 if (response.status === 400) {
                     userFriendlyError += ': Bad request - check your model selection and API key';
+                    nonRetryable = true;
                 } else if (response.status === 401) {
                     userFriendlyError += ': Invalid API key';
+                    nonRetryable = true;
                 } else if (response.status === 403) {
                     userFriendlyError += ': Access forbidden - check your API permissions';
+                    nonRetryable = true;
                 } else if (response.status === 404) {
                     userFriendlyError += ': Model not found - check your model name';
+                    nonRetryable = true;
                 } else if (response.status === 500 || response.status === 502 || response.status === 503) {
                     userFriendlyError += ': Provider service error - try again later';
                 } else {
                     userFriendlyError += `: ${errorMsg}`;
                 }
-                
-                throw new Error(userFriendlyError);
+
+                const err = new Error(userFriendlyError) as Error & { nonRetryable?: boolean };
+                err.nonRetryable = nonRetryable;
+                throw err;
 
             } catch (err: any) {
+                // P1-1: 4xx (except 429) — fail fast, no retry.
+                if (err?.nonRetryable) {
+                    new Notice(`⚠ ${err.message}`, 5000);
+                    throw err;
+                }
                 if (err.name === 'AbortError' || err.name === 'TimeoutError') {
                     if (attempt < MAX_RETRIES) {
                         new Notice(`Request timed out. Retrying (${attempt}/${MAX_RETRIES})...`);
+                        // P1-1 (also flagged as T-7 in audit): add a short
+                        // delay before retrying after a timeout, otherwise
+                        // we hammer an already-slow server.
+                        await this.sleep(BASE_DELAY);
                         continue;
                     }
                     throw new Error('Request timed out. The model may be slow or overloaded.');
@@ -434,8 +465,10 @@ Do NOT translate the numbers. Maintain the list structure. No extra commentary.
                     throw err;
                 }
                 
-                // For network errors, retry with exponential backoff
-                const delay = BASE_DELAY * Math.pow(2, attempt - 1);
+                // For network errors, retry with exponential backoff + jitter
+                // FIX H6: add jitter (0-500ms) to prevent retry storms when multiple
+                // requests fail simultaneously (e.g., network blip affecting 10 pages).
+                const delay = BASE_DELAY * Math.pow(2, attempt - 1) + Math.random() * 500;
                 console.log(`Attempt ${attempt} failed, retrying in ${delay}ms...`, err);
                 await this.sleep(delay);
             }
@@ -449,28 +482,15 @@ Do NOT translate the numbers. Maintain the list structure. No extra commentary.
     }
 
     /**
-     * Budget output tokens from input size. Translations are usually similar in
-     * length to the source; ~1 token ≈ 3 chars, +50% headroom for languages that
-     * expand and for the [#N] tags, clamped to the provider/top-level cap.
+     * FIX: Simplified character-based maxTokens computation.
+     *
+     * T6.1: signature reduced to the only caller-relevant input (the provider
+     * id) — the old (systemPrompt, originalText, isBatch, textBakedIn)
+     * parameters were all ignored.
      */
-    private computeMaxTokens(systemPrompt: string, originalText: string): number {
-        const approxInputTokens = Math.ceil((systemPrompt.length + originalText.length) / 3);
-        // Reuse the only existing token ceiling in settings (OCR provider's maxTokens).
-        const cap = this.plugin.settings.ocrProvider?.maxTokens || 8192;
-        return Math.min(cap, Math.max(512, Math.ceil(approxInputTokens * 1.5)));
+    private computeMaxTokens(): number {
+        const cap = getMaxOutputTokens(this.plugin.settings.apiProvider);
+        return Math.max(1024, cap);
     }
 
-    /** Reject after `ms` if the wrapped promise hasn't settled (requestUrl can't be aborted). */
-    private withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
-        return new Promise<T>((resolve, reject) => {
-            const id = setTimeout(
-                () => reject(Object.assign(new Error('Request timed out'), { name: 'TimeoutError' })),
-                ms,
-            );
-            p.then(
-                (v) => { clearTimeout(id); resolve(v); },
-                (e) => { clearTimeout(id); reject(e); },
-            );
-        });
-    }
 }

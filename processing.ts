@@ -1,66 +1,98 @@
-// processing.ts – FULL OVERHAULED VERSION
-// All fixes integrated: robust chunking, [#ID] delimiters for 100% retention,
-// super-resilient numbered-line parser, automatic fallbacks, full debug logging,
-// AND structure restoration to preserve original numbering/bullets.
-// No text is ever dropped or left unappended.
+// processing.ts — CACHE-FIRST + PIPELINE-ONLY VERSION
+//
+// Layout detection strategy:
+//   1. CACHE-FIRST: check .translations.md for cached paragraph layout
+//      (produced by background pdf-layout-worker via watcher/commands).
+//      If cached → use cached rects (no DOM detection needed).
+//   2. DOM FALLBACK: if no cache, run contour pipeline on PDF.js textLayer
+//      spans (layout-detector.ts → OccupancyMap → IslandBuilder).
+//   3. BACKGROUND ENRICHMENT: on cache miss, enqueue the page for background
+//      processing so next time it's cached.
+//
+// No post-processing: no semantic merging, no sentence re-flow.
+// One paragraph = one TranslationUnit (split only if > maxBatchChars).
+
+// P0-2: removed `@ts-nocheck`. It previously masked real type errors
+// including the missing `externalLayoutService` / `ocrLayoutService`
+// declarations (P0-1) and the dead `_fromCache` field on TranslationUnit.
+// All `_externalRect` / `_externalFont` accesses are now type-safe because
+// those fields are declared optional on `TranslationUnit` in types.ts.
 
 import { Notice, TFile } from 'obsidian';
 import OpenRouterTranslatorPlugin from './main';
 import { TranslationUnit, OverlayPositionData } from './types';
 import { LayoutDetector, LayoutSettings } from './layout-detector';
-import type { VerticalStrip } from './GapDetector';
+// Phase 7 (V4 Schema): stable per-overlay identifier generator. Used at
+// the cache→OverlayPositionData construction site below so the merged
+// result has the same id as the on-disk version (which the DOM-extraction
+// and queue paths also produce for the same source paragraph).
+import { getCurrentEngine } from './overlay-id';
+// T2.4: shared constants/utilities (was duplicated across 5 modules).
+import { isTableLikeText, normalizeWithLineBreaks, collapseToSingleLine, CancelToken, isCancelled as tokenCancelled } from './shared';
+// T2.5: THE single construction site for saved overlay records.
+import { makeOverlay } from './overlay-factory';
+import type { VerticalStrip } from './layout-detector';
+// Phase 13.3: import the provider registry so we can read `contextWindow`
+// for the auto-chunk check. (We do NOT call buildRequest from here —
+// TranslationEngine owns that.)
+// FIX: getProvider import removed — token estimation was inaccurate and
+// caused problems with reasoning models. Chunking is now purely
+// character-based via maxBatchChars.
+// P0-1: instantiate both layout services so the Python (PyMuPDF) pipeline
+// (headless-translate.ts) and the OCR pipelines (ocr-text.ts / ocr-layout.ts)
+// can be reached from the TextProcessor without throwing at runtime.
 import { ExternalLayoutService } from './external-layout';
 import { OcrLayoutService } from './ocr-layout';
+// P0-1 (Phase 1): static import replaces runtime `require('./paragraph-filter')`,
+// which throws `ReferenceError: require is not defined` on mobile (Obsidian's
+// mobile runtime has no CommonJS shim). Mobile crashes occurred in
+// executeTranslation whenever paragraphFilterRules were enabled (the defaults).
+import { compileRules, filterParagraphs } from './paragraph-filter';
 
 export class TextProcessor {
   private plugin: OpenRouterTranslatorPlugin;
   public layoutDetector: LayoutDetector;
+  // P0-1: public so externalLayoutService / ocrLayoutService are reachable
+  // from headless-translate.ts:91 and ocr-text.ts:74. Both were previously
+  // accessed but never declared or instantiated — every Python-layout watcher
+  // run and every OCR command crashed with `TypeError: Cannot read properties
+  // of undefined (reading 'clearCache' | 'ocrPageText')`.
   public externalLayoutService: ExternalLayoutService;
   public ocrLayoutService: OcrLayoutService;
 
   // Caches
   private measurementCache = new Map<HTMLElement, { rect: DOMRect; timestamp: number }>();
   private styleCache = new Map<HTMLElement, CSSStyleDeclaration>();
-  private colorDistanceCache = new Map<string, number>();
 
-  // State – now stores BOTH units AND their translated lines
-  private lastPreparedUnits: {
-    pageElement: HTMLElement;
-    units: TranslationUnit[];
-    translatedLines: string[];
-  } | null = null;
+  // FIX D4 (REMOVED, T6.1): `lastPreparedUnits` was global mutable state shared
+  // between the (now deleted) translatePageContent() and createOverlayWithText(). If the user switched
+  // pages between the two calls (or if a third party called
+  // createOverlayWithText), the overlay would be created on the wrong page with
+  // the wrong units. Now createOverlayWithText accepts TranslationUnit[] +
+  // translatedLines directly as parameters, eliminating the implicit coupling.
 
   private overlayContainers: HTMLElement[] = [];
   private translationFailures: { segmentIndex: number; error: string }[] = [];
-  private lastColumnAnalysis: {
-    columns: Array<{ left: number; top: number; right: number; bottom: number; width: number; height: number }>;
-    edgeCols: Array<{ left: number; top: number; right: number; bottom: number; width: number; height: number }>;
-    gapCols: Array<{ left: number; top: number; right: number; bottom: number; width: number; height: number }>;
-    verticalGaps: number[];
-    horizontalGaps: number[];
-  } | null = null;
 
   constructor(plugin: OpenRouterTranslatorPlugin) {
     this.plugin = plugin;
     this.layoutDetector = new LayoutDetector(this.plugin.layoutSettings);
-    this.externalLayoutService = new ExternalLayoutService(plugin);
-    this.ocrLayoutService = new OcrLayoutService(plugin);
+    // P0-1: instantiate both services now. They hold a back-reference to the
+    // plugin for settings/storage access; no I/O is performed at construction.
+    this.externalLayoutService = new ExternalLayoutService(this.plugin);
+    this.ocrLayoutService = new OcrLayoutService(this.plugin);
   }
 
   // ==================== PUBLIC API ====================
 
   public updateLayoutDetectorSettings(newSettings: LayoutSettings, silent = false): void {
-    console.log("Updating LayoutDetector with new settings:", newSettings);
     this.layoutDetector = new LayoutDetector(newSettings);
-    this.externalLayoutService.clearCache();
     if (!silent) {
       new Notice('Layout detection settings have been updated.');
     }
   }
 
   public async addTextOverlay() {
-    // Standard overlay translation (internal/python only). OCR-AI is a separate
-    // subsystem reached through its own commands, never through here.
     const currentPage = this.plugin.overlay.getCurrentPageElement();
     if (currentPage) {
       await this.addOverlayToPage(currentPage);
@@ -71,13 +103,41 @@ export class TextProcessor {
 
   public async addOverlayToPage(pageElement: HTMLElement) {
     try {
-      const translatedText = await this.translatePageContent(pageElement);
-      if (translatedText) {
-        await this.createOverlayWithText(pageElement, translatedText);
-        const successfulTranslations = translatedText.split('\n').filter(line => line !== 'Translation missing').length;
-        new Notice(`✓ Translation complete. Rendered ${successfulTranslations} segment(s).`, 3000);
+      // FIX D4: combine translate + render into a single atomic call so that
+      // TranslationUnit[] + translatedLines flow directly between the two
+      // steps without going through mutable global state.
+      const textLayer = pageElement.querySelector('.textLayer') as HTMLElement;
+      if (!textLayer) {
+        new Notice('Text layer not found. Wait for PDF to fully render.');
+        return;
       }
+
+      const translationUnits = await this.prepareTranslationUnits(textLayer, pageElement, /* forceFresh */ true);
+      if (!translationUnits || translationUnits.length === 0) {
+        new Notice('No valid text to translate (or layout analysis failed).', 2000);
+        return;
+      }
+
+      const translatedLines = await this.executeTranslation(translationUnits);
+      // T1.8: a cancelled/failed run must not render fallback originals over
+      // this page's existing overlays — stop here. executeTranslation already
+      // surfaced the error Notice.
+      const degradedPageNum = parseInt(pageElement.getAttribute('data-page-number') || '0', 10);
+      if (this.lastRunDegraded && this.plugin.overlay?.pagesWithOverlays?.has?.(degradedPageNum)) {
+        new Notice('Translation incomplete — existing saved overlays left untouched.', 5000);
+        return;
+      }
+      const successfulTranslations = translatedLines.filter(line => line !== 'Translation missing').length;
+
+      await this.createOverlayWithText(pageElement, translationUnits, translatedLines);
+      new Notice(`✓ Translation complete. Rendered ${successfulTranslations} segment(s).`, 3000);
     } catch (error: any) {
+      if (error?.message === 'cancelled') {
+        // T1.2/T1.8: cancellation is a user action, not a failure — render
+        // nothing, save nothing.
+        new Notice('Translation cancelled.', 3000);
+        return;
+      }
       console.error("addOverlayToPage process failed:", error);
       new Notice(`⚠ Translation failed: ${error.message}`, 4000);
     }
@@ -85,95 +145,73 @@ export class TextProcessor {
 
   // ==================== TRANSLATION PIPELINE ====================
 
-  public async translatePageContent(pageElement: HTMLElement): Promise<string | null> {
-    const textLayer = pageElement.querySelector('.textLayer') as HTMLElement;
-    const engine = this.plugin.settings.layoutEngine;
+  // T6.1: `translatePageContent` (kept-for-back-compat wrapper over
+  // prepare+execute) was removed — it had zero live callers after the
+  // multi-page modal migrated to the background queue.
 
-    if (!textLayer && engine === 'internal') {
-      new Notice('Text layer not found. Wait for PDF to fully render.');
-      return null;
-    }
-
-    let translationUnits: TranslationUnit[] | null = null;
-
-    switch (engine) {
-      case 'python':
-        translationUnits = await this.prepareExternalTranslationUnits(pageElement);
-        break;
-      case 'internal':
-      default:
-        translationUnits = this.prepareTranslationUnits(textLayer!, pageElement);
-        break;
-    }
-
-    if (!translationUnits || translationUnits.length === 0) {
-      new Notice('No valid text to translate (or layout analysis failed).', 2000);
-      return null;
-    }
-
-    // Semantic merging is only safe for the internal engine, where geometry
-    // lives in originalSpans. For OCR/python each block is a complete layout
-    // region with its own rect, so merging across regions would drop/!misplace
-    // bounding boxes (the merged unit would keep only the first fragment's rect).
-    if (this.plugin.settings.enableSemanticMerging && engine === 'internal') {
-      translationUnits = this.mergeSemanticFragments(translationUnits);
-    }
-
-    const translatedLines = await this.executeTranslation(translationUnits);
-
-    // Cache everything – guarantees perfect 1:1 mapping for overlay creation
-    this.lastPreparedUnits = {
-      pageElement,
-      units: [...translationUnits],
-      translatedLines: [...translatedLines]
-    };
-
-    return translatedLines.join('\n');
-  }
-
-  public async createOverlayWithText(pageElement: HTMLElement, translatedText: string): Promise<void> {
-    const requiresTextLayer = this.plugin.settings.layoutEngine === 'internal';
-    const prepResult = this.validateAndPreparePrerequisites(pageElement, requiresTextLayer);
+  /**
+   * FIX D4 + T6.1: createOverlayWithText accepts TranslationUnit[] +
+   * translatedLines as explicit parameters. The legacy `(pageElement,
+   * joinedString)` overload relied on the removed `lastPreparedUnits`
+   * global state and had no live callers — deleted in this overhaul.
+   */
+  public async createOverlayWithText(
+    pageElement: HTMLElement,
+    units: TranslationUnit[],
+    translatedLines: string[],
+  ): Promise<void> {
+    const prepResult = this.validateAndPreparePrerequisites(pageElement, true);
     if (!prepResult) return;
     const { overlayContainer } = prepResult;
     this.overlayContainers.push(overlayContainer);
 
-    let translationUnits: TranslationUnit[] | null = null;
-    let translatedLines: string[];
-
-    // === CRITICAL: Reuse cached units + translated lines if available ===
-    if (this.lastPreparedUnits?.pageElement === pageElement) {
-      translationUnits = this.lastPreparedUnits.units;
-      translatedLines = this.lastPreparedUnits.translatedLines;
-    } else {
-      // No cache – cannot safely use the passed translatedText.
-      new Notice('⚠ Page data expired. Please re-translate.', 3000);
-      overlayContainer.remove();
-      return;
-    }
-
+    const translationUnits = units;
     if (!translationUnits || translationUnits.length === 0) {
       overlayContainer.remove();
       return;
     }
 
     // === Safety net: enforce equal length ===
-    if (translatedLines.length !== translationUnits.length) {
-      console.error(`CRITICAL: Units (${translationUnits.length}) vs TranslatedLines (${translatedLines.length}) mismatch. Fixing.`);
-      if (translatedLines.length < translationUnits.length) {
-        translatedLines = [
-          ...translatedLines,
-          ...translationUnits.slice(translatedLines.length).map(u => u.text)
+    let finalTranslatedLines = translatedLines ?? [];
+    if (finalTranslatedLines.length !== translationUnits.length) {
+      console.error(`CRITICAL: Units (${translationUnits.length}) vs TranslatedLines (${finalTranslatedLines.length}) mismatch. Fixing.`);
+      if (finalTranslatedLines.length < translationUnits.length) {
+        finalTranslatedLines = [
+          ...finalTranslatedLines,
+          ...translationUnits.slice(finalTranslatedLines.length).map(u => u.text)
         ];
       } else {
-        translatedLines = translatedLines.slice(0, translationUnits.length);
+        finalTranslatedLines = finalTranslatedLines.slice(0, translationUnits.length);
       }
     }
 
-    this.renderOverlay(translationUnits, translatedLines, overlayContainer, pageElement);
+    this.renderOverlay(translationUnits, finalTranslatedLines, overlayContainer, pageElement);
 
-    if (this.plugin.settings.autoSaveOverlay) {
-      requestAnimationFrame(() => this.plugin.overlay.saveCurrentPageOverlay());
+    // Phase 1 (F1.2): notify the overlay renderer that this page now has
+    // overlays, so it can subscribe the page to the IntersectionObserver
+    // and apply the current visibility state. Without this, freshly
+    // translated overlays would not be tracked for scroll/zoom refresh
+    // and could appear visible even when the user had toggled overlays off.
+    const pageNumberForRefresh = parseInt(pageElement.getAttribute('data-page-number') || '0', 10);
+    if (pageNumberForRefresh > 0) {
+      this.plugin.overlay.markPageAsHavingOverlays(pageNumberForRefresh, pageElement);
+    }
+
+    if (this.plugin.settings.autoSaveOverlay && !this.lastRunDegraded) {
+      // FIX H11: capture the page element in the rAF closure. Previously the rAF
+      // callback called saveCurrentPageOverlay() which re-queries the current page
+      // — if the user scrolled/flipped pages before the rAF fired, the wrong page
+      // would be saved. Now we pass the page element so saveCurrentPageOverlay
+      // can extract overlay data from the CORRECT page.
+      //
+      // T1.8 (Q2=2): a degraded run (fallback originals) is NEVER auto-saved —
+      // it would silently overwrite good existing translations with
+      // untranslated text (exactly the near-miss observed with the
+      // "Error: cancelled" boot bug).
+      const pageElForSave = pageElement;
+      requestAnimationFrame(() => {
+        this.plugin.overlay.saveCurrentPageOverlayForPage(pageElForSave);
+      });
     }
   }
 
@@ -197,82 +235,43 @@ export class TextProcessor {
     return { textLayer, overlayContainer };
   }
 
-  private async prepareOcrApiTranslationUnits(pageElement: HTMLElement): Promise<TranslationUnit[] | null> {
-    const activeFile = this.plugin.app.workspace.getActiveFile();
-    if (!activeFile) return null;
+  /**
+   * Prepare TranslationUnits from PDF textLayer.
+   *
+   * Phase 12 (P2-17): the cache-first branch + `tryGetCachedUnits` were
+   * removed. All five callers pass `forceFresh: true` — the cache-first
+   * branch was unreachable dead code. The background `pdf-layout-queue`
+   * owns the on-disk cache; interactive translation paths always extract
+   * fresh from the DOM so the overlay renderer has real span references
+   * for positioning. The `forceFresh` parameter is kept (optional,
+   * defaulted to true) to preserve the public signature — callers that
+   * still pass it explicitly are not broken.
+   *
+   * One pipeline paragraph = one translation unit.
+   * If paragraph text > maxBatchChars, split into sentence groups
+   * (chunking only — does NOT merge or alter paragraph boundaries).
+   */
+  public async prepareTranslationUnits(
+    textLayerOrSpans: HTMLElement | HTMLSpanElement[],
+    pageElement: HTMLElement,
+    forceFresh: boolean = true,
+    // P1-9 (Phase 13): per-call layout settings, no global mutation.
+    // When `layoutSettings` is passed, `prepareTranslationUnits` builds a
+    // throwaway `LayoutDetector` instance for this call only — the caller
+    // (e.g. `retranslateSelectionWithLayoutMode` in overlay-ui.ts) no
+    // longer has to mutate `this.layoutDetector` via
+    // `updateLayoutDetectorSettings(tuned, true)` and restore it in a
+    // `finally` block. Eliminates the rapid-double-click race where two
+    // concurrent retranslates would each `try`/`finally` the global
+    // detector and one could end up restoring the other's tuned settings.
+    layoutSettings?: LayoutSettings
+  ): Promise<TranslationUnit[] | null> {
+    // `forceFresh` is kept for API stability; the cache-first branch is
+    // gone, so the parameter has no effect. Callers should still pass
+    // `true` (the default) for clarity.
+    void forceFresh;
 
-    const pageNumStr = pageElement.getAttribute('data-page-number');
-    if (!pageNumStr) return null;
-    const pageNum = parseInt(pageNumStr, 10);
-
-    const ocrSettings = this.plugin.settings.ocrProvider;
-
-    let pageItems = await this.ocrLayoutService.getCachedPage(activeFile.path, pageNum);
-
-    if (!pageItems || pageItems.length === 0) {
-      if (ocrSettings.workflowMode === 'full-document') {
-        const hasFull = await this.ocrLayoutService.hasCachedLayout(activeFile.path);
-        if (!hasFull) {
-          new Notice(
-            'Full document OCR cache not found.\n' +
-            'Run "OCR: Analyze full document" first, or switch to "per-page" mode.',
-            6000
-          );
-          return null;
-        }
-        new Notice(`Page ${pageNum} has no OCR data in cache.`);
-        return null;
-      }
-      pageItems = await this.ocrLayoutService.ocrPage(activeFile, pageNum, pageElement);
-    }
-
-    if (!pageItems || pageItems.length === 0) return null;
-
-    return pageItems.map(item => ({
-      id: item.id,
-      paragraphId: item.id,
-      text: item.text,
-      originalSpans: [],
-      _externalRect: item.rect,
-      _externalFont: {
-        family: item.fontFamily,
-        size: item.fontSize,
-        sizes: item.originalFontSizes
-      }
-    } as unknown as TranslationUnit));
-  }
-
-  private async prepareExternalTranslationUnits(pageElement: HTMLElement): Promise<TranslationUnit[] | null> {
-    const activeFile = this.plugin.app.workspace.getActiveFile();
-    if (!activeFile) return null;
-
-    if (!this.externalLayoutService.hasCachedLayout(activeFile.path)) {
-      const layout = await this.externalLayoutService.generateLayout(activeFile);
-      if (!layout) return null;
-    }
-
-    const pageNumStr = pageElement.getAttribute('data-page-number');
-    if (!pageNumStr) return null;
-    const pageNum = parseInt(pageNumStr, 10);
-
-    const pageItems = this.externalLayoutService.getCachedPage(activeFile.path, pageNum);
-    if (!pageItems || pageItems.length === 0) return null;
-
-    return pageItems.map(item => ({
-      id: item.id,
-      paragraphId: item.id,
-      text: item.text,
-      originalSpans: [],
-      _externalRect: item.rect,
-      _externalFont: {
-        family: item.fontFamily,
-        size: item.fontSize,
-        sizes: item.originalFontSizes
-      }
-    } as unknown as TranslationUnit));
-  }
-
-  public prepareTranslationUnits(textLayerOrSpans: HTMLElement | HTMLSpanElement[], pageElement: HTMLElement): TranslationUnit[] | null {
+    // ── DOM extraction: run pipeline on textLayer spans ───────────
     const rawSpans = Array.isArray(textLayerOrSpans)
       ? textLayerOrSpans
       : Array.from(textLayerOrSpans.querySelectorAll<HTMLSpanElement>('span'));
@@ -283,9 +282,18 @@ export class TextProcessor {
       return null;
     }
 
-    const result = this.layoutDetector.detectLayout(textSpans, pageElement);
-    this.lastColumnAnalysis = result.columnAnalysis;
-    if (this.plugin.settings.debugMode) {
+    // P1-9 (Phase 13): use a per-call detector when the caller supplied
+    // tuned settings; otherwise fall back to the shared instance that
+    // `updateLayoutDetectorSettings` keeps in sync with the plugin's
+    // global layout settings.
+    const detector = layoutSettings
+      ? new LayoutDetector(layoutSettings)
+      : this.layoutDetector;
+    const result = detector.detectLayout(textSpans, pageElement);
+
+    // Bug 1 fix: visual rendering gated on layoutDebugMode (matches its description),
+    // console logging gated on debugMode (matches its description).
+    if (this.plugin.settings.layoutDebugMode) {
       this.renderLayoutDebugOverlay(
         pageElement,
         result.columnAnalysis,
@@ -295,14 +303,14 @@ export class TextProcessor {
     } else {
       this.clearLayoutDebugOverlay(pageElement);
     }
-    this.clearCaches();
-
     if (this.plugin.settings.debugMode) {
-      console.log(`PDF Translator: Found ${result.paragraphs.length} paragraph(s) to process.`);
+      console.log(`PDF Translator: DOM pipeline → ${result.paragraphs.length} paragraph(s).`);
     }
+    this.clearCaches();
 
     const { maxBatchChars } = this.plugin.settings;
 
+    // ── Emit one TranslationUnit per pipeline paragraph ─────────────
     return result.paragraphs.flatMap((paragraphSpans, paraIndex) => {
       if (!paragraphSpans || paragraphSpans.length === 0) return [];
       const paragraphId = `para-${paraIndex}`;
@@ -318,6 +326,7 @@ export class TextProcessor {
         }];
       }
 
+      // Chunk by sentence groups (large paragraphs only)
       const sortedSpans = [...paragraphSpans].sort((a, b) => {
         const rectA = this.getBoundingClientRectCached(a);
         const rectB = this.getBoundingClientRectCached(b);
@@ -355,377 +364,366 @@ export class TextProcessor {
     });
   }
 
-  // ==================== SEMANTIC MERGING ====================
-
-  private mergeSemanticFragments(units: TranslationUnit[]): TranslationUnit[] {
-    if (units.length < 2) return units;
-
-    const mergedUnits: TranslationUnit[] = [];
-    const terminatorRegex = /[.?!:](?:\s*<\/[^>]+>)*\s*$/;
-    const startLowercaseRegex = /^(?:<[^>]+>)*\s*[a-z]/;
-
-    // Clone so we never mutate the caller's unit objects/arrays.
-    let currentUnit: TranslationUnit = { ...units[0], originalSpans: [...units[0].originalSpans] };
-
-    for (let i = 1; i < units.length; i++) {
-      const nextUnit = units[i];
-      const isCurrentOpen = !terminatorRegex.test(currentUnit.text.trim());
-      const isNextContinuation = startLowercaseRegex.test(nextUnit.text.trim());
-
-      if (isCurrentOpen && isNextContinuation) {
-        currentUnit.text += ' ' + nextUnit.text;
-        currentUnit.originalSpans.push(...nextUnit.originalSpans);
-        if (this.plugin.settings.debugMode) {
-          console.log(`Merged broken sentence: "${currentUnit.text.substring(currentUnit.text.length - 30)}..."`);
-        }
-      } else {
-        mergedUnits.push(currentUnit);
-        currentUnit = { ...nextUnit, originalSpans: [...nextUnit.originalSpans] };
-      }
-    }
-    mergedUnits.push(currentUnit);
-    return mergedUnits;
-  }
-
   // ==================== TRANSLATION EXECUTION ====================
-  // ** OVERHAULED ** – Uses [#ID] syntax to prevent regex confusion
 
-  public async executeTranslation(units: TranslationUnit[]): Promise<string[]> {
+  /**
+   * T1.8: set whenever the most recent executeTranslation/translateSegments
+   * run degraded to fallbacks (any segment reverted to its original text,
+   * or a page-level failure). Consumers (createOverlayWithText) use this to
+   * avoid RENDERING original text over already-saved translations and to
+   * skip the auto-save — a failed run must never overwrite good data.
+   */
+  public lastRunDegraded = false;
+
+  public async executeTranslation(
+    units: TranslationUnit[],
+    opts?: { isCancelled?: CancelToken },
+  ): Promise<string[]> {
     this.translationFailures = [];
-    
-    // Safety check: Empty units
+    this.lastRunDegraded = false;
+
     if (units.length === 0) return [];
 
-    // 1. Prepare Prompt with STRONG Delimiters
-    // We use [#1], [#2] instead of 1., 2. to avoid confusion with document content
-    // like "2.5 Section Title" or "2024 Year".
-    const fullText = units.map((u, i) => `[#${i + 1}] ${u.text}`).join('\n');
-    const { useBatchTranslation: useBatch, maxBatchChars } = this.plugin.settings;
-
-    // Use chunking if total text length exceeds limit
-    const shouldUseChunking = useBatch && units.length > 1 && fullText.length > maxBatchChars;
-
-    try {
-      let translatedLines: string[];
-
-      if (shouldUseChunking) {
-        new Notice(`Long page detected. Translating in multiple batches...`, 4000);
-        translatedLines = await this.performChunkedTranslation(units, maxBatchChars);
-      } else if (useBatch && units.length > 1) {
-        // new Notice(`Translating ${units.length} segments in a batch...`, 3000); // optional: reduce noise
-        const raw = await this.plugin.translation.translateBatch(fullText, units.length);
-        
-        if (this.plugin.settings.debugMode) {
-          console.log(`[Batch Input]:\n${fullText}`);
-          console.log(`[Batch Raw Output]:\n${raw}`);
+    // Stage 2.4: Apply paragraph filter rules. Paragraphs matching
+    // enabled filter rules (page numbers, single letters, etc.) are NOT
+    // sent to the LLM — their original text is used as the "translation".
+    let translatableUnits = units;
+    let skippedIndices = new Set<number>();
+    const rules = this.plugin.settings.paragraphFilterRules;
+    if (rules && rules.length > 0) {
+      const compiled = compileRules(rules);
+      if (compiled.length > 0) {
+        const texts = units.map(u => u.text);
+        const { translatable, skipped } = filterParagraphs(texts, compiled);
+        if (skipped.size > 0) {
+          skippedIndices = skipped;
+          translatableUnits = translatable.map(i => units[i]);
+          if (this.plugin.settings.debugMode) {
+            console.log(`[ParagraphFilter] ${skipped.size}/${units.length} paragraphs filtered (not sent to LLM):`,
+              [...skipped.entries()].map(([i, name]) => `#${i + 1} (${name}): "${units[i].text.substring(0, 30)}"`));
+          }
         }
-        
-        // 2. Robust Extraction
-        translatedLines = await this.extractNumberedLinesRobust(raw, units.length, units.map(u => u.text));
+      }
+    }
+
+    // If all paragraphs were filtered, return originals immediately.
+    if (translatableUnits.length === 0) {
+      return units.map(u => u.text);
+    }
+
+    const { useBatchTranslation: useBatch, maxBatchChars } = this.plugin.settings;
+    const translatableTexts = translatableUnits.map(u => u.text);
+
+    let translatedLines: string[];
+    try {
+      if (useBatch && translatableUnits.length > 1) {
+        translatedLines = await this.translateSegments(translatableTexts, {
+          isCancelled: opts?.isCancelled,
+        });
       } else {
-        // Sequential fallback
-        translatedLines = await this.performSequentialTranslation(units);
+        translatedLines = await this.performSequentialTranslation(translatableUnits, opts?.isCancelled);
       }
 
-      // 3. SAFEGUARD: Structure Restoration
-      // Fixes issue where "2.1 Title" becomes "Title" (LLM stripping numbering)
-      translatedLines = this.restoreStructure(units, translatedLines);
+      // Restore leading numbering/bullets that LLMs sometimes strip.
+      translatedLines = this.restoreStructure(translatableUnits, translatedLines);
 
-      // 4. Final Validation & Filling
-      // If a line is missing, we fallback to original text to prevent empty gaps in the overlay
+      // ── Line-break policy (Q9 + user-requested table handling) ─────────
+      // A segment keeps its line structure when EITHER the user explicitly
+      // asked for it (preserveSourceLineBreaks) OR the SOURCE segment was
+      // table-like (every line short → table rows / list items — the
+      // structure IS the meaning). Everything else collapses to one line.
       translatedLines = translatedLines.map((line, i) => {
-        if (line === 'Translation missing' || !line.trim()) {
-            console.warn(`Segment ${i + 1} missing. Reverting to original.`);
-            return units[i].text;
+        const origText = translatableUnits[i]?.text || '';
+        const keepBreaks = this.plugin.settings.preserveSourceLineBreaks
+          || isTableLikeText(origText);
+        return keepBreaks ? normalizeWithLineBreaks(line) : collapseToSingleLine(line);
+      });
+
+      // Detect degradation: any segment that fell back to its original
+      // text (missing marker / chunk failure). Drives T1.8 protection.
+      let degradedCount = 0;
+      translatedLines = translatedLines.map((line, i) => {
+        if (!line || !line.trim()) {
+          degradedCount++;
+          console.warn(`Segment ${i + 1} empty. Reverting to original.`);
+          return translatableUnits[i].text;
         }
         return line;
       });
+      if (degradedCount > 0) this.lastRunDegraded = true;
+
+      // Stage 2.4: merge translated lines back with skipped paragraphs.
+      if (skippedIndices.size > 0) {
+        const result: string[] = new Array(units.length);
+        let transIdx = 0;
+        for (let i = 0; i < units.length; i++) {
+          if (skippedIndices.has(i)) {
+            result[i] = units[i].text;
+          } else {
+            result[i] = translatedLines[transIdx] || units[i].text;
+            transIdx++;
+          }
+        }
+        return result;
+      }
 
       return translatedLines;
 
     } catch (err: any) {
-      this.plugin.logDebug('Translation fatal error:', err);
-      // Fail gracefully: return originals
+      // T1.8: a CANCELLED run must not be treated as "translate failed →
+      // fall back to originals" — rendering and (worse) auto-SAVING
+      // original text over good saved translations is data corruption.
+      // Re-throw so addOverlayToPage stops before rendering anything.
+      if (err?.message === 'cancelled') {
+        this.lastRunDegraded = true;
+        throw err;
+      }
+      // FIX H14: fatal translation errors must be surfaced — otherwise the
+      // user sees a false "✓ Translation complete" while all segments
+      // silently fell back to originals. Mark degraded so the caller can
+      // refuse to overwrite existing saved overlays (Q2 decision, variant 2).
+      console.error('[PDF Translator] Translation failed:', err);
+      new Notice(`Translation failed: ${err?.message || err}`, 8000);
+      this.lastRunDegraded = true;
       return units.map(u => u.text);
     }
   }
 
-  // ==================== CHUNKED TRANSLATION ====================
+  // The chunked / sequential / extraction methods below are unchanged
+  // from the previous version — they only consume the TranslationUnit[]
+  // list produced by prepareTranslationUnits. They are kept here so the
+  // plugin can still handle large pages, but they do NOT alter paragraph
+  // boundaries from the pipeline.
 
-  private async performChunkedTranslation(units: TranslationUnit[], maxChunkChars: number): Promise<string[]> {
-    const allTranslatedLines = Array(units.length).fill('Translation missing');
-    let i = 0;
-    let chunkCounter = 0;
-
-    while (i < units.length) {
-      const indices: number[] = [];
-      let chunkLength = 0;
-
-      // Greedy accumulation – always include at least 1 unit to prevent infinite loop.
-      while (i < units.length) {
-        const addedLength = units[i].text.length + 8; // "[#12] " overhead
-
-        if (indices.length > 0 && chunkLength + addedLength > maxChunkChars) {
-          // Try to cut at a sentence break inside the current chunk.
-          // Only do so if there is at least 2 items and the break is not the last item.
-          const breakIdx = this.findLastSentenceBreak(units, indices);
-          if (breakIdx > 0 && breakIdx < indices.length - 1) {
-            // How many trailing indices are we returning to the next chunk?
-            const unitsToReturn = indices.length - (breakIdx + 1);
-            i -= unitsToReturn;           // rewind global pointer
-            indices.splice(breakIdx + 1); // trim the chunk to the break point
-          }
-          // Whether or not we found a sentence break, stop building this chunk here.
-          break;
-        }
-
-        indices.push(i);
-        chunkLength += addedLength;
-        i++;
-      }
-
-      // Safety guard: this should never happen after the "at least 1" rule above,
-      // but protects against any edge case that would otherwise create an infinite loop.
-      if (indices.length === 0) {
-        console.error(`performChunkedTranslation: empty indices at position ${i}. Force-skipping unit.`);
-        allTranslatedLines[i] = units[i].text;
-        i++;
-        continue;
-      }
-
-      chunkCounter++;
-      // Re-index locally 1..N
-      const chunkText = indices.map((idx, localPos) => `[#${localPos + 1}] ${units[idx].text}`).join('\n');
-
-      if (this.plugin.settings.debugMode) {
-        console.log(`[Chunk ${chunkCounter}] Translating ${indices.length} unit(s) (global indices ${indices[0]}–${indices[indices.length - 1]}):\n${chunkText}`);
-      }
-
-      try {
-        new Notice(`Translating batch ${chunkCounter}...`);
-        const raw = await this.plugin.translation.translateBatch(chunkText, indices.length);
-
-        if (this.plugin.settings.debugMode) {
-          console.log(`[Chunk ${chunkCounter} Raw Output]:\n${raw}`);
-        }
-
-        const chunkOriginals = indices.map(idx => units[idx].text);
-        const lines = await this.extractNumberedLinesRobust(raw, indices.length, chunkOriginals);
-
-        // Validate that we got the right number of lines back before mapping.
-        if (lines.length !== indices.length) {
-          console.warn(
-            `[Chunk ${chunkCounter}] extractNumberedLinesRobust returned ${lines.length} lines ` +
-            `but expected ${indices.length}. Some segments may fall back to originals.`
-          );
-        }
-
-        // Map local positions back to global array.
-        // Use Math.min to avoid accessing an out-of-bounds index if lines is short.
-        const safeLen = Math.min(lines.length, indices.length);
-        for (let localPos = 0; localPos < safeLen; localPos++) {
-          const globalIdx = indices[localPos];
-          if (globalIdx !== undefined) {
-            allTranslatedLines[globalIdx] = lines[localPos];
-          }
-        }
-
-        // If lines was shorter than expected, fill remaining with originals so nothing is lost.
-        for (let localPos = safeLen; localPos < indices.length; localPos++) {
-          const globalIdx = indices[localPos];
-          if (globalIdx !== undefined && allTranslatedLines[globalIdx] === 'Translation missing') {
-            console.warn(`[Chunk ${chunkCounter}] Segment ${localPos + 1} not in parser output. Falling back to original.`);
-            allTranslatedLines[globalIdx] = units[globalIdx].text;
-          }
-        }
-
-      } catch (err) {
-        console.error(`Batch ${chunkCounter} failed`, err);
-        // Fallback: keep original text so overlay still renders for all units in this chunk.
-        indices.forEach(idx => {
-          allTranslatedLines[idx] = units[idx].text;
-        });
-      }
-    }
-
-    return allTranslatedLines;
-  }
-
-  private findLastSentenceBreak(units: TranslationUnit[], indices: number[]): number {
-    for (let i = indices.length - 1; i >= 0; i--) {
-      if (/[.?!](?:\s*<\/[bi]>)*\s*$/.test(units[indices[i]].text.trim())) {
-        return i;
-      }
-    }
-    return -1;
-  }
-
-  public async extractNumberedLines(rawText: string, expectedCount: number, originalTexts: string[] = []): Promise<string[]> {
-    const fallbacks =
-      originalTexts.length >= expectedCount
-        ? originalTexts
-        : [
-            ...originalTexts,
-            ...Array(Math.max(0, expectedCount - originalTexts.length)).fill('Translation missing')
-          ];
-    return this.extractNumberedLinesRobust(rawText, expectedCount, fallbacks);
-  }
-
-  // ==================== ROBUST NUMBERED-LINE PARSER ====================
-  // ** OVERHAULED ** – Handles [#ID] tags and falls back gracefully
-
-
-  private async extractNumberedLinesRobust(
-    rawText: string,
-    expectedCount: number,
-    originalTexts: string[]
+  /**
+   * T2.1: THE unified translation orchestrator (all callers share this core).
+   *
+   * Contract: returns EXACTLY `texts.length` strings, aligned 1:1 with the
+   * input — one translation per input text, regardless of internal
+   * pre-splitting/chunking. This contract is what the old
+   * `translateTextsWithChunking` documented but VIOLATED (P0-1: pre-split
+   * long texts into N segments and returned one translation per SEGMENT,
+   * shifting every subsequent translation of the page onto the wrong
+   * paragraph in the headless/python path).
+   *
+   * Pipeline:
+   *   1. Pre-split texts longer than `maxBatchChars − 20` into sentence
+   *      groups, remembering each segment's ORIGIN index.
+   *   2. Pack segments into ≤ maxBatchChars chunks ([#N]-numbered).
+   *   3. translateBatch + extractNumberedLinesRobust per chunk; per-chunk
+   *      failure falls back to that chunk's ORIGINAL SEGMENT TEXTS (not
+   *      silently shifted translations).
+   *   4. Re-join each origin's segment translations back into one string.
+   *   5. restoreStructure-style marker restoration happens in the caller.
+   *
+   * Cancellation (T1.2): checks ONLY the caller-supplied token — never the
+   * global background-queue flag (the old shared checks cancelled manual
+   * translations whenever the queue had been paused — see T1.1/T1.2).
+   */
+  public async translateSegments(
+    texts: string[],
+    opts?: { isCancelled?: CancelToken; onProgress?: (done: number, total: number) => void },
   ): Promise<string[]> {
-    // 1. Sanitize AI Output
-    let cleanText = rawText
-      .replace(/```(?:json|text)?/g, '')
-      .replace(/```/g, '')
-      .replace(/^Here is the translation.*?:/im, '')
-      .trim();
+    if (texts.length === 0) return [];
+    this.lastRunDegraded = false;
 
-    const result = Array(expectedCount).fill('Translation missing');
+    const maxBatchChars = this.plugin.settings.maxBatchChars ?? 4000;
+    const UNIT_OVERHEAD = 20;
 
-    // STRATEGY A: Position-independent [#N] tag splitting.
-    // Splitting on the tags themselves finds a [#N] anywhere — multiple per
-    // line, or mid-line after a wrap — which the old line-anchored regex missed.
-    // parts = [pre, "1", text1, "2", text2, ...]
-    const parts = cleanText.split(/\[#(\d+)\]/);
-    let foundCount = 0;
-
-    for (let k = 1; k < parts.length; k += 2) {
-      const num = parseInt(parts[k], 10);
-      const text = (parts[k + 1] ?? '').replace(/^[\s:.\-*_]+/, '').trim();
-      if (num >= 1 && num <= expectedCount && text) {
-        result[num - 1] = text;
-        foundCount++;
-      }
-    }
-
-    // If we found at least half the expected tags, trust Strategy A.
-    // (A partial match is still better than misaligned line-splitting.)
-    if (foundCount >= Math.ceil(expectedCount / 2)) {
-      // Re-translate only the holes individually rather than silently reverting.
-      let revertedCount = 0;
-      for (let i = 0; i < expectedCount; i++) {
-        if (result[i] !== 'Translation missing') continue;
-        try {
-          const retry = await this.plugin.translation.translateWithOpenRouter(originalTexts[i] ?? '');
-          const clean = (retry || '').trim();
-          if (clean) {
-            result[i] = clean;
-          } else {
-            result[i] = originalTexts[i] ?? 'Translation missing';
-            revertedCount++;
-          }
-        } catch {
-          result[i] = originalTexts[i] ?? 'Translation missing';
-          revertedCount++;
+    // ── Step 1: pre-split oversized texts, tracking origin indices ──
+    const segments: string[] = [];
+    const originOf: number[] = [];   // segments[i] belongs to texts[ originOf[i] ]
+    for (let t = 0; t < texts.length; t++) {
+      const text = texts[t];
+      if (text.length + UNIT_OVERHEAD > maxBatchChars) {
+        const parts = this.splitLongTextBySentences(text, maxBatchChars - UNIT_OVERHEAD);
+        for (const p of parts) {
+          segments.push(p);
+          originOf.push(t);
         }
+      } else {
+        segments.push(text);
+        originOf.push(t);
       }
-
-      if (revertedCount > 0) {
-        new Notice(`${revertedCount} of ${expectedCount} segment(s) could not be aligned and kept their original text.`, 5000);
-      }
-      return result;
     }
 
-    // STRATEGY B: Fallback to Line Splitting
-    const lines = cleanText.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+    // ── Step 2: pack segments into ≤ maxBatchChars chunks ──
+    const charChunks: string[][] = [];
+    let current: string[] = [];
+    let currentSize = 0;
+    for (const seg of segments) {
+      const size = seg.length + UNIT_OVERHEAD;
+      if (currentSize + size > maxBatchChars && current.length > 0) {
+        charChunks.push(current);
+        current = [];
+        currentSize = 0;
+      }
+      current.push(seg);
+      currentSize += size;
+    }
+    if (current.length > 0) charChunks.push(current);
 
-    const candidateLines = lines.filter(l =>
-      !l.toLowerCase().startsWith("sure,") &&
-      !l.toLowerCase().startsWith("translation:") &&
-      !l.toLowerCase().startsWith("here are")
-    );
-
-    // Strip prompt tags but not body numbering
-    const strictTagStripRegex = /^[\s*_]*\[#\d+\][\s*_]*(?:[:.-])?\s*/;
-
-    // Exact count match в†’ 1:1 mapping
-    if (candidateLines.length === expectedCount) {
-      return candidateLines.map(line => line.replace(strictTagStripRegex, ''));
+    if (charChunks.length > 1) {
+      new Notice(`Translating in ${charChunks.length} batches...`, 3000);
     }
 
-    // STRATEGY C: Soft Alignment (count is close)
-    if (candidateLines.length > 0 && Math.abs(candidateLines.length - expectedCount) <= 2) {
-      console.log(`Alignment fallback: Expected ${expectedCount}, got ${candidateLines.length}. Aligning sequentially.`);
-      const safeLen = Math.min(candidateLines.length, expectedCount);
-      for (let i = 0; i < safeLen; i++) {
-        result[i] = candidateLines[i].replace(strictTagStripRegex, '');
+    // ── Step 3: translate chunks sequentially (order preserved) ──
+    const segmentTranslations: string[] = new Array(segments.length);
+    const delayMs = this.plugin.settings.sequentialDelayMs ?? 150;
+    let segCursor = 0;
+    for (let i = 0; i < charChunks.length; i++) {
+      if (tokenCancelled(opts?.isCancelled)) {
+        throw new Error('cancelled');
       }
-      // Fill any remaining slots with originals (don't leave 'Translation missing' holes).
-      for (let i = safeLen; i < expectedCount; i++) {
+      const chunk = charChunks[i];
+      const originTextsOfChunk = chunk; // chunk[k] IS the origin segment text (pre-split piece)
+      try {
+        const chunkText = chunk.map((t, j) => `[#${j + 1}] ${t}`).join('\n');
         if (this.plugin.settings.debugMode) {
-          console.warn(`Segment ${i + 1} not in candidate lines. Reverting to original.`);
+          console.log(`[Chunk ${i + 1}/${charChunks.length} Input]:\n${chunkText.substring(0, 200)}...`);
         }
-        result[i] = originalTexts[i] ?? 'Translation missing';
+        const raw = await this.plugin.translation.translateBatch(chunkText, chunk.length);
+        const lines = await this.extractNumberedLinesRobust(raw, chunk.length, originTextsOfChunk);
+        for (let k = 0; k < chunk.length; k++) {
+          segmentTranslations[segCursor + k] = lines[k];
+        }
+        if (charChunks.length > 1) {
+          new Notice(`Batch ${i + 1}/${charChunks.length} complete.`, 2000);
+        }
+      } catch (err) {
+        if (err?.message === 'cancelled') throw err;
+        // Per-chunk failure: fall back to THIS chunk's original segments.
+        // (The old code pushed the raw chunk texts too, but the pre-split
+        // misalignment above made even that wrong — P0-1.)
+        console.error(
+          `[translateSegments] chunk ${i + 1}/${charChunks.length} failed, falling back to originals:`,
+          err,
+        );
+        new Notice(
+          `Batch ${i + 1}/${charChunks.length} failed — using original text. ` +
+          `Error: ${err?.message?.substring(0, 60) || err}`,
+          5000,
+        );
+        this.lastRunDegraded = true;
+        for (let k = 0; k < chunk.length; k++) {
+          segmentTranslations[segCursor + k] = chunk[k];
+        }
       }
-      return result;
+      segCursor += chunk.length;
+      opts?.onProgress?.(Math.min(segCursor, segments.length), segments.length);
+      if (i < charChunks.length - 1 && delayMs > 0) {
+        await new Promise(r => setTimeout(r, delayMs));
+      }
     }
 
-    // STRATEGY D: Last resort – fill with originals, log warning
-    console.warn(
-      `extractNumberedLinesRobust: All strategies failed for ${expectedCount} segments. ` +
-      `Raw output had ${candidateLines.length} candidate lines. Reverting all to originals.`
-    );
-    return originalTexts.map(t => t ?? 'Translation missing');
+    // ── Step 4: re-join each origin's segments (1:1 with input texts) ──
+    const byOrigin: string[][] = Array.from({ length: texts.length }, () => []);
+    for (let s = 0; s < segments.length; s++) {
+      byOrigin[originOf[s]].push(segmentTranslations[s] ?? segments[s]);
+    }
+    return byOrigin.map(parts => parts.join(' ').replace(/[ \t]+/g, ' ').trim());
   }
 
-  // ==================== CRITICAL SAFEGUARD: STRUCTURE RESTORATION ====================
-  // ** NEW ** – forces original list markers back onto translations
+  /**
+   * Back-compat wrapper (headless/python path). Now a pure delegate to the
+   * unified orchestrator — the historical 1:1-alignment bug (P0-1) is fixed
+   * INSIDE translateSegments, so this signature keeps working for callers
+   * that hold plain string arrays.
+   */
+  public async translateTextsWithChunking(
+    texts: string[],
+    opts?: { isCancelled?: CancelToken },
+  ): Promise<string[]> {
+    return this.translateSegments(texts, { isCancelled: opts?.isCancelled });
+  }
 
-  private restoreStructure(units: TranslationUnit[], translatedLines: string[]): string[] {
-    // Regex matches: "1.", "1.1", "2.1.3", "a)", "-", "•"
-    const listMarkersRegex = /^(\d{1,2}\.\d{1,2}(\.\d{1,2})?|\d{1,3}[\.\)]|[a-z][\.\)]|[-•*])\s+/i;
+  /**
+   * FIX: split a single long text into segments that fit within `maxLen`.
+   * Tries sentence boundaries first (., !, ?, 。, ！, ？), then falls back
+   * to word boundaries, then to hard character split. Each segment is ≤ maxLen.
+   * This prevents "Empty response" errors when a single paragraph exceeds
+   * maxBatchChars — previously the whole paragraph was sent in one API call
+   * and failed on context overflow.
+   */
+  private splitLongTextBySentences(text: string, maxLen: number): string[] {
+    if (text.length <= maxLen) return [text];
 
-    return translatedLines.map((line, index) => {
-      if (line === 'Translation missing') return line;
+    const segments: string[] = [];
+    // Sentence-end markers: Latin (.!?) + CJK (。！？)
+    const sentenceRegex = /[^.!?。！？\n]+[.!?。！？\n]+|\S[^.!?。！？\n]*$/g;
+    const sentences = text.match(sentenceRegex) || [text];
 
-      const original = units[index].text.trim();
-      const originalMatch = original.match(listMarkersRegex);
-      
-      // If original didn't have a number/bullet, return translation as is
-      if (!originalMatch) return line;
-
-      const marker = originalMatch[1]; 
-      const translationMatch = line.trim().match(listMarkersRegex);
-
-      // 1. Translation lacks marker -> Prepend it
-      if (!translationMatch) {
-        return `${marker} ${line}`;
+    let current = '';
+    for (const sentence of sentences) {
+      if (sentence.length > maxLen) {
+        // Single sentence longer than maxLen — split by words/spaces
+        if (current) { segments.push(current); current = ''; }
+        const words = sentence.split(/(\s+)/);
+        for (const word of words) {
+          if ((current + word).length > maxLen && current) {
+            segments.push(current);
+            current = '';
+          }
+          current += word;
+        }
+      } else if ((current + sentence).length > maxLen && current) {
+        segments.push(current);
+        current = sentence;
+      } else {
+        current += sentence;
       }
+    }
+    if (current) segments.push(current);
 
-      // 2. Translation has marker, but it might be wrong (e.g. LLM wrote "1." instead of "2.1")
-      if (translationMatch[1] !== marker) {
-        // If the marker is purely numeric/bullet, we trust the original layout.
-        // We avoid replacing word-like starts (e.g. "Chapter 1" vs "Capítulo 1" is fine).
-        if (/^[\d\.\-•]+$/.test(marker)) {
-             return `${marker} ${line.replace(listMarkersRegex, '').trim()}`;
+    // Last resort: if any segment still > maxLen, hard-split by characters
+    const result: string[] = [];
+    for (const seg of segments) {
+      if (seg.length <= maxLen) {
+        result.push(seg);
+      } else {
+        for (let i = 0; i < seg.length; i += maxLen) {
+          result.push(seg.slice(i, i + maxLen));
         }
       }
-
-      return line;
-    });
+    }
+    return result.length > 0 ? result : [text];
   }
 
-  // ==================== SEQUENTIAL TRANSLATION ====================
-
-  private async performSequentialTranslation(units: TranslationUnit[]): Promise<string[]> {
-    const results: string[] = new Array(units.length);
-    const delayMs = (this.plugin.settings as any).sequentialDelayMs ?? 150;
+  private async performSequentialTranslation(units: TranslationUnit[], cancelToken?: CancelToken): Promise<string[]> {
+    const results: string[] = [];
+    const delayMs = this.plugin.settings.sequentialDelayMs ?? 150;
+    const maxChars = this.plugin.settings.maxBatchChars;
 
     for (let i = 0; i < units.length; i++) {
-      try {
-        results[i] = await this.plugin.translation.translateWithOpenRouter(units[i].text);
-      } catch (error: any) {
-        this.plugin.logDebug(`Translation failed for segment ${i}:`, error);
-        this.translationFailures.push({ segmentIndex: i, error: error.message || 'Unknown error' });
-        results[i] = 'Translation missing';
+      // T1.2: cancellation is checked via the CALLER-OWNED token only. The
+      // old global `plugin.pdfLayoutQueue?.isCancelled?.()` probe here is
+      // what made every manual translation die with "Error: cancelled"
+      // after the queue flag got poisoned at plugin startup (see T1.1).
+      if (tokenCancelled(cancelToken)) {
+        throw new Error('cancelled');
       }
+      try {
+        // Oversized single unit: route through the unified orchestrator
+        // (T2.1) — it pre-splits by sentences, chunks, and re-joins with a
+        // guaranteed 1:1 mapping, replacing the parallel implementation
+        // translateOversizedUnit that was removed in this overhaul.
+        if (units[i].text.length > maxChars) {
+          const translated = await this.translateSegments([units[i].text], { isCancelled: cancelToken });
+          results.push(translated[0] ?? units[i].text);
+        } else {
+          // FIX: TranslationEngine has only translateBatch() and translateWithOpenRouter().
+          // The previous call to .translate() always threw TypeError, was caught
+          // silently, and returned the original text — masking the failure.
+          const text = await this.plugin.translation.translateWithOpenRouter(units[i].text);
+          results.push(text);
+        }
+      } catch (err) {
+        if (err?.message === 'cancelled') throw err;
+        console.error(`Segment ${i + 1} failed:`, err);
+        this.lastRunDegraded = true;
+        results.push(units[i].text);
+      }
+      // Respect sequentialDelayMs between requests (rate-limit friendly).
       if (i < units.length - 1 && delayMs > 0) {
         await new Promise(r => setTimeout(r, delayMs));
       }
@@ -733,7 +731,172 @@ export class TextProcessor {
     return results;
   }
 
-  // ==================== RENDERING ====================
+  /**
+   * Robust extraction of numbered lines from LLM batch response.
+   *
+   * CRITICAL: MUST return exactly `expectedCount` lines, one per input unit.
+   * Paragraph boundaries (from pipeline) MUST be preserved — never merge
+   * adjacent units even if LLM returns merged text.
+   *
+   * Supports multiple LLM response formats:
+   *   - `[#1] text` (our preferred format, sent in chunkText)
+   *   - `1. text` / `1) text` / `[1] text` (LLM may use these alternatives)
+   *   - `1: text`
+   *
+   * Algorithm:
+   *   1. Find all numbered markers in the response (any of the formats above).
+   *   2. Sort by their index N.
+   *   3. If a marker N is missing → fall back to original text for that slot.
+   *   4. If a marker N has multi-line content → join with single space
+   *      (so LLM's internal newlines don't create false paragraph breaks).
+   *   5. If multiple markers reference the same N → use the first one.
+   *   6. Truncate / pad to exactly expectedCount.
+   */
+  public async extractNumberedLines(raw: string, expectedCount: number, originals: string[]): Promise<string[]> {
+    return this.extractNumberedLinesRobust(raw, expectedCount, originals);
+  }
+
+  private async extractNumberedLinesRobust(raw: string, expectedCount: number, originals: string[]): Promise<string[]> {
+    // ── FIX #1: Strip markdown code block wrapper ──────────────────────
+    // LLMs often wrap responses in ``` or ```json blocks. Without stripping,
+    // the last segment captures trailing ``` as part of its content.
+    let cleanedRaw = raw.replace(/\r\n/g, '\n').trim();
+    if (cleanedRaw.startsWith('```')) {
+      // Remove opening ``` (optionally followed by language tag like "json")
+      cleanedRaw = cleanedRaw.replace(/^```[a-zA-Z]*\n?/, '');
+      // Remove closing ```
+      cleanedRaw = cleanedRaw.replace(/\n?```$/, '');
+      cleanedRaw = cleanedRaw.trim();
+    }
+
+    // ── FIX #2: Line-by-line parsing instead of one big regex ──────────
+    // The previous single-regex approach had a bug: when [#1] had empty content
+    // immediately followed by [#2], the regex's lazy [\s\S]*? with lookahead
+    // could swallow [#2] as content of #1. Line-by-line is more predictable.
+    //
+    // FIX C3: Only match [#N] format (our preferred, unambiguous).
+    // Previous regex also matched [N], N., N), N: — but these are common in
+    // numbered lists INSIDE translations (e.g., "Steps: 1. Open 2. Edit 3. Save").
+    // When a translation contains a numbered list, each list item was parsed as
+    // a new marker, truncating the translation and mixing content with subsequent segments.
+    // [#N] is unambiguous because it's never used in natural text.
+    const markerLineRegex = /^\s*\[#(\d+)\]\s*(.*)$/;
+
+    const found: Map<number, string> = new Map();
+    let currentIdx = -1;
+    let currentText = '';
+
+    const flushCurrent = () => {
+      if (currentIdx >= 0 && currentIdx < expectedCount) {
+        // T5.3 (table support): line structure of a translation is now
+        // PRESERVED through this parser. Multi-line content is joined
+        // with '\n' (not ' '), and `<br>` tags from the model's echo are
+        // KEPT — the caller (executeTranslation) applies the per-segment
+        // policy (isTableLikeText / preserveSourceLineBreaks) and either
+        // keeps the structure or collapses it. Previously this stripped
+        // <br> and space-joined everything, flattening table rows.
+        const trimmed = currentText
+          .replace(/[ \t]+\n/g, '\n')
+          .replace(/\n[ \t]+/g, '\n')
+          .trim();
+        if (trimmed.length > 0 && !found.has(currentIdx)) {
+          found.set(currentIdx, trimmed);
+        }
+      }
+      currentIdx = -1;
+      currentText = '';
+    };
+
+    const lines = cleanedRaw.split('\n');
+    for (const line of lines) {
+      const m = line.match(markerLineRegex);
+      if (m) {
+        // New marker — flush previous segment
+        flushCurrent();
+        // FIX C3: strict regex only has one capture group (the number)
+        const numStr = m[1];
+        currentIdx = parseInt(numStr, 10) - 1;  // 0-based
+        currentText = m[2] || '';
+      } else {
+        // Continuation line — append to current segment, PRESERVING the
+        // model's line break as '\n' (see flushCurrent note above).
+        if (currentIdx >= 0) {
+          currentText += '\n' + line.trim();
+        }
+        // If currentIdx < 0, this is preamble before any marker — ignore.
+      }
+    }
+    // Flush last segment
+    flushCurrent();
+
+    // FIX C3: mandatory warning if no [#N] markers found — indicates LLM ignored
+    // prompt format instructions or prompt template is broken. Without this warning,
+    // all segments silently fall back to originals and user sees "✓ Translation complete".
+    if (found.size === 0 && expectedCount > 0) {
+      console.warn('[extractNumberedLinesRobust] No [#N] markers found in LLM response. ' +
+        'All segments will fall back to original text. Check prompt template format. ' +
+        `Response preview: ${cleanedRaw.substring(0, 200)}...`);
+    }
+
+    // Build result array — fill missing slots with originals (fallback)
+    const result: string[] = [];
+    for (let i = 0; i < expectedCount; i++) {
+      const translated = found.get(i);
+      if (translated && translated.length > 0) {
+        result.push(translated);
+      } else {
+        // LLM didn't return this segment — fall back to original text
+        // (better than "Translation missing" because it preserves content).
+        if (this.plugin.settings.debugMode) {
+          console.warn(`[extractNumberedLinesRobust] Segment #${i + 1} missing in LLM response, falling back to original.`);
+        }
+        result.push(originals[i] || 'Translation missing');
+      }
+    }
+
+    return result;
+  }
+
+  private restoreStructure(units: TranslationUnit[], lines: string[]): string[] {
+    return lines.map((line, i) => {
+      const orig = units[i]?.text || '';
+      // Preserve leading numbering/bullets that may have been stripped.
+      // T5.3: whitespace cleanup is intentionally NOT done here anymore —
+      // the per-segment line-break policy in executeTranslation (collapse
+      // vs preserve) owns it, and table-like segments must keep <br>/\n.
+      const firstLine = line.split(/\r?\n/)[0] ?? line;
+      const origLead = orig.match(/^\s*(\d+[\.\)]\s*|[-•*]\s*|#\s*)/);
+      if (origLead && !firstLine.match(/^\s*(\d+[\.\)]\s*|[-•*]\s*|#\s*)/)) {
+        return origLead[1] + line;
+      }
+      return line;
+    });
+  }
+
+  // ==================== OVERLAY RENDERING ====================
+
+  // FIX H10: derive the PDF file from a page element instead of calling
+  // getActiveFile(). This prevents stale-file bugs when the user switches
+  // tabs during an async translation operation.
+  private getFileFromPageElement(pageElement: HTMLElement): TFile | null {
+    // Walk up the DOM to find the workspace leaf container
+    const leafContent = pageElement.closest('.workspace-leaf-content[data-type="pdf"]') as HTMLElement | null;
+    if (!leafContent) {
+      // Fallback to getActiveFile if we can't find the leaf
+      const fallback = this.plugin.app.workspace.getActiveFile();
+      return (fallback && fallback.extension === 'pdf') ? fallback : null;
+    }
+
+    // Find the leaf by matching the container element
+    let resultFile: TFile | null = null;
+    this.plugin.app.workspace.iterateAllLeaves((leaf: any) => {
+      if (resultFile) return;
+      if (leaf.view?.getViewType?.() === 'pdf' && leaf.view.containerEl === leafContent) {
+        resultFile = leaf.view.file || null;
+      }
+    });
+    return resultFile;
+  }
 
   private renderOverlay(
     units: TranslationUnit[],
@@ -741,62 +904,61 @@ export class TextProcessor {
     overlayContainer: HTMLElement,
     pageElement: HTMLElement
   ) {
-    const engine = this.plugin.settings.layoutEngine;
-
-    // ----- EXTERNAL LAYOUT (python) -----
-    if (engine === 'python') {
+    // ── CACHED LAYOUT PATH ──────────────────────────────────────────
+    // If units came from cache (have _externalRect), use renderSavedOverlay
+    // which positions overlays by relativeRect (no DOM spans needed).
+    // P0-2: removed `(u: any)` cast — `_externalRect` is now declared on
+    // TranslationUnit in types.ts so TypeScript narrows correctly.
+    const hasCachedUnits = units.some(u => !!u._externalRect);
+    if (hasCachedUnits) {
       const pageNumber = parseInt(pageElement.getAttribute('data-page-number') || '0', 10);
-      const activeFile = this.plugin.app.workspace.getActiveFile();
+      // FIX H10: don't use getActiveFile() — if user switched tabs between
+      // createOverlayWithText() start and this point, wrong file would be saved.
+      // Instead, derive the file from the page element's closest PDF viewer leaf.
+      const activeFile = this.getFileFromPageElement(pageElement);
 
       const overlayData: OverlayPositionData[] = units
-        .map((unit: any, index) => {
+        .map((unit, index) => {
           const extRect = unit._externalRect;
           const extFont = unit._externalFont;
           if (!extRect) return null;
-
-          // Guard against degenerate / out-of-range rects from the layout source.
-          // These previously rendered as zero-size boxes pinned to the bottom-right.
-          const { l, t, w, h } = extRect;
-          const valid =
-            Number.isFinite(l) && Number.isFinite(t) &&
-            Number.isFinite(w) && Number.isFinite(h) &&
-            w > 0.001 && h > 0.001 &&        // has real area (normalized units)
-            l >= -0.01 && t >= -0.01 &&       // not off the top-left
-            l <= 1.01 && t <= 1.01;           // origin within the page
-          if (!valid) {
-            this.plugin.logDebug(`Dropping degenerate external rect for segment ${index}:`, extRect);
-            return null;
+          try {
+            // T2.5: single construction site (id + engine stamped inside).
+            return makeOverlay({
+              page: pageNumber,
+              rect: { left: extRect.l, top: extRect.t, width: extRect.w, height: extRect.h },
+              text: unit.text,
+              translated: translatedLines[index] || unit.text,
+              fontFamily: extFont?.family,
+              fontSize: extFont?.size,
+              originalFontSizes: extFont?.sizes || [],
+              engine: getCurrentEngine(this.plugin),
+            });
+          } catch {
+            return null; // invalid rect — skip this unit (factory invariant)
           }
-
-          return {
-            selector: '',
-            textContent: unit.text,
-            page: pageNumber,
-            translatedText: translatedLines[index] || unit.text,
-            relativeRect: {
-              left: extRect.l,
-              top: extRect.t,
-              width: extRect.w,
-              height: extRect.h
-            },
-            fontSize: extFont?.size,
-            fontFamily: extFont?.family,
-            originalFontSizes: extFont?.sizes || [],
-          } as OverlayPositionData;
         })
         .filter((x): x is OverlayPositionData => x !== null);
 
       this.plugin.overlay.renderSavedOverlay(overlayData, pageNumber);
 
-      if (this.plugin.settings.autoSaveOverlay && activeFile) {
+      if (this.plugin.settings.autoSaveOverlay && activeFile && !this.lastRunDegraded) {
         this.plugin.storage
-          .updatePageOverlaysAndWrite(activeFile, { [pageNumber]: overlayData })
-          .catch(err => console.error("Failed to auto-save translation:", err));
+          .updatePageOverlaysAndWrite(activeFile, { [pageNumber]: overlayData }, { replace: true })
+          // Phase 2 (P1-19): the manual `cachedOverlayData.pageOverlays[pageNumber]
+          // = overlayData` patch that lived in this `.then()` was redundant —
+          // `updatePageOverlaysAndWrite` already calls `updateCacheFromWrite`
+          // after the write resolves, which is the single source of truth for
+          // the renderer's in-memory cache. The manual patch was a double-write
+          // that could diverge from disk on overlap-merge with stale items.
+          .catch((err: any) => console.error('Failed to auto-save translation:', err));
       }
       return;
     }
 
-    // ----- INTERNAL LAYOUT (DOM) -----
+    // ── DOM LAYOUT PATH ─────────────────────────────────────────────
+    // Reassemble sentence-split units by paragraphId, then render via
+    // renderOverlays (which needs originalSpans for positioning).
     const reassembledParagraphs = new Map<string, { originalSpans: HTMLSpanElement[]; translatedText: string; originalText: string; }>();
     units.forEach((unit, index) => {
       const { paragraphId, originalSpans } = unit;
@@ -835,7 +997,8 @@ export class TextProcessor {
       if (!lines.has(lineKey)) lines.set(lineKey, []);
       lines.get(lineKey)!.push(span);
     });
-    return Array.from(lines.entries())
+
+    const sortedLines = Array.from(lines.entries())
       .sort((a, b) => a[0] - b[0])
       .map(([_, lineSpans]) =>
         lineSpans
@@ -849,8 +1012,56 @@ export class TextProcessor {
             return content;
           })
           .join(' ')
-      )
-      .join('<br>');
+      );
+
+    // FIX (v5): smart line break preservation.
+    // Even when preserveSourceLineBreaks=false (default, better for prose),
+    // we preserve <br> for table-like paragraphs where each line has < 5 words
+    // and there are >= 3 such short lines. This prevents table rows / list
+    // items from collapsing into one continuous line:
+    //   "item1<br>item2<br>item3" instead of "item1 item2 item3"
+    //
+    // Detection:
+    //   - Split each line by whitespace, count words
+    //   - If >= 3 lines with 1-4 words each → table-like → use <br>
+    //   - Otherwise → prose → use space (unless preserveSourceLineBreaks=true)
+    const shouldUseBreaks = this.shouldPreserveLineBreaks(sortedLines);
+
+    return sortedLines.join(shouldUseBreaks ? '<br>' : ' ');
+  }
+
+  /**
+   * FIX (v5): Detect table-like paragraphs that need <br> preservation.
+   *
+   * Rule (per user spec): if a paragraph has 2+ non-empty lines and EACH
+   * non-empty line has < 5 words → preserve <br>. This catches:
+   *   - 2-row tables: "DSH 10<br>FS 14"
+   *   - 3+ row tables: "item1<br>item2<br>item3"
+   *   - Reference lists: "22,25<br>10-12<br>3,18,22,25"
+   *   - Short labels: "a<br>b<br>c<br>d"
+   *
+   * Without this, these collapse into one line when preserveSourceLineBreaks=false,
+   * making tables unreadable.
+   *
+   * "Each line < 5 words" is the only criterion — no minimum line count
+   * beyond 2 (a 1-line paragraph has nothing to join, so the question is moot).
+   */
+  private shouldPreserveLineBreaks(lines: string[]): boolean {
+    // If user explicitly enabled preserveSourceLineBreaks, always use <br>
+    if (this.plugin.settings.preserveSourceLineBreaks) return true;
+
+    // Collect non-empty lines
+    const nonEmptyLines = lines.filter(l => l.trim());
+    if (nonEmptyLines.length < 2) return false;  // need at least 2 lines
+
+    // Check that EVERY non-empty line has < 5 words
+    for (const line of nonEmptyLines) {
+      const wordCount = line.trim().split(/\s+/).filter(Boolean).length;
+      if (wordCount >= 5) return false;  // found a long line → not table-like
+    }
+
+    // All lines have < 5 words → table-like → preserve <br>
+    return true;
   }
 
   private escapeHtml(text: string): string {
@@ -865,7 +1076,14 @@ export class TextProcessor {
     const rect = this.getBoundingClientRectCached(span);
     const text = (span.textContent || '').trim();
     if (rect.width <= 1 || rect.height <= 1 || !text) return false;
-    if (/^\d{1,3}$/.test(text)) return false;
+    // VERIFICATION FIX (user-requested audit): the old `/^\d{1,3}$/` test
+    // dropped EVERY standalone 1-3 digit span — including numbers that
+    // pdf.js emits as separate spans MID-SENTENCE ("Figure [123] shows…").
+    // Those digits were silently deleted from the translated text. Page
+    // numbers are now handled the same way on every path: the layout
+    // pipeline gives them their own spatially-isolated paragraph and the
+    // paragraph-filter rule `^\d{1,4}$` (whole-text anchored, see
+    // paragraph-filter.ts) keeps them out of the LLM call.
     if (text.length === 1 && /[•\-»«]/.test(text)) return false;
     if (text.startsWith('http')) return false;
     return true;
@@ -898,7 +1116,6 @@ export class TextProcessor {
   private clearCaches(): void {
     this.measurementCache.clear();
     this.styleCache.clear();
-    if (this.colorDistanceCache.size > 1000) this.colorDistanceCache.clear();
   }
 
   public getSpansBbox(spans: HTMLSpanElement[], pageElement: HTMLElement) {
@@ -931,10 +1148,19 @@ export class TextProcessor {
     this.clearLayoutDebugOverlay();
     this.clearCaches();
     this.translationFailures = [];
-    this.lastColumnAnalysis = null;
-    this.lastPreparedUnits = null;
-    this.externalLayoutService.clearCache();
-    this.ocrLayoutService.clearCache();
+    // FIX D4: lastPreparedUnits removed — no global state to clear.
+  }
+
+  // FIX H9: remove a single overlay container from both DOM and the tracking array.
+  // Without this, overlayContainers grows unbounded — detached DOM subtrees retained
+  // forever until cleanup() is called (plugin reload). Call this instead of
+  // container.remove() when removing an overlay.
+  public removeOverlayContainer(container: HTMLElement): void {
+    const idx = this.overlayContainers.indexOf(container);
+    if (idx >= 0) {
+      this.overlayContainers.splice(idx, 1);
+    }
+    container.remove();
   }
 
   private clearLayoutDebugOverlay(pageElement?: HTMLElement): void {
@@ -973,32 +1199,10 @@ export class TextProcessor {
     const layer = document.createElement('div');
     layer.className = 'pdf-layout-debug-overlay';
     layer.style.cssText = [
-      'position:absolute',
-      'left:0',
-      'top:0',
-      'width:100%',
-      'height:100%',
-      'pointer-events:none',
-      'z-index:140'
+      'position:absolute', 'left:0', 'top:0', 'width:100%', 'height:100%',
+      'pointer-events:none', 'z-index:140'
     ].join(';');
 
-    // Draw detected strip regions (likely separators).
-    for (const strip of strips) {
-      const stripEl = document.createElement('div');
-      stripEl.style.cssText = [
-        'position:absolute',
-        `left:${toLocalX(strip.left).toFixed(3)}%`,
-        `top:${toLocalY(strip.top).toFixed(3)}%`,
-        `width:${toLocalW(Math.max(0, strip.right - strip.left)).toFixed(3)}%`,
-        `height:${toLocalH(Math.max(0, strip.bottom - strip.top)).toFixed(3)}%`,
-        'background:rgba(255,80,80,0.14)',
-        'border:1px dashed rgba(255,70,70,0.85)',
-        'box-sizing:border-box'
-      ].join(';');
-      layer.appendChild(stripEl);
-    }
-
-    // Draw detected layout regions (complex layout segmentation).
     for (const region of layoutRegions) {
       const regionEl = document.createElement('div');
       regionEl.style.cssText = [
@@ -1014,7 +1218,6 @@ export class TextProcessor {
       layer.appendChild(regionEl);
     }
 
-    // Draw detected columns.
     for (const col of columnAnalysis.columns || []) {
       const colEl = document.createElement('div');
       colEl.style.cssText = [
@@ -1030,15 +1233,12 @@ export class TextProcessor {
       layer.appendChild(colEl);
     }
 
-    // Draw vertical gap center lines.
     for (const gx of columnAnalysis.verticalGaps || []) {
       const line = document.createElement('div');
       line.style.cssText = [
         'position:absolute',
         `left:${toLocalX(gx).toFixed(3)}%`,
-        'top:0',
-        'width:0',
-        'height:100%',
+        'top:0', 'width:0', 'height:100%',
         'border-left:2px solid rgba(255,170,0,0.9)'
       ].join(';');
       layer.appendChild(line);

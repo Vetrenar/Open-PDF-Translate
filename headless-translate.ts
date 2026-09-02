@@ -17,6 +17,14 @@
 import { Notice, TFile } from 'obsidian';
 import type OpenRouterTranslatorPlugin from './main';
 import { SavedOverlay, OverlayPositionData } from './types';
+// P0-1 (Phase 1): static import replaces runtime `require('./paragraph-filter')`,
+// which throws `ReferenceError: require is not defined` on mobile (Obsidian's
+// mobile runtime has no CommonJS shim). The background watcher path runs on
+// mobile too, so this was crashing every auto-enqueued watcher job there.
+// T2.5: THE single construction site for saved overlay records.
+import { makeOverlay } from './overlay-factory';
+import { getCurrentEngine } from './overlay-id';
+import { compileRules, filterParagraphs } from './paragraph-filter';
 
 export interface HeadlessResult {
     ok: boolean;
@@ -33,7 +41,15 @@ export class HeadlessTranslator {
         this.plugin = plugin;
     }
 
-    cancel() { this.cancelled = true; }
+    cancel() {
+        this.cancelled = true;
+        // T1.2: propagation into pdfLayoutQueue.cancel() was REMOVED.
+        // Cancellation now travels through the OWNED token passed to
+        // translateTextsWithChunking below; the old shared global flag is
+        // what let a python-engine cancel kill unrelated internal-queue
+        // work (and, via the old global probes in processing.ts, manual
+        // translations — see T1.1/T1.2).
+    }
 
     /** Preconditions for headless mode (python engine + script + interpreter). */
     canRun(): { ok: boolean; reason?: string } {
@@ -56,9 +72,40 @@ export class HeadlessTranslator {
     /**
      * Translate one PDF headlessly and write its .translations.md.
      * Skips files that already have a translation unless force=true.
+     *
+     * FIX E1 (incremental save): previously this method accumulated ALL
+     * pages in a single `pageOverlays` object and wrote the file ONCE at
+     * the end via `writeSavedOverlayForFile`. If the process crashed mid-way
+     * (or the user cancelled), ALL translated pages were lost.
+     *
+     * Now: each successfully-translated page is persisted immediately via
+     * `updatePageOverlaysAndWrite` (read-modify-write merge). A crash only
+     * loses the in-flight page; all previously-saved pages are on disk.
+     *
+     * FIX H-1: Previously this method processed pages strictly sequentially.
+     * The `backgroundTranslationConcurrency` setting was being ignored in the
+     * headless path — it was only honoured by the internal-engine PdfLayoutQueue.
+     * Now we run N page-translation tasks in parallel (default 3), where N is
+     * `plugin.settings.backgroundTranslationConcurrency` clamped to 1–8.
+     *
+     * Layout extraction itself stays sequential (PyMuPDF can't be safely called
+     * in parallel from the same script instance), but the LLM calls — which
+     * dominate wall-clock time — run concurrently.
      */
     async translateFile(pdf: TFile, opts: { force?: boolean; silent?: boolean } = {}): Promise<HeadlessResult> {
         this.cancelled = false;
+        // Phase 11 (fix Phase 9 regression): the previous `cancel()` call (from
+        // Pause/Cancel UI or watcher.stop()) also flipped
+        // `pdfLayoutQueue.cancelled = true` via `cancelRunning()` →
+        // `HeadlessTranslator.cancel()` → `pdfLayoutQueue.cancel()`. Without
+        // an explicit `resume()` here, the very next `translateFile` call would
+        // hit `pdfLayoutQueue.isCancelled()` checks inside the shared
+        // `performChunkedTranslation` / `performSequentialTranslation` /
+        // `translateTextsWithChunking` utilities and fail-fast with a misleading
+        // "cancelled" error — even though the user had just started a fresh
+        // translation. `resume()` is a guarded no-op if the queue wasn't
+        // cancelled, so this is always safe to call.
+        this.plugin.pdfLayoutQueue?.resume?.();
         const pre = this.canRun();
         if (!pre.ok) return { ok: false, pages: 0, segments: 0, error: pre.reason };
 
@@ -68,65 +115,222 @@ export class HeadlessTranslator {
             if (existing) return { ok: true, pages: 0, segments: 0, error: 'already translated' };
         }
 
-        // 1) Headless layout extraction (PyMuPDF, no DOM).
+        // FIX H4: use PdfLayoutQueue.withFileLock to serialize with interactive translation.
+        // Without this, headless (watcher) and interactive translation on the same PDF
+        // would race on .translations.md writes, potentially losing data.
+        return this.plugin.pdfLayoutQueue.withFileLock(pdf.path, async () => {
+            return this._translateFileLocked(pdf, opts);
+        });
+    }
+
+    private async _translateFileLocked(pdf: TFile, opts: { force?: boolean; silent?: boolean } = {}): Promise<HeadlessResult> {
+        // 1) Headless layout extraction (PyMuPDF, no DOM) — sequential.
         this.plugin.processor.externalLayoutService.clearCache(pdf.path);
         const layout = await this.plugin.processor.externalLayoutService.generateLayout(pdf);
         if (!layout) return { ok: false, pages: 0, segments: 0, error: 'layout extraction failed' };
         if (this.cancelled) return { ok: false, pages: 0, segments: 0, error: 'cancelled' };
 
-        // 2) Translate + build overlay data per page.
-        const pageOverlays: Record<string, OverlayPositionData[]> = {};
+        // 2) Translate pages in parallel (LLM calls dominate wall-clock time).
+        const concurrency = Math.max(1, Math.min(8, this.plugin.settings.backgroundTranslationConcurrency || 3));
+
+        // Build a list of (pageNum, usable items) pairs to translate.
+        const pageNumbers = Object.keys(layout).map(Number).sort((a, b) => a - b);
+        const work: Array<{ pageNum: number; usable: any[] }> = [];
+        for (const pageNum of pageNumbers) {
+            const items = layout[String(pageNum)] || [];
+            const usable = items.filter((it: any) => it.text?.trim() && this.validRect(it.rect));
+            if (usable.length > 0) work.push({ pageNum, usable });
+        }
+
+        if (work.length === 0) {
+            return { ok: false, pages: 0, segments: 0, error: 'no translatable text (is this a scan? use OCR)' };
+        }
+
         let pageCount = 0;
         let segCount = 0;
+        let lastNoticeAt = 0;
 
-        const pageNumbers = Object.keys(layout).map(Number).sort((a, b) => a - b);
-        for (const pageNum of pageNumbers) {
+        // Process work items in parallel chunks of size `concurrency`.
+        // Each chunk awaits all its tasks before starting the next chunk.
+        const delayMs = this.plugin.settings.sequentialDelayMs ?? 150;
+        for (let i = 0; i < work.length; i += concurrency) {
             if (this.cancelled) break;
-            const items = layout[String(pageNum)] || [];
-            const usable = items.filter(it => it.text?.trim() && this.validRect(it.rect));
-            if (usable.length === 0) continue;
 
-            // Batch-translate this page's segments, index-aligned.
-            const fullText = usable.map((u, i) => `[#${i + 1}] ${u.text}`).join('\n');
-            let translated: string[];
-            try {
-                const raw = await this.plugin.translation.translateBatch(fullText, usable.length);
-                translated = await this.plugin.processor.extractNumberedLines(raw, usable.length, usable.map(u => u.text));
-            } catch (e: any) {
-                // Fall back to originals for this page rather than aborting the file.
-                translated = usable.map(u => u.text);
-            }
+            const chunk = work.slice(i, i + concurrency);
+            const results = await Promise.allSettled(chunk.map(async ({ pageNum, usable }) => {
+                // Stage 2.4: apply paragraph filter rules. Paragraphs matching
+                // a filter rule are NOT sent to the LLM — they use their
+                // original text as the "translation". This saves API costs on
+                // page numbers, single letters, etc.
+                let translatableUsable = usable;
+                const skippedByFilter = new Set<number>();  // indices into `usable`
+                const filterRules = this.plugin.settings.paragraphFilterRules;
+                if (filterRules && filterRules.length > 0) {
+                    const compiled = compileRules(filterRules);
+                    if (compiled.length > 0) {
+                        const texts = usable.map((u: any) => u.text);
+                        const { translatable, skipped } = filterParagraphs(texts, compiled);
+                        if (skipped.size > 0) {
+                            translatableUsable = translatable.map(i => usable[i]);
+                            for (const [localIdx] of skipped) {
+                                skippedByFilter.add(localIdx);
+                            }
+                        }
+                    }
+                }
 
-            const overlays: OverlayPositionData[] = usable.map((it, i) => ({
-                selector: '',
-                textContent: it.text,
-                relativeRect: { left: it.rect.l, top: it.rect.t, width: it.rect.w, height: it.rect.h },
-                page: pageNum,
-                translatedText: translated[i] || it.text,
-                fontSize: it.fontSize,
-                fontFamily: it.fontFamily,
-                originalFontSizes: it.originalFontSizes || [],
+                // If all paragraphs were filtered, skip LLM call entirely.
+                if (translatableUsable.length === 0) {
+                    const overlays: OverlayPositionData[] = [];
+                    for (const it of usable) {
+                        try {
+                            overlays.push(makeOverlay({
+                                page: pageNum,
+                                rect: { left: it.rect.l, top: it.rect.t, width: it.rect.w, height: it.rect.h },
+                                text: it.text,
+                                translated: it.text, // filter-skipped → original text
+                                fontFamily: it.fontFamily,
+                                fontSize: it.fontSize,
+                                originalFontSizes: it.originalFontSizes || [],
+                                engine: getCurrentEngine(this.plugin),
+                            }));
+                        } catch { /* invalid rect — skip */ }
+                    }
+                    if (overlays.length > 0) {
+                        // T-FULLPAGE-OVERWRITE: complete page state → replace.
+                        await this.plugin.storage.updatePageOverlaysAndWrite(pdf, { [pageNum]: overlays }, { replace: true });
+                    }
+                    return { pageNum, count: overlays.length };
+                }
+
+                // Batch-translate this page's segments, index-aligned.
+                // FIX H2: use the shared chunking utility instead of a direct
+                // `translateBatch(fullText, count)` call. Previously this path
+                // sent an entire page (potentially 10K+ chars) in a single API
+                // call — on small-context providers (e.g. Ollama at 4K) that
+                // exceeded the context window and silently fell back to
+                // originals. The utility splits by `maxBatchChars` + provider
+                // `contextWindow`, translates chunks sequentially while
+                // preserving order, and absorbs per-chunk failures internally
+                // (failed chunks revert to originals; other chunks still
+                // return their translations). The outer try/catch below now
+                // only triggers on catastrophic failure (all chunks failed,
+                // network down, or `cancelled` thrown between chunks).
+                let translated: string[];
+                let translationFailed = false;
+                let failureReason = '';
+                try {
+                    const translatableTexts = translatableUsable.map((u: any) => u.text);
+                    // T1.2: pass THIS translator's own cancellation token (was: implicit global
+                    // queue-flag probing inside processing.ts).
+                    translated = await this.plugin.processor.translateTextsWithChunking(translatableTexts, {
+                        isCancelled: () => this.cancelled,
+                    });
+                } catch (e: any) {
+                    // Fall back to originals for this page rather than aborting the file.
+                    translationFailed = true;
+                    failureReason = e?.message ?? String(e);
+                    console.warn(`[HeadlessTranslator] page ${pageNum} translation failed, using original text:`, failureReason);
+                    translated = translatableUsable.map((u: any) => u.text);
+                }
+
+                // FIX E3: filter out overlays with neither original text nor translation.
+                // This prevents creating empty-ot overlays that trigger parser bugs.
+                //
+                // Phase 15.5: the previous `[⚠ untranslated] ` marker prefix has been
+                // REMOVED — it leaked into the rendered overlay and into the
+                // persisted .translations.md, where the leading `[` made the
+                // first line look like a Markdown task-list item and broke some
+                // downstream parsers. The fallback to original text is still
+                // preserved below; only the visible marker is gone. A Notice
+                // (Phase 15.6) tells the user the page fell back.
+                if (translationFailed) {
+                    new Notice(
+                        `[p${pageNum}] Translation failed: ${failureReason.length > 80 ? failureReason.substring(0, 77) + '...' : failureReason}\n` +
+                        `Translation completed. Some pages fell back to original text.`,
+                        8000,
+                    );
+                }
+
+                // Stage 2.4: build overlays for ALL usable items (translatable +
+                // filter-skipped). Translatable items get the LLM translation;
+                // filter-skipped items get their original text.
+                const overlays: OverlayPositionData[] = [];
+                for (let idx = 0; idx < usable.length; idx++) {
+                    const it = usable[idx];
+                    const orig = (it.text || '').trim();
+                    if (!orig) continue;  // skip empty
+
+                    let tr: string;
+                    if (skippedByFilter.has(idx)) {
+                        // Filter-skipped paragraph — use original text
+                        tr = orig;
+                    } else {
+                        // Translated paragraph — find its position in the
+                        // translatableUsable array to get the right translation.
+                        const transIdx = translatableUsable.indexOf(it);
+                        tr = (translated[transIdx] || '').trim();
+                    }
+
+                    try {
+                        overlays.push(makeOverlay({
+                            page: pageNum,
+                            rect: { left: it.rect.l, top: it.rect.t, width: it.rect.w, height: it.rect.h },
+                            text: it.text,
+                            translated: tr || it.text,
+                            fontFamily: it.fontFamily,
+                            fontSize: it.fontSize,
+                            originalFontSizes: it.originalFontSizes || [],
+                            engine: getCurrentEngine(this.plugin),
+                        }));
+                    } catch { /* invalid rect — skip */ }
+                }
+
+                // FIX E1: incremental save via updatePageOverlaysAndWrite (read-modify-write).
+                // Previously: accumulated all pages and wrote once at end → crash = total loss.
+                // Now: each page is persisted immediately; crash only loses the in-flight page.
+                if (overlays.length > 0) {
+                    // T-FULLPAGE-OVERWRITE: complete page state → replace.
+                    await this.plugin.storage.updatePageOverlaysAndWrite(pdf, { [pageNum]: overlays }, { replace: true });
+                }
+
+                return { pageNum, count: overlays.length };
             }));
 
-            pageOverlays[String(pageNum)] = overlays;
-            pageCount++;
-            segCount += overlays.length;
-            if (!opts.silent) new Notice(`[bg] ${pdf.basename}: page ${pageNum}`, 1200);
+            // Collect results (in chunk order, which preserves overall page order
+            // since chunks are processed left-to-right).
+            for (const r of results) {
+                if (r.status === 'fulfilled') {
+                    pageCount++;
+                    segCount += r.value.count;
+                } else {
+                    // Should not happen — extractNumberedLines / fallback above
+                    // catches its own errors. But if something escaped, log it.
+                    console.error('[HeadlessTranslator] chunk task rejected:', r.reason);
+                }
+            }
+
+            // Throttle notices to one per 1.5s so big PDFs don't spam the UI.
+            const now = Date.now();
+            if (!opts.silent && now - lastNoticeAt > 1500) {
+                lastNoticeAt = now;
+                new Notice(`[bg] ${pdf.basename}: ${pageCount}/${work.length} pages`, 1500);
+            }
+
+            // FIX: respect sequentialDelayMs between page chunks (rate-limit friendly).
+            // When concurrency > 1, pages within a chunk run in parallel — the delay
+            // applies BETWEEN chunks (sequential), not within. When concurrency = 1,
+            // this effectively adds delay between every page.
+            if (i + concurrency < work.length && delayMs > 0) {
+                await new Promise(r => setTimeout(r, delayMs));
+            }
         }
 
         if (pageCount === 0) {
             return { ok: false, pages: 0, segments: 0, error: 'no translatable text (is this a scan? use OCR)' };
         }
 
-        // 3) Write .translations.md (headless; no viewer needed).
-        const savedOverlay: SavedOverlay = {
-            fileName: pdf.name,
-            filePath: pdf.path,
-            timestamp: Date.now(),
-            pageOverlays,
-        };
-
-        await this.plugin.storage.writeSavedOverlayForFile(pdf, savedOverlay);
+        // FIX E1: file was already saved incrementally — no final write needed.
         return { ok: true, pages: pageCount, segments: segCount };
     }
 }

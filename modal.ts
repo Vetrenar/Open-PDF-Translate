@@ -1,24 +1,44 @@
 // modal.ts
-import { Modal, Setting, Notice, ButtonComponent, TFile } from 'obsidian';
+// ─────────────────────────────────────────────────────────────────────────
+// MIGRATED: TranslateMultiplePagesModal is now a thin wrapper over
+// PdfLayoutQueue (background worker pipeline).
+//
+// Previously: full DOM-based pipeline (~520 lines) that navigated pages,
+// waited for text layers, called translatePageContent + createOverlayWithText
+// per page, verified overlays, and saved. Required the PDF to be open and
+// blocked the UI during translation.
+//
+// Now: enqueues a page range into PdfLayoutQueue and subscribes to its
+// onChange for live progress. The worker handles extraction+translation+save
+// in the background. The PDF does NOT need to be open. The modal can be
+// closed without aborting the translation — the queue continues running.
+//
+// Removed features:
+//   - Time-window pacing (worker uses concurrency + sequentialDelayMs instead)
+//   - Per-page retry with exponential backoff (TranslationEngine handles retries)
+//   - DOM navigation / waitForPageAndTextLayer (worker reads bytes directly)
+//   - Overlay verification (worker writes verified data via updatePageOverlaysAndWrite)
+//   - Translation cache (worker doesn't re-translate cached pages)
+//
+// Phase 14 (C14): now extends `SingletonModal<TranslateMultiplePagesModal>`
+// instead of `Modal`. SingletonModal tracks open instances per subclass and
+// either replaces or focuses the existing instance when a second `open()` is
+// called. This eliminates the previous static `isBulkTranslationInProgress` /
+// `currentInstance` fields, which duplicated that responsibility (and could
+// get out of sync with the queue's actual state).
+//
+// Translation-in-progress detection now consults `pdfLayoutQueue` directly:
+//   - "Is a translation running?" → `queue.isRunning() || state.totalPending > 0`
+//   - "Which file is being translated?" → first file in `state.files` with
+//     any non-done task.
+// ─────────────────────────────────────────────────────────────────────────
+
+import { Setting, Notice, ButtonComponent, TFile } from 'obsidian';
 import { t } from './i18n';
 import OpenRouterTranslatorPlugin from './main';
+import { SingletonModal } from './modal-base';
 
-/**
- * A modal for translating a range of pages within a PDF file.
- *
- * This modal implements a robust translation workflow with the following features:
- * - **Translation Caching:** Temporarily stores successful translations to prevent data loss on overlay creation failure.
- * - **Overlay Verification:** Explicitly checks that the created overlay contains the translated text, triggering a retry if it doesn't.
- * - **Optional Paced Distribution:** Users can optionally define a time window. If set,
- *   the translation calls are evenly distributed from the start to fit within that
- *   time, preventing API rate-limiting. If not set, it runs as fast as possible.
- * - **Adaptive Retries:** Handles transient network errors with an exponential backoff strategy.
- * - **Clear UI Feedback:** Provides detailed progress updates to the user.
- * - **Singleton Job Management:** Prevents multiple bulk translation jobs from running simultaneously,
- *   and provides an interface to manage the running job.
- */
-export class TranslateMultiplePagesModal extends Modal {
-    // Plugin and File Context
+export class TranslateMultiplePagesModal extends SingletonModal<TranslateMultiplePagesModal> {
     plugin: OpenRouterTranslatorPlugin;
     file: TFile;
 
@@ -26,33 +46,77 @@ export class TranslateMultiplePagesModal extends Modal {
     startPage: number = 1;
     endPage: number = 1;
     totalPages: number = 1;
-    useTimeWindow: boolean = false;
-    timeWindowHours: number = 2; // Default time window of 2 hours
 
-    // Internal state management
-    isProcessing: boolean = false;
-    isCancelled: boolean = false;
-    activeOverlays: HTMLElement[] = [];
-    private retryTimeout: number = 0;
-
-    // NEW: Cache to store translated text, preventing data loss on DOM errors.
-    private translationCache: Map<number, string> = new Map();
-
-    // State for pacing
-    private pacingDelay: number = 200; // Default "sprint" delay
-
-    // Properties for live progress tracking
-    private progressMessage: string = 'Initializing...';
+    // UI state
     private progressEl: HTMLElement | null = null;
+    private unsubQueue: (() => void) | null = null;
 
-    // Static properties to ensure only one bulk translation runs at a time
-    static isBulkTranslationInProgress: boolean = false;
-    static currentInstance: TranslateMultiplePagesModal | null = null;
+    // Phase 14.3: holds references to the Start / Close buttons so they can
+    // be disabled during the async `startWorkerTranslation()` call. Prevents
+    // a double-click from enqueuing the same page range twice.
+    private startBtn: ButtonComponent | null = null;
+    private closeBtn: ButtonComponent | null = null;
+    private cancelBtn: ButtonComponent | null = null;  // Bug fix (bg-queue audit): Cancel in start view
 
     constructor(plugin: OpenRouterTranslatorPlugin, file: TFile) {
         super(plugin.app);
         this.plugin = plugin;
         this.file = file;
+    }
+
+    /**
+     * Phase 14 (C14): 'focus' reopen behavior. If the user triggers the
+     * "Translate multiple pages" command while this modal is already open
+     * (e.g. from the command palette while inspecting progress), we focus
+     * the existing instance instead of closing it and opening a new one —
+     * the new instance would lose the live progress subscription.
+     */
+    protected reopenBehavior() {
+        return 'focus' as const;
+    }
+
+    /**
+     * Returns the file currently being translated by the queue, or `null`
+     * if no translation is in progress. Replaces the old `currentInstance.file`
+     * static-field lookup — now derived from live queue state so it can never
+     * go stale.
+     */
+    private getRunningQueueFile(): TFile | null {
+        const queue = this.plugin.pdfLayoutQueue;
+        if (!queue) return null;
+        const state = queue.getState();
+        if (state.totalPending === 0 && !queue.isRunning()) return null;
+        for (const fs of state.files) {
+            for (const task of fs.tasks.values()) {
+                if (task.status === 'pending' || task.status === 'running') {
+                    return fs.file;
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * FIX: returns ALL files in the queue with pending/running tasks.
+     * Used by the management view to show the full queue, not just the
+     * first running file.
+     */
+    private getAllQueuedFiles(): Array<{ file: TFile; done: number; total: number; pending: number; error: number }> {
+        const queue = this.plugin.pdfLayoutQueue;
+        if (!queue) return [];
+        const state = queue.getState();
+        const result: Array<{ file: TFile; done: number; total: number; pending: number; error: number }> = [];
+        for (const fs of state.files) {
+            const tasks = [...fs.tasks.values()];
+            const done = tasks.filter(t => t.status === 'done').length;
+            const pending = tasks.filter(t => t.status === 'pending' || t.status === 'running').length;
+            const error = tasks.filter(t => t.status === 'error').length;
+            const total = fs.totalPages || tasks.length;
+            if (pending > 0 || done > 0 || error > 0) {
+                result.push({ file: fs.file, done, total, pending, error });
+            }
+        }
+        return result;
     }
 
     /**
@@ -62,17 +126,33 @@ export class TranslateMultiplePagesModal extends Modal {
         const { contentEl } = this;
         contentEl.empty();
 
-        if (TranslateMultiplePagesModal.isBulkTranslationInProgress && TranslateMultiplePagesModal.currentInstance) {
-            this.displayManagementView(contentEl);
+        // Phase 14 (C14): the static `isBulkTranslationInProgress` flag is
+        // gone. We consult the queue directly: if any file has pending or
+        // running tasks, show the management view; otherwise show the start
+        // view. This is more accurate than the flag (which had to be set/
+        // cleared manually and could drift out of sync with the queue).
+        const runningFile = this.getRunningQueueFile();
+        if (runningFile) {
+            this.displayManagementView(contentEl, runningFile);
             return;
         }
 
         this.titleEl.setText(t('modal.translate.title'));
         contentEl.createEl('p', { text: `${t('modal.translate.file')} ${this.file.basename}` });
 
-        this.totalPages = await this.estimateTotalPages();
+        try {
+            this.totalPages = await this.plugin.pdfLayoutService.getPageCount(this.file);
+        } catch (err: any) {
+            contentEl.createEl('p', {
+                text: t('modal.translate.errorPageCount', { error: err?.message ?? String(err) }),
+                attr: { style: 'color: var(--text-error);' },
+            });
+            return;
+        }
+        // FIX: use {n} placeholder instead of concatenation (was producing
+        // "Всего {n} страниц 10" instead of "Всего 10 страниц").
         this.endPage = this.totalPages;
-        contentEl.createEl('p', { text: `${t('modal.translate.total')} ${this.totalPages}` });
+        contentEl.createEl('p', { text: t('modal.translate.total', { n: String(this.totalPages) }) });
 
         this.renderSettings(contentEl);
 
@@ -85,438 +165,396 @@ export class TranslateMultiplePagesModal extends Modal {
 
     /**
      * Renders a view to manage an in-progress translation job.
+     * FIX: now shows ALL queued files, not just the first running one.
      */
-    private displayManagementView(contentEl: HTMLElement) {
-        this.titleEl.setText('Translation in Progress');
-        const instance = TranslateMultiplePagesModal.currentInstance;
+    private displayManagementView(contentEl: HTMLElement, runningFile: TFile) {
+        this.titleEl.setText(t('modal.translate.inProgress'));
 
-        if (!instance) {
-            contentEl.setText('Could not find the active translation process.');
-            return;
-        }
+        contentEl.createEl('p', { text: t('modal.translate.backgroundRunning') });
 
-        contentEl.createEl('p', { text: 'A batch translation is already running.' });
+        // FIX: create a container for per-file progress rows
+        const progressContainer = contentEl.createDiv({ cls: 'translator-progress-container' });
 
-        const progressDisplay = contentEl.createEl('p', { cls: 'translator-progress-display' });
-        progressDisplay.setText(instance.progressMessage);
+        const queue = this.plugin.pdfLayoutQueue;
+        if (queue) {
+            const updateProgress = () => {
+                progressContainer.empty();
 
-        const intervalId = window.setInterval(() => {
-            if (TranslateMultiplePagesModal.isBulkTranslationInProgress && instance) {
-                progressDisplay.setText(instance.progressMessage);
-            } else {
-                window.clearInterval(intervalId);
-                new Notice('Translation job has finished.');
-                this.close();
+                // FIX: show all queued files, not just runningFile
+                const allFiles = this.getAllQueuedFiles();
+                if (allFiles.length === 0) {
+                    progressContainer.createEl('p', {
+                        text: t('modal.translate.noActive'),
+                        attr: { style: 'color: var(--text-muted);' },
+                    });
+                    return;
+                }
+
+                for (const item of allFiles) {
+                    const fileRow = progressContainer.createEl('div', {
+                        cls: 'translator-file-progress',
+                        attr: { style: 'padding: 8px 0; border-bottom: 1px solid var(--background-modifier-border);' },
+                    });
+
+                    // File name
+                    fileRow.createEl('div', {
+                        text: item.file.basename,
+                        attr: { style: 'font-weight: 600; margin-bottom: 4px;' },
+                    });
+
+                    // Progress text
+                    const progressText = item.error > 0
+                        ? t('modal.translate.progressWithError', {
+                            done: String(item.done),
+                            total: String(item.total),
+                            pend: String(item.pending),
+                            err: String(item.error),
+                        })
+                        : t('modal.translate.progress', {
+                            done: String(item.done),
+                            total: String(item.total),
+                            pend: String(item.pending),
+                        });
+                    fileRow.createEl('div', {
+                        text: progressText,
+                        attr: { style: 'color: var(--text-muted); font-size: 0.9em;' },
+                    });
+
+                    // Progress bar
+                    if (item.total > 0) {
+                        const pct = Math.round((item.done / item.total) * 100);
+                        const barContainer = fileRow.createEl('div', {
+                            attr: {
+                                style: 'margin-top: 4px; height: 6px; background: var(--background-modifier-border); border-radius: 3px; overflow: hidden;',
+                            },
+                        });
+                        barContainer.createEl('div', {
+                            attr: {
+                                style: `height: 100%; width: ${pct}%; background: var(--interactive-accent); transition: width 0.3s ease;`,
+                            },
+                        });
+                    }
+                }
+            };
+            updateProgress();
+            // P1-30 (Phase 5): unsubscribe any previous subscription before
+            // overwriting `this.unsubQueue`. Without this, re-entering the
+            // management view (e.g. via 'focus' reopenBehavior after a prior
+            // onClose failed to clear it, or after a code path that assigned
+            // unsubQueue without going through cleanup) would leak the old
+            // callback — the queue would keep invoking a closure that
+            // references a detached `progressContainer`, growing the
+            // listener list indefinitely across reopens.
+            if (this.unsubQueue) {
+                this.unsubQueue();
+                this.unsubQueue = null;
             }
-        }, 1000);
+            this.unsubQueue = queue.onChange(updateProgress);
+        }
 
         const buttonContainer = contentEl.createDiv({ cls: 'translator-button-container' });
 
         new ButtonComponent(buttonContainer)
-            .setButtonText('Cancel Translation')
+            .setButtonText(t('modal.translate.cancelTranslation'))
             .setWarning()
             .onClick(() => {
-                if (TranslateMultiplePagesModal.cancelCurrentTranslation()) {
-                    new Notice('Translation aborted.');
+                if (queue) {
+                    queue.cancel();
+                    new Notice(
+                        t('modal.translate.translationCancelled'),
+                        6000,
+                    );
                 }
                 this.close();
             });
 
         new ButtonComponent(buttonContainer)
-            .setButtonText('Close')
+            .setButtonText(t('modal.translate.close'))
             .onClick(() => this.close());
     }
 
     /**
-     * Renders the settings for page range and time window.
+     * Renders the settings for page range.
      */
     private renderSettings(contentEl: HTMLElement) {
         let startInput: HTMLInputElement;
         let endInput: HTMLInputElement;
+        let validationMsg: HTMLElement;
 
-        new Setting(contentEl).setName('Start page').addText((cb) => {
-            startInput = cb.el;
+        // FIX: add validation message element for real-time feedback.
+        // Without it, user can type invalid values and only see an error
+        // after clicking Start — confusing UX.
+        const validationEl = contentEl.createEl('p', {
+            cls: 'translator-page-validation',
+            attr: { style: 'color: var(--text-warning); font-size: 0.85em; min-height: 1.2em; margin: 4px 0;' },
+        });
+        validationMsg = validationEl;
+
+        const validateAndUpdate = () => {
+            const s = this.startPage;
+            const e = this.endPage;
+            if (s < 1) {
+                validationMsg.setText(t('modal.translate.validation.startTooLow'));
+                return false;
+            }
+            if (e < s) {
+                validationMsg.setText(t('modal.translate.validation.endBeforeStart'));
+                return false;
+            }
+            if (e > this.totalPages) {
+                validationMsg.setText(t('modal.translate.validation.endTooHigh', { total: String(this.totalPages) }));
+                return false;
+            }
+            validationMsg.setText('');
+            return true;
+        };
+
+        new Setting(contentEl).setName(t('modal.translate.startPage')).addText((cb) => {
+            startInput = cb.inputEl;
             cb.setValue(String(this.startPage)).onChange((value) => {
                 const n = parseInt(value, 10);
-                if (!isNaN(n) && n >= 1 && n <= this.totalPages) this.startPage = n;
+                if (!isNaN(n) && n >= 1 && n <= this.totalPages) {
+                    this.startPage = n;
+                    validateAndUpdate();
+                } else {
+                    validationMsg.setText(t('modal.translate.validation.invalid', { total: String(this.totalPages) }));
+                }
             });
         });
 
-        new Setting(contentEl).setName('End page').addText((cb) => {
-            endInput = cb.el;
+        new Setting(contentEl).setName(t('modal.translate.endPage')).addText((cb) => {
+            endInput = cb.inputEl;
             cb.setValue(String(this.endPage)).onChange((value) => {
                 const n = parseInt(value, 10);
-                if (!isNaN(n) && n >= this.startPage && n <= this.totalPages) this.endPage = n;
+                if (!isNaN(n) && n >= 1 && n <= this.totalPages) {
+                    this.endPage = n;
+                    validateAndUpdate();
+                } else {
+                    validationMsg.setText(t('modal.translate.validation.invalid', { total: String(this.totalPages) }));
+                }
             });
         });
 
         new Setting(contentEl).addButton((cb) => {
-            cb.setButtonText('All Pages').setCta().onClick(() => {
+            cb.setButtonText(t('modal.translate.allPages')).setCta().onClick(() => {
                 this.startPage = 1;
                 this.endPage = this.totalPages;
                 startInput.value = '1';
                 endInput.value = String(this.totalPages);
+                validationMsg.setText('');
             });
         });
 
-        const timeWindowSetting = new Setting(contentEl)
-            .setName('Use Time Window')
-            .setDesc('Distribute translations over a set time to avoid rate limits. If off, it will run as fast as possible.')
-            .addToggle(toggle => toggle
-                .setValue(this.useTimeWindow)
-                .onChange(value => {
-                    this.useTimeWindow = value;
-                    timeInputSetting.settingEl.style.display = value ? '' : 'none';
-                }));
-
-        const timeInputSetting = new Setting(contentEl)
-            .setName('Job Time (Hours)')
-            .setDesc('The total time to spread the translation job over.')
-            .addText(text => text
-                .setValue(String(this.timeWindowHours))
-                .onChange(value => {
-                    const n = parseFloat(value);
-                    if (!isNaN(n) && n > 0) this.timeWindowHours = n;
-                }));
-
-        timeInputSetting.settingEl.style.display = this.useTimeWindow ? '' : 'none';
+        // Info note about worker mode
+        contentEl.createEl('p', {
+            text: t('modal.translate.workerInfo'),
+            attr: { style: 'color: var(--text-muted); font-size: 0.9em; margin-top: 12px;' },
+        });
     }
 
     /**
-     * Renders the Start and Abort buttons.
+     * Renders the Start, Cancel, and Close buttons.
      */
     private renderActionButtons(container: HTMLElement) {
-        const startButton = new ButtonComponent(container)
+        this.startBtn = new ButtonComponent(container)
             .setButtonText(t('modal.translate.btn.start'))
             .setCta()
             .onClick(async () => {
                 if (this.startPage > this.endPage) {
-                    new Notice('Start page must be less than or equal to End page.');
+                    new Notice(t('modal.translate.startPageError'));
                     return;
                 }
 
-                this.initializeJobState();
-                startButton.setDisabled(true);
-                abortButton.setDisabled(false);
-
-                this.updateProgress('Starting translation job...');
+                // Phase 14.3: disable BOTH buttons for the duration of the
+                // await. Previously only Start was disabled, leaving Close
+                // clickable — a fast double-click could enqueue the range
+                // and immediately close the modal, losing the live progress
+                // subscription. With both disabled, the user has to wait
+                // for the enqueue to settle.
+                this.startBtn?.setDisabled(true);
+                this.closeBtn?.setDisabled(true);
 
                 try {
-                    await this.translatePageRange(this.file, this.startPage, this.endPage);
-                    if (!this.isCancelled) {
-                        this.close();
-                    }
+                    await this.startWorkerTranslation();
+                    // FIX: after enqueue, show immediate feedback so user knows
+                    // the process started. Without this, there's a delay between
+                    // clicking Start and the first progress update from queue.onChange.
+                    this.updateProgress(t('modal.translate.starting'));
+                    // Bug fix (bg-queue audit): show Cancel button now that translation
+                    // is running, so user can stop it without closing the modal.
+                    this.cancelBtn?.setDisabled(false);
                 } catch (err: any) {
-                    new Notice('Error: ' + (err.message || 'Unknown error'), 7000);
-                    console.error('Bulk translation failed:', err);
-                } finally {
+                    new Notice(t('modal.translate.failedToStart', { error: err.message }), 7000);
+                    console.error('Worker translation failed to start:', err);
                     this.cleanup();
-                    if (!this.isCancelled) {
-                        startButton.setDisabled(false);
-                    }
-                    abortButton.setDisabled(true);
+                } finally {
+                    // Re-enable Close so the user can dismiss the modal after
+                    // the worker has been enqueued. Start stays disabled once
+                    // translation has begun (re-enabling would allow a second
+                    // enqueue on top of the running one).
+                    this.closeBtn?.setDisabled(false);
                 }
             });
 
-        const abortButton = new ButtonComponent(container)
-            .setButtonText('Abort')
-            .setDisabled(true)
+        // Bug fix (bg-queue audit): add Cancel button to start view so user can
+        // stop a running translation without closing the modal. Previously the
+        // Cancel button only existed in the management view (which only shows
+        // when a PRIOR run was already in progress on modal open).
+        this.cancelBtn = new ButtonComponent(container)
+            .setButtonText(t('modal.translate.cancelTranslation'))
+            .setWarning()
+            .setDisabled(true)  // enabled after Start succeeds
             .onClick(() => {
-                if (this.isProcessing) {
-                    new Notice('Aborting translation...');
-                    this.isCancelled = true;
-                    abortButton.setButtonText('Aborting...').setDisabled(true);
+                const queue = this.plugin.pdfLayoutQueue;
+                if (queue) {
+                    queue.cancel();
+                    new Notice(t('modal.translate.translationCancelled'), 6000);
+                    this.updateProgress(t('modal.translate.translationCancelled'));
                 }
+                this.startBtn?.setDisabled(false);
+                this.cancelBtn?.setDisabled(true);
             });
+
+        this.closeBtn = new ButtonComponent(container)
+            .setButtonText(t('modal.translate.close'))
+            .onClick(() => this.close());
     }
 
     /**
-     * Sets the initial state for a new translation job.
+     * Enqueue the page range into PdfLayoutQueue and subscribe to progress.
      */
-    private initializeJobState() {
-        this.isProcessing = true;
-        this.isCancelled = false;
+    private async startWorkerTranslation() {
+        const queue = this.plugin.pdfLayoutQueue;
+        if (!queue) {
+            new Notice(t('modal.translate.queueUnavailable'), 6000);
+            this.cleanup();
+            return;
+        }
 
-        TranslateMultiplePagesModal.isBulkTranslationInProgress = true;
-        TranslateMultiplePagesModal.currentInstance = this;
+        // Subscribe to queue state changes for live progress
+        const fileKey = this.file.path;
+        // P1-30 (Phase 5): unsubscribe any previous subscription before
+        // overwriting `this.unsubQueue`. The Start button can be clicked
+        // multiple times in succession if the prior enqueue returned 0
+        // cached pages and the modal wasn't dismissed — each click would
+        // overwrite `unsubQueue` without unsubscribing the previous one,
+        // leaking the closure and double-firing progress callbacks.
+        if (this.unsubQueue) {
+            this.unsubQueue();
+            this.unsubQueue = null;
+        }
+        this.unsubQueue = queue.onChange(() => {
+            this.updateProgressFromQueue(queue, fileKey);
+        });
+
+        try {
+            const count = await queue.enqueuePageRange(this.file, this.startPage, this.endPage);
+
+            if (count === 0) {
+                new Notice(
+                    t('modal.translate.allCached', { start: String(this.startPage), end: String(this.endPage) }),
+                    5000,
+                );
+                this.updateProgress(t('modal.translate.allCachedNothing'));
+                this.cleanup();
+                return;
+            }
+
+            this.updateProgress(
+                t('modal.translate.queued', { count: String(count), start: String(this.startPage), end: String(this.endPage) })
+            );
+            new Notice(
+                t('modal.translate.started', { count: String(count), file: this.file.basename }),
+                4000,
+            );
+
+            // Don't close the modal — show live progress until done.
+            // The user can close manually; the queue continues in background.
+        } catch (err: any) {
+            const msg = err?.message ?? String(err);
+            console.error('[TranslateMultiplePagesModal] enqueuePageRange failed:', err);
+            new Notice(t('modal.translate.failedToQueue', { error: msg }), 7000);
+            this.cleanup();
+        }
     }
 
-    /**
-     * Centralized method for updating the progress message.
-     */
     private updateProgress(msg: string) {
-        this.progressMessage = msg;
         if (this.progressEl) {
             this.progressEl.setText(msg);
         }
     }
 
-    /**
-     * The main logic loop for processing a range of pages.
-     */
-    private async translatePageRange(pdfFile: TFile, startPage: number, endPage: number): Promise<void> {
-        const activeFile = this.app.workspace.getActiveFile();
-        const shouldRestorePage = !!activeFile && activeFile.path === pdfFile.path;
-        const pageToRestore = shouldRestorePage ? this.plugin.getCurrentPageNumber() : null;
+    private updateProgressFromQueue(queue: any, fileKey: string) {
+        const state = queue.getState();
+        const fileState = state.files.find((f: any) => f.file.path === fileKey);
+        if (!fileState) return;
 
-        const pdfLeaf = this.plugin.pdfDom.resolveLeafForFile(pdfFile);
-        if (!pdfLeaf) {
-            throw new Error('No available workspace leaf to open PDF.');
-        }
+        const tasks = [...fileState.tasks.values()];
+        const done = tasks.filter((t: any) => t.status === 'done').length;
+        const err = tasks.filter((t: any) => t.status === 'error').length;
+        const pend = tasks.filter((t: any) => t.status === 'pending' || t.status === 'running').length;
+        const total = fileState.totalPages || tasks.length;
 
-        try {
-            const openedFile = (pdfLeaf as any).view?.file as TFile | undefined;
-            const isAlreadyOpen = !!openedFile && openedFile.path === pdfFile.path;
-            if (!isAlreadyOpen) {
-                await pdfLeaf.openFile(pdfFile);
-            }
-            if (!await this.waitForEl(pdfLeaf, '.pdfViewer', 10000)) throw new Error('Failed to load PDF viewer.');
-        } catch (err) {
-            throw new Error('Could not open the specified PDF file.');
-        }
+        const status = err > 0
+            ? t('modal.translate.progressWithError', { done: String(done), total: String(total), pend: String(pend), err: String(err) })
+            : t('modal.translate.progress', { done: String(done), total: String(total), pend: String(pend) });
 
-        const originalAutoSave = this.plugin.settings.autoSaveOverlay;
-        this.plugin.settings.autoSaveOverlay = true;
+        this.updateProgress(`🔄 ${status}`);
 
-        let completed = 0, failed = 0;
-        const totalPagesToProcess = endPage - startPage + 1;
-        const processingQueue = Array.from({ length: totalPagesToProcess }, (_, i) => startPage + i);
-
-        if (this.useTimeWindow && this.timeWindowHours > 0 && totalPagesToProcess > 0) {
-            const totalMilliseconds = this.timeWindowHours * 3600 * 1000;
-            this.pacingDelay = totalMilliseconds / totalPagesToProcess;
-            const paceInSeconds = Math.round(this.pacingDelay / 1000);
-            this.updateProgress(`Pacing enabled. Each page will be processed approx. every ${paceInSeconds} seconds.`);
-            await this.sleep(1000);
-        } else {
-            this.pacingDelay = 200;
-        }
-
-        try {
-            while (processingQueue.length > 0) {
-                if (this.isCancelled) {
-                    this.updateProgress('вЏ№пёЏ Translation cancelled by user.');
-                    return;
-                }
-
-                const pageNum = processingQueue.shift()!;
-                const progressPrefix = `[${completed + 1}/${totalPagesToProcess}]`;
-                this.updateProgress(`${progressPrefix} ↻ Processing page ${pageNum}...`);
-
-                try {
-                    // MODIFIED: Reworked the core logic with caching and verification
-                    await this.retryWithBackoff(async () => {
-                        const navSuccess = await this.navigateToPage(pdfLeaf, pageNum);
-                        if (!navSuccess) throw new Error('Navigation failed.');
-
-                        const pageEl = await this.waitForPageAndTextLayer(pdfLeaf, pageNum, 30000);
-                        if (!pageEl) throw new Error('Page or text layer failed to render.');
-
-                        // Step 1: Get translation (from cache or new API call)
-                        let translatedText = this.translationCache.get(pageNum);
-                        if (!translatedText) {
-                            this.updateProgress(`${progressPrefix} ✍ Translating page ${pageNum}...`);
-                            // ASSUMPTION: You need a method that only does the translation and returns a string.
-                            translatedText = await this.plugin.processor.translatePageContent(pageEl);
-                            if (!translatedText || translatedText.trim() === '') {
-                                throw new Error('Translation returned empty content.');
-                            }
-                            this.translationCache.set(pageNum, translatedText); // Cache the successful translation
-                        } else {
-                            this.updateProgress(`${progressPrefix} 📄 Using cached translation for page ${pageNum}.`);
-                        }
-
-                        // Step 2: Create the overlay with the translated text
-                        // ASSUMPTION: You need a method that creates the overlay from a given text string.
-                        await this.plugin.processor.createOverlayWithText(pageEl, translatedText);
-                        const newOverlay = pageEl.querySelector<HTMLElement>('.pdf-text-overlay-container');
-
-                        // Step 3: VERIFY the overlay was created and contains the correct text
-                        if (!newOverlay) {
-                            throw new Error('Overlay element was not found after creation.');
-                        }
-
-                        const overlayText = newOverlay.innerText.trim();
-                        // Verify a snippet of the text to avoid issues with formatting differences
-                        const verificationSnippet = translatedText.substring(0, 50);
-                        if (!overlayText.includes(verificationSnippet)) {
-                            console.error(`Verification FAILED for page ${pageNum}. Overlay text did not match translated text.`);
-                            console.log('Expected snippet:', verificationSnippet);
-                            console.log('Actual overlay text:', overlayText.substring(0, 100));
-                            throw new Error('Overlay content verification failed.');
-                        }
-
-                        // If verification passes, add to active overlays for cleanup
-                        this.activeOverlays.push(newOverlay);
-                    }, pageNum);
-
-                    completed++;
-                    this.updateProgress(`${progressPrefix} ✓ Page ${pageNum} complete.`);
-
-                    // Manage memory by removing old overlays from the DOM
-                    if (this.activeOverlays.length > 5) {
-                        const oldOverlay = this.activeOverlays.shift();
-                        oldOverlay?.parentElement?.removeChild(oldOverlay);
-                    }
-
-                } catch (err: any) {
-                    if (this.isCancelled) break;
-                    console.error(`Page ${pageNum} failed permanently after all retries:`, err);
-                    this.updateProgress(`${progressPrefix} вќЊ Page ${pageNum} failed: ${err.message || 'Unknown error'}`);
-                    failed++;
-                }
-
-                if (this.pacingDelay > 1000) {
-                    this.updateProgress(`Pacing... Next page in ${Math.round(this.pacingDelay / 1000)}s`);
-                }
-                await this.sleep(this.pacingDelay);
-            }
-        } finally {
-            this.plugin.settings.autoSaveOverlay = originalAutoSave;
-            if (pageToRestore && pageToRestore > 0) {
-                await this.navigateToPage(pdfLeaf, pageToRestore);
-            }
-            const summary = `Ѓ Finished: ${completed}/${totalPagesToProcess} succeeded${failed ? `, ${failed} failed` : ''}.`;
+        if (pend === 0) {
+            const summary = err > 0
+                ? t('modal.translate.finishedSummary', { done: String(done), total: String(total), err: String(err) })
+                : t('modal.translate.finishedSummaryOk', { done: String(done), total: String(total) });
             this.updateProgress(summary);
-            new Notice(summary, 7000);
-        }
-    }
-
-    /**
-     * A robust retry mechanism that handles transient errors.
-     */
-    private async retryWithBackoff<T>(
-        operation: () => Promise<T>,
-        pageNum: number
-    ): Promise<T> {
-        const maxRetries = 3;
-        const baseDelay = 1500;
-
-        for (let attempt = 0; attempt < maxRetries; attempt++) {
-            if (this.isCancelled) throw new Error('Operation cancelled');
-            try {
-                return await operation();
-            } catch (error) {
-                if (attempt < maxRetries - 1) {
-                    const delay = baseDelay * Math.pow(2, attempt);
-                    this.updateProgress(`Page ${pageNum} failed (attempt ${attempt + 1}), retrying in ${delay / 1000}s...`);
-                    await this.sleep(delay);
-                } else {
-                    throw error;
-                }
-            }
-        }
-        throw new Error('Retry mechanism failed unexpectedly.');
-    }
-
-    onClose() {
-        this.contentEl.empty();
-        if (this.isProcessing) {
+            new Notice(
+                t('modal.translate.completeWithSummary', { summary, file: this.file.basename }),
+                7000,
+            );
             this.cleanup();
         }
     }
 
+    onClose() {
+        this.contentEl.empty();
+        // Unsubscribe from queue changes (but DON'T cancel the queue —
+        // closing the modal doesn't stop the background translation)
+        if (this.unsubQueue) {
+            this.unsubQueue();
+            this.unsubQueue = null;
+        }
+        // Phase 14 (C14): MUST call super.onClose() so SingletonModal can
+        // remove us from the per-subclass instances Map.
+        super.onClose();
+    }
+
     private cleanup() {
-        this.isProcessing = false;
-
-        // MODIFIED: Clear the cache on cleanup
-        this.translationCache.clear();
-
-        this.activeOverlays.forEach(overlay => overlay.parentElement?.removeChild(overlay));
-        this.activeOverlays = [];
-
-        clearTimeout(this.retryTimeout);
-
-        if (TranslateMultiplePagesModal.currentInstance === this) {
-            TranslateMultiplePagesModal.isBulkTranslationInProgress = false;
-            TranslateMultiplePagesModal.currentInstance = null;
+        if (this.unsubQueue) {
+            this.unsubQueue();
+            this.unsubQueue = null;
         }
     }
 
-    // #1: resolve the DOM subtree for a specific pdf leaf so lookups never hit
-    // another open PDF tab. Falls back to document only if the leaf has no container.
-    private leafRoot(pdfLeaf: any): ParentNode {
-        return this.plugin.pdfDom.getLeafContainer(pdfLeaf) ?? document;
+    /**
+     * Returns true if the background queue is currently processing any task.
+     * Phase 14 (C14): replaces the old `isBulkTranslationInProgress` static
+     * flag — now derived from live queue state so it can never drift.
+     */
+    static isTranslationInProgress(plugin: OpenRouterTranslatorPlugin): boolean {
+        const queue = plugin.pdfLayoutQueue;
+        if (!queue) return false;
+        return queue.isRunning() || queue.getState().totalPending > 0;
     }
 
-    private resolveLeafForFile(file: TFile): any {
-        return this.plugin.pdfDom.resolveLeafForFile(file);
-    }
-
-    private async estimateTotalPages(): Promise<number> {
-        await this.sleep(500);
-        const leaf = this.resolveLeafForFile(this.file);
-        const total = await this.plugin.pdfDom.getTotalPages(leaf, /* forceLast */ true);
-        return total || 1;
-    }
-
-    private async navigateToPage(pdfLeaf: any, pageNum: number): Promise<boolean> {
-        if (this.isCancelled) return false;
-
-        const pageEl = this.plugin.pdfDom.getPageElement(pageNum, pdfLeaf);
-        if (!(pdfLeaf as any)?.view || !pageEl) {
-            console.error(`PDF view or page element ${pageNum} not found.`);
-            return false;
-        }
-
-        pageEl.scrollIntoView({ block: 'nearest' });
-
-        const success = await this.waitForCondition(() => {
-            const rect = pageEl.getBoundingClientRect();
-            const viewHeight = window.innerHeight || document.documentElement.clientHeight;
-            return rect.bottom > 0 && rect.top < viewHeight;
-        }, 15000);
-
-        if (!success) console.warn(`Failed to confirm page ${pageNum} is in view.`);
-        await this.sleep(500);
-        return true;
-    }
-
-    private async waitForPageAndTextLayer(pdfLeaf: any, pageNum: number, timeoutMs: number): Promise<HTMLElement | null> {
-        return this.waitForCondition(() => {
-            const tl = this.plugin.pdfDom.getTextLayer(pageNum, pdfLeaf);
-            const hasText = ((tl?.querySelector('span[role="presentation"]')?.textContent?.trim().length ?? 0) > 0);
-            return hasText ? (tl!.parentElement as HTMLElement) : null;
-        }, timeoutMs, 250);
-    }
-
-    private async sleep(ms: number): Promise<void> {
-        return new Promise(resolve => {
-            if (this.isCancelled) return resolve();
-            this.retryTimeout = window.setTimeout(resolve, ms);
-        });
-    }
-
-    private async waitForEl(pdfLeaf: any, selector: string, timeoutMs: number): Promise<HTMLElement | null> {
-        const root = this.leafRoot(pdfLeaf);
-        return this.waitForCondition(() => root.querySelector<HTMLElement>(selector), timeoutMs);
-    }
-
-    private async waitForCondition<T>(
-        condition: () => T | null | false,
-        timeoutMs: number,
-        intervalMs: number = 100
-    ): Promise<T | null> {
-        const start = Date.now();
-        while (Date.now() - start < timeoutMs) {
-            if (this.isCancelled) return null;
-            const result = condition();
-            if (result) return result;
-            await this.sleep(intervalMs);
-        }
-        return null;
-    }
-
-    static isTranslationInProgress(): boolean {
-        return this.isBulkTranslationInProgress;
-    }
-
-    static cancelCurrentTranslation(): boolean {
-        if (this.currentInstance?.isProcessing) {
-            this.currentInstance.isCancelled = true;
+    /**
+     * Cancel the currently-running translation via the queue.
+     * Returns true if a cancellation was issued.
+     */
+    static cancelCurrentTranslation(plugin: OpenRouterTranslatorPlugin): boolean {
+        const queue = plugin.pdfLayoutQueue;
+        if (queue && (queue.isRunning() || queue.getState().totalPending > 0)) {
+            queue.cancel();
             return true;
         }
         return false;
     }
 }
-

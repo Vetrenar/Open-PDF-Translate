@@ -1,0 +1,119 @@
+/*
+ * styles.css — PDF Translator overlay styling.
+ *
+ * Phase 1 (dead-code removal): the rule blocks that previously styled
+ * the removed "expanded" hover state (`.pdf-text-overlay-reflow.is-expanded`
+ * and its scrollbar variants), the per-overlay attribute selectors
+ * (`[data-font-size]`, `[data-font-family]`, `[data-color]`,
+ * `[data-font-weight]`, `[data-font-style]`, `[data-text-decoration]`,
+ * `[data-text-align]`), the `.font-styled` class, and the `.bold` /
+ * `.italic` / `.center` helper classes have all been deleted. None of
+ * those selectors were emitted by `overlay-ui.ts` after the refactor —
+ * the inline styles set in `createReflowOverlay` cover everything — so
+ * the CSS was pure dead weight and a maintenance trap (any future
+ * change to the inline-style list would silently fail to match the
+ * dead selectors here).
+ *
+ * Phase 17 (theme-awareness): the overlay background stays WHITE
+ * (Decision 1.4 — overlays are rendered on top of PDF pages, which are
+ * themselves white; using the theme's `--background-primary` here would
+ * make dark-mode overlays show up as black rectangles over white PDF
+ * pages, which is unreadable). UI controls (borders, selection outlines)
+ * are styled via Obsidian CSS variables so they respect the active theme;
+ * see `overlay-ui.ts::ensureGlobalStyles` for the inline `bbox-selected`
+ * rule which uses `var(--interactive-accent)`.
+ */
+
+/* Base overlay style */
+.pdf-text-overlay-reflow {
+    position: absolute;
+    color: var(--text-normal);
+    /*
+     * FIX: removed `background-color: #fff` — inline styles in
+     * `overlay-ui.ts::createReflowOverlay` now use `rgba(255,255,255,0.88)`
+     * (semi-transparent) so content underneath remains visible. This CSS
+     * rule was overriding the inline style AND making the background fully
+     * opaque, hiding images/charts/labels under the overlay.
+     */
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    padding: 2px 6px;
+    border-radius: 4px;
+    white-space: normal;
+    overflow-wrap: break-word;
+    pointer-events: all;
+    z-index: 100;
+    box-sizing: border-box;
+    opacity: 0;
+
+    /* Base font size - will be overridden by relative sizing */
+    font-size: 16px;
+
+    /* Smooth transitions */
+    transition:
+        opacity 0.3s ease,
+        max-height 0.3s ease,
+        width 0.25s ease,
+        padding 0.25s ease,
+        box-shadow 0.25s ease,
+        left 0.25s ease,
+        top 0.25s ease,
+        font-size 0.25s ease;
+
+    /* Base state shadow */
+    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+
+    /* Performance hint */
+    will-change: opacity, max-height, width, left, top, font-size;
+}
+
+/* Inner content */
+.pdf-text-overlay-reflow > div {
+    line-height: 1.6;
+    word-break: break-word;
+    hyphens: auto;
+}
+
+/*
+ * Phase 17 (Decision 1.4): the overlay container itself is the
+ * per-page wrapper created by `overlay.ts::createOverlayContainer`.
+ * It MUST keep a white background so that the white overlay boxes
+ * above it blend seamlessly with the underlying white PDF page; any
+ * other colour would show through the (possibly semi-transparent)
+ * overlay boxes and produce a visible tinted rectangle.
+ */
+.pdf-text-overlay-container {
+    background: #ffffff;
+}
+
+/* Multiple font sizes handling */
+.pdf-text-overlay-reflow .multi-font-text {
+    font-size: inherit;
+}
+
+.pdf-text-overlay-reflow .font-size-0 { font-size: calc(var(--reference-height, 1000px) * var(--relative-size-0, 0.012)); }
+.pdf-text-overlay-reflow .font-size-1 { font-size: calc(var(--reference-height, 1000px) * var(--relative-size-1, 0.014)); }
+.pdf-text-overlay-reflow .font-size-2 { font-size: calc(var(--reference-height, 1000px) * var(--relative-size-2, 0.016)); }
+
+/*
+ * Phase 1 (dead-code removal): the `.bold`, `.italic`, `.underline`,
+ * `.strikethrough`, `.center`, `.right`, `.justify` helper classes
+ * that lived here have been removed. `overlay-ui.ts` sets those
+ * properties directly via inline styles (`fontWeight`, `fontStyle`,
+ * `textDecoration`, `textAlign` in `createReflowOverlay`'s
+ * `Object.assign(el.style, …)` call), so the CSS classes were never
+ * applied to any element.
+ */
+
+/* High contrast mode support */
+@media (prefers-contrast: high) {
+    .pdf-text-overlay-reflow {
+        border: 2px solid var(--text-normal);
+    }
+}
+
+/* Reduced motion support */
+@media (prefers-reduced-motion: reduce) {
+    .pdf-text-overlay-reflow {
+        transition: none;
+    }
+}

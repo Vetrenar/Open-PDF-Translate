@@ -1,4 +1,4 @@
-import { FileSystemAdapter, TFile } from 'obsidian';
+import { FileSystemAdapter, Notice, TFile } from 'obsidian';
 import OpenRouterTranslatorPlugin from './main';
 
 export interface CapturedPageImage {
@@ -22,12 +22,34 @@ export class PageCapture {
         return pages.length > 0 ? pages.length : null;
     }
 
+    /**
+     * Resolve an absolute file:// path for a PDF, used by OCR providers that
+     * accept a file-path input mode (as opposed to image-base64).
+     *
+     * P2-46 (Phase 16): mobile fallback. FileSystemAdapter is desktop-only —
+     * on mobile (Cordova / capacitor FS) the adapter is not a
+     * FileSystemAdapter, so the previous code silently returned `null` and
+     * the caller surfaced the opaque error "Could not determine PDF file
+     * path." Now we emit a clear, actionable Notice instructing the user to
+     * switch OCR input mode to `image` (which works on every platform via
+     * canvas capture) instead of `filepath`.
+     */
     getAbsolutePdfPath(file?: TFile): string | null {
         const target = file ?? this.plugin.app.workspace.getActiveFile();
         if (!target || target.extension !== 'pdf') return null;
 
         const adapter = this.plugin.app.vault.adapter;
-        if (!(adapter instanceof FileSystemAdapter)) return null;
+        if (!(adapter instanceof FileSystemAdapter)) {
+            // Mobile — filepath OCR mode is unavailable. Surface a clear
+            // Notice so the user knows to switch to image-capture mode
+            // rather than seeing a generic "Could not determine PDF file
+            // path" error from the caller.
+            new Notice(
+                'Filepath OCR mode is not available on mobile. ' +
+                'Switch OCR input mode to "image" in settings.'
+            );
+            return null;
+        }
         const basePath = adapter.getBasePath();
         return `${basePath}/${target.path}`;
     }
@@ -51,7 +73,15 @@ export class PageCapture {
         const ocr = this.plugin.settings.ocrProvider;
         const targetScale = Math.max(1, ocr?.imageScale ?? 2);
         const format = ocr?.imageFormat === 'jpeg' ? 'image/jpeg' : 'image/png';
-        const quality = format === 'image/jpeg' ? Math.min(1, Math.max(0.5, (ocr?.imageQuality ?? 85) / 100)) : undefined;
+        // Phase 9 (C6): imageQuality may be stored either as a fraction in
+        // [0, 1] (e.g. 0.92) or as a percentage in (1, 100] (e.g. 92). Detect
+        // the unit by checking whether the value is greater than 1 — if so,
+        // divide by 100 to convert to a fraction. Values <= 1 are treated as
+        // fractions directly. Clamp to [0.5, 1] for JPEG quality.
+        const rawQ = ocr?.imageQuality ?? 0.92;
+        const quality = format === 'image/jpeg'
+            ? Math.min(1, Math.max(0.5, rawQ > 1 ? rawQ / 100 : rawQ))
+            : undefined;
 
         // Aim for a reasonable absolute resolution: scale up small canvases more.
         // Cap the long edge so we don't ship absurdly large base64 payloads.
@@ -81,7 +111,45 @@ export class PageCapture {
         }
     }
 
-    async capturePageByNumber(pageNumber: number, root: ParentNode = document): Promise<CapturedPageImage | null> {
+    /**
+     * Capture a specific page by 1-based number.
+     *
+     * P2-47 (Phase 16): delegate to the leaf-scoped PdfViewerAdapter when a
+     * file is supplied. The previous implementation used
+     * `document.querySelector('.page[data-page-number="N"]')` which on a
+     * multi-tab workspace returns the FIRST matching page across ALL open
+     * PDF leaves — silently capturing the wrong tab's page when OCR is run
+     * on a non-focused PDF. Resolving the leaf via `pdfDom.resolveLeafForFile`
+     * scopes the query to the correct tab.
+     *
+     * The legacy `root` parameter (defaulting to `document`) is kept as a
+     * fallback so any external caller that doesn't supply a file continues
+     * to work; new callers should pass `file`.
+     */
+    async capturePageByNumber(
+        pageNumber: number,
+        file?: TFile,
+        root: ParentNode = document,
+    ): Promise<CapturedPageImage | null> {
+        // Preferred path: leaf-scoped capture via PdfViewerAdapter.
+        if (file) {
+            const dom = this.plugin.pdfDom;
+            const leaf = dom?.resolveLeafForFile?.(file);
+            if (leaf) {
+                const pageEl = await dom!.waitForRenderedPage?.(
+                    pageNumber,
+                    { timeoutMs: 12000 },
+                    leaf,
+                );
+                if (pageEl) {
+                    return this.capturePageElement(pageEl as HTMLElement);
+                }
+                // Fall through to the legacy query if the adapter failed to
+                // produce a rendered page (e.g. viewer still mounting).
+            }
+        }
+
+        // Fallback: legacy document-scoped query.
         const pageEl = root.querySelector(
             `.page[data-page-number="${pageNumber}"]`
         ) as HTMLElement | null;
