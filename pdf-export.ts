@@ -226,46 +226,109 @@ export class PdfExportService {
     // -----------------------------------------------------------------------
 
     /**
-     * T5.2: THE canonical storage parser is now the single reader of
-     * `.translations.md`. The previous hand-rolled walker diverged from
-     * storage.ts in three ways (multi-line translation joining, `<!-- empty -->`
-     * handling, html stripping) — a file that rendered perfectly could
-     * export differently from what the overlay showed.
+     * Walk through the Markdown translation file and collect all annotated
+     * text blocks.  Each block is preceded by a metadata comment of the form:
+     *
+     *   %% { "page": 1, "r": { "l": 0.1, "t": 0.2, "w": 0.8, "h": 0.05 }, … } %%
+     *
+     * Everything between two such comments (or between a comment and a heading)
+     * is treated as the translated text for that region.
      */
     private async parseMarkdownStructure(
         file: TFile,
     ): Promise<Record<string, ExportOverlay[]>> {
-        const pdfFile = this.plugin.app.workspace.getActiveFile();
         const content = await this.plugin.app.vault.read(file);
-        const saved = this.plugin.storage.parseMarkdownOverlay(
-            content,
-            (pdfFile && pdfFile.extension === 'pdf') ? pdfFile : file,
-        );
-        const exportData: Record<string, ExportOverlay[]> = {};
-        if (!saved) return exportData;
+        const lines   = content.split(/\r?\n/);
 
-        for (const [pageKey, items] of Object.entries(saved.pageOverlays)) {
-            for (const item of items) {
-                const text = htmlToPlainText(item.translatedText || '');
-                if (!text) continue;
-                const region = item.relativeRect;
+        const exportData: Record<string, ExportOverlay[]> = {};
+        let currentMeta: any     = null;
+        let currentLines: string[] = [];
+
+        const commitBlock = (): void => {
+            if (!currentMeta || currentLines.length === 0) {
+                currentMeta  = null;
+                currentLines = [];
+                return;
+            }
+
+            const pageNum = currentMeta.page;
+            const region  = currentMeta.r;
+
+            if (pageNum == null || !region) {
+                currentMeta  = null;
+                currentLines = [];
+                return;
+            }
+
+            // Join lines, strip trailing whitespace from each, convert HTML
+            const rawText = currentLines
+                .map(l => l.trimEnd())
+                .join('\n')
+                .trim();
+            const text = htmlToPlainText(rawText);
+
+            if (text) {
+                const pageKey = String(pageNum);
                 if (!exportData[pageKey]) exportData[pageKey] = [];
+
                 exportData[pageKey].push({
                     text,
-                    page: item.page,
-                    x: region.left,
-                    y: region.top,
-                    width: region.width,
-                    height: region.height,
-                    fontFamily: this.normalizeFontFamily(item.fontFamily),
-                    fontSize: Array.isArray(item.originalFontSizes) && item.originalFontSizes.length > 0
-                        ? item.originalFontSizes
-                        : [item.fontSize ?? 10],
-                    color: '#000000',
+                    page:       pageNum,
+                    x:          region.l,
+                    y:          region.t,
+                    width:      region.w,
+                    height:     region.h,
+                    fontFamily: this.normalizeFontFamily(currentMeta.ff),
+                    fontSize:   Array.isArray(currentMeta.ofs) ? currentMeta.ofs : [currentMeta.ofs ?? 10],
+                    color:      currentMeta.color ?? '#000000',
                     isNormalized: true,
                 });
             }
+
+            currentMeta  = null;
+            currentLines = [];
+        };
+
+        // %% { … } %% — allow optional whitespace around the JSON
+        const META_RE = /^\s*%%\s*(\{.*\})\s*%%\s*$/;
+
+        for (let i = 0; i < lines.length; i++) {
+            const line        = lines[i];
+            const trimmedLine = line.trim();
+
+            // Metadata marker → commit previous block, start a new one
+            const metaMatch = trimmedLine.match(META_RE);
+            if (metaMatch) {
+                commitBlock();
+                try {
+                    currentMeta = JSON.parse(metaMatch[1]);
+                } catch (e) {
+                    console.warn(`[PDF Export] Malformed JSON on line ${i + 1}:`, metaMatch[1]);
+                    currentMeta = null;
+                }
+                continue;
+            }
+
+            // Heading → commit and reset (headings are structural, not content)
+            if (trimmedLine.startsWith('#')) {
+                commitBlock();
+                continue;
+            }
+
+            // Collect content lines (skip leading blank lines before text starts)
+            if (currentMeta) {
+                if (trimmedLine !== '' || currentLines.length > 0) {
+                    currentLines.push(line);
+                }
+            }
         }
+
+        // Commit the last block
+        commitBlock();
+
+        const total = Object.values(exportData).reduce((n, a) => n + a.length, 0);
+        console.log(`[PDF Export] Parsed ${total} overlay(s) across ${Object.keys(exportData).length} page(s).`);
+
         return exportData;
     }
 

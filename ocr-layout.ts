@@ -33,8 +33,20 @@ import { CapturedPageImage } from './page-capture';
 // extractor live in providers.ts as a single source of truth.
 import { buildRequest, extractResponseContent } from './providers';
 
-// T2.4: shared timeout helper (was a local duplicate of translation.ts's).
-import { withTimeout } from './shared';
+/**
+ * Phase 12.3 (C10): `withTimeout` is a PRIVATE method on TranslationEngine,
+ * not exported from translation.ts. Define a local equivalent so we can
+ * bound OCR requests without refactoring translation.ts.
+ */
+function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
+    let timer: ReturnType<typeof setTimeout>;
+    return Promise.race([
+        p,
+        new Promise<T>((_, reject) => {
+            timer = setTimeout(() => reject(new Error(`Timeout after ${ms}ms`)), ms);
+        }),
+    ]).finally(() => clearTimeout(timer));
+}
 
 export class OcrLayoutService {
     private plugin: OpenRouterTranslatorPlugin;

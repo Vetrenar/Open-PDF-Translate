@@ -100,9 +100,16 @@ import type OpenRouterTranslatorPlugin from './main';
 import type { PdfTextExtractor } from './pdf-text-extractor';
 import type { NormalizedParagraph, ExtractPageResult } from './pdf-text-extractor';
 import type { OverlayPositionData } from './types';
-// T2.5: THE single construction site for saved overlay records.
-import { makeOverlay } from './overlay-factory';
-import { getCurrentEngine, computeLayoutSettingsHash } from './overlay-id';
+// P0-1 (Phase 1): static import replaces runtime `require('./paragraph-filter')`,
+// which throws `ReferenceError: require is not defined` on mobile (Obsidian's
+// mobile runtime has no CommonJS shim). Background queue path crashed on
+// mobile whenever paragraphFilterRules were enabled (the defaults).
+import { compileRules, filterParagraphs } from './paragraph-filter';
+// Phase 7 (V4 Schema): stable per-overlay identifier generator. Stamped on
+// every queue-built overlay so the saved result has an id matching what
+// the DOM-extraction and headless paths produce for the same source
+// paragraph — enables merge-by-id-first in updatePageOverlaysAndWrite.
+import { generateOverlayId, getCurrentEngine, computeLayoutSettingsHash } from './overlay-id';
 
 // ─────────────────────────────────────────────────────────────────────
 // Types
@@ -741,16 +748,8 @@ export class PdfLayoutQueue {
     const translationQueue: TranslationJob[] = [];
     let translationQueueClosed = false;
 
-    // T1.3: count of workers that are still alive (a worker exits when it
-    // observes cancellation, or — before the fix — after an empty page,
-    // which killed workers one by one and DEADLOCKED the extraction loop's
-    // backpressure wait once all of them were gone).
-    let activeWorkers = 0;
-
     // Worker function: pull jobs from translationQueue, translate, persist.
     const translationWorker = async (workerId: number): Promise<void> => {
-      activeWorkers++;
-      try {
       while (true) {
         if (this.cancelled) return;
         // Shift the oldest job (FIFO — preserves page order within a file)
@@ -794,13 +793,12 @@ export class PdfLayoutQueue {
             }
 
             // FIX C3: check cancel AFTER translation but BEFORE write.
-            // T1.3: a cancelled task returns to 'pending' (NOT 'error') so a
-            // later Resume re-processes it instead of leaving it stuck as a
-            // failed page. The worker itself exits — cancellation means stop.
+            // If cancelled, don't persist partial overlays — the task will
+            // be re-enqueued on resume.
             if (this.cancelled) {
-              jobTask.status = 'pending';
-              jobTask.error = undefined;
-              jobTask.finishedAt = undefined;
+              jobTask.status = 'error';
+              jobTask.error = 'cancelled before write';
+              jobTask.finishedAt = Date.now();
               this.notifyChange();
               return;
             }
@@ -814,13 +812,6 @@ export class PdfLayoutQueue {
             // FIX C4: if all paragraphs were empty (e.g. image-only page),
             // don't write anything — prevents creating a page bucket with
             // only empty-ot overlays that would trigger parser bugs.
-            //
-            // T1.3 (deadlock fix): `continue`, NOT `return`. The old `return`
-            // KILLED THE WORKER after every textless page; with default
-            // concurrency 3, three scanned pages in a row left zero workers
-            // alive, and the extraction loop's backpressure wait
-            // (`while (translationQueue.length >= MAX_QUEUE_SIZE) …`)
-            // blocked forever with nobody left to drain the queue.
             if (overlayData.length === 0) {
               jobTask.status = 'done';
               jobTask.finishedAt = Date.now();
@@ -828,17 +819,12 @@ export class PdfLayoutQueue {
                 `${LOG_PREFIX} [p${jobTask.pageNum}] Done: 0 paragraphs (all empty, nothing to write).`
               );
               this.notifyChange();
-              continue;
+              return;
             }
 
             await this.plugin.storage.updatePageOverlaysAndWrite(
               jobState.file,
               { [jobTask.pageNum]: overlayData },
-              // T-FULLPAGE-OVERWRITE: overlayData enumerates EVERY paragraph
-              // of the page (complete state) — REPLACE, don't merge, or a
-              // re-translated page keeps the previous generation's items
-              // wherever rects drifted apart.
-              { replace: true },
             );
 
             jobTask.status = 'done';
@@ -861,10 +847,6 @@ export class PdfLayoutQueue {
             );
             this.notifyChange();
           }
-      }
-      } finally {
-        // T1.3: worker bookkeeping — decrement no matter how the loop exits.
-        activeWorkers--;
       }
     };
 
@@ -998,14 +980,12 @@ export class PdfLayoutQueue {
           // P1-22 (Phase 10): high-watermark backpressure. Wait for the
           // translation workers to drain the queue before pushing more
           // jobs — prevents `translationQueue` from growing unbounded on
-          // large PDFs (which would OOM the tab).
-          //
-          // T1.3 (deadlock guard): if NO workers are alive anymore, break —
-          // waiting would be forever. (Workers can exit on cancellation;
-          // combined with the empty-page `continue` fix above, this makes
-          // the loop structurally unable to hang.)
+          // large PDFs (which would OOM the tab). The poll interval is
+          // 100ms — fast enough to keep workers fed, slow enough not to
+          // burn CPU. We also break out on cancel/dispose so the wait
+          // doesn't deadlock the loop during teardown.
           while (translationQueue.length >= MAX_QUEUE_SIZE) {
-            if (this.cancelled || this.disposed || activeWorkers === 0) break;
+            if (this.cancelled || this.disposed) break;
             await new Promise(resolve => setTimeout(resolve, 100));
           }
           if (this.cancelled) {
@@ -1036,17 +1016,6 @@ export class PdfLayoutQueue {
       // Wait for all workers to finish remaining translations
       await Promise.allSettled(workers);
       this.processing = false;
-
-      // T1.2 (safety net): auto-clear a stale cancel flag once the queue is
-      // fully idle. `cancelled` was meant as a best-effort stop for in-flight
-      // work, NOT a permanent pause — but combined with the old global probes
-      // in processing.ts it used to poison every subsequent manual run (see
-      // the "Error: cancelled" boot bug, T1.1). With tokens in place this is
-      // belt-and-suspenders, keeping the flag from sticking around after an
-      // aborted batch was fully drained or cleared.
-      if (this.cancelled && !this.hasPendingTasks()) {
-        this.cancelled = false;
-      }
 
       // If a task was added during teardown, re-trigger
       if (!this.cancelled && this.hasPendingTasks()) {
@@ -1145,52 +1114,134 @@ export class PdfLayoutQueue {
       return result;
     }
 
-    // T2.2: the queue's own paragraph-filter pass was REMOVED — it ran in
-    // addition to the identical pass inside executeTranslation, doubling
-    // the work and drifting apart from the interactive path whenever one
-    // of the two was changed. executeTranslation now owns filtering (and
-    // fills skipped paragraphs with their original text itself).
+    // Stage 2.4: apply paragraph filter rules. Paragraphs matching a filter
+    // rule are NOT sent to the LLM — they use their original text as the
+    // "translation". This saves API costs on page numbers, single letters,
+    // etc. The filter is applied here (not at extraction) so overlays are
+    // still created for filtered paragraphs — they just show the original.
+    let filteredTexts = translatableTexts;
+    let filteredIndices = translatableIndices;
+    const skippedByFilter = new Set<number>();  // indices into `paragraphs` array
+    const rules = this.plugin.settings.paragraphFilterRules;
+    if (rules && rules.length > 0) {
+      const compiled = compileRules(rules);
+      if (compiled.length > 0) {
+        const { translatable, skipped } = filterParagraphs(translatableTexts, compiled);
+        if (skipped.size > 0) {
+          filteredTexts = translatable.map(i => translatableTexts[i]);
+          filteredIndices = translatable.map(i => translatableIndices[i]);
+          for (const [localIdx, ruleName] of skipped) {
+            skippedByFilter.add(translatableIndices[localIdx]);
+          }
+          if (debug) {
+            console.log(`${LOG_PREFIX} [p${pageNum}] ParagraphFilter: ${skipped.size}/${translatableTexts.length} paragraphs filtered (not sent to LLM)`);
+          }
+        }
+      }
+    }
+
+    // If all paragraphs were filtered, return originals immediately.
+    if (filteredTexts.length === 0) {
+      for (const idx of translatableIndices) {
+        result[idx] = paragraphs[idx].text;
+      }
+      return result;
+    }
 
     let translated: string[];
+    let failureReason = '';
     try {
-      // Minimal TranslationUnit-like wrappers; executeTranslation applies
-      // the paragraph filter, [#N] batching, line-break policy and
-      // degradation tracking (T1.8) exactly like the interactive path.
-      // T1.2: cancellation is passed explicitly as a TOKEN owned by this
-      // queue — the translation core no longer probes the queue's global
-      // flag (which poisoned interactive runs — see T1.1/T1.2 notes).
-      const pseudoUnits = translatableTexts.map((text, i) => ({
+      // FIX H2: use shared chunking utility instead of a direct
+      // `translateBatch(fullText, count)` call. Previously this method sent
+      // an entire page (potentially 10K+ chars across 20 paragraphs) in a
+      // single API call. On small-context providers (e.g. Ollama at 4K)
+      // this exceeded the context window and the LLM silently fell back to
+      // originals. The shared utility:
+      //   1. Splits by `maxBatchChars` (per-text +20-char overhead).
+      //   2. Further splits by `contextWindow` if estimated tokens > 70%.
+      //   3. Translates chunks sequentially, preserves order, and falls
+      //      back to originals on per-chunk failure (partial-fault
+      //      tolerance — one bad chunk doesn't lose the whole page).
+      //   4. Checks `this.cancelled` between chunks and throws
+      //      `new Error('cancelled')` so the watcher modal's Pause/Cancel
+      //      takes effect within ~one chunk's LLM latency.
+      //
+      // The previous P1-9 cancel-polling (`Promise.race` against
+      // `CANCEL_POLL_INTERVAL_MS`) is no longer needed here — the utility
+      // does its own per-chunk cancel-check, and each chunk is much smaller
+      // than the old monolithic call, so the worst-case wait is bounded.
+      // FIX: use executeTranslation (same as standard 1-page path) instead of
+      // translateTextsWithChunking. Previously the queue path ALWAYS chunked,
+      // even for small pages — while the standard path sent the whole page in
+      // one API call when it fit within maxBatchChars. This caused:
+      //   1. Different translation quality (chunking loses context between chunks)
+      //   2. Truncated paragraphs (LLM returns partial [#N] markers per chunk)
+      //   3. Missing batch notices (chunking utility didn't show feedback)
+      //
+      // Now both paths use executeTranslation, which:
+      //   - Sends the whole page in one call if fullText.length <= maxBatchChars
+      //   - Only chunks if the page exceeds maxBatchChars
+      //   - Shows "Long page detected" notice when chunking
+      //   - Uses the same extractNumberedLinesRobust + restoreStructure pipeline
+      //
+      // We wrap the filtered texts in minimal TranslationUnit-like objects so
+      // executeTranslation can process them (it expects units with .text field).
+      const pseudoUnits = filteredTexts.map((text, i) => ({
         id: `p${pageNum}-${i}`,
         paragraphId: `p${pageNum}-${i}`,
         originalSpans: [],
         text,
       } as any));
-      translated = await this.plugin.processor.executeTranslation(pseudoUnits, {
-        isCancelled: () => this.isCancelled(),
-      });
+      translated = await this.plugin.processor.executeTranslation(pseudoUnits);
     } catch (err: any) {
       // Page-level fault tolerance: fall back to originals rather than
       // aborting the whole PDF. The user can re-translate this page later.
-      const failureReason = err?.message ?? String(err);
+      // (This catch covers catastrophic failures — e.g. all chunks failed,
+      // network down, or `cancelled` thrown between chunks. Per-chunk
+      // partial failures are already absorbed inside the utility, which
+      // falls back to originals for the failed chunk and keeps going.)
+      failureReason = err?.message ?? String(err);
       console.warn(`${LOG_PREFIX} [p${pageNum}] Translation failed, using originals as fallback:`, err);
+      // Show a Notice so the user knows translation failed (layout was still
+      // extracted and saved — they can re-translate from the overlay later).
       new Notice(
         `[p${pageNum}] Translation failed: ${failureReason.length > 80 ? failureReason.substring(0, 77) + '...' : failureReason}\n` +
         `Translation completed. Some pages fell back to original text.`,
         8000,
       );
-      translated = translatableTexts.slice();
+      // Stage 2.4: fallback must use filteredTexts (not translatableTexts)
+      // because `translated[j]` is mapped to `filteredIndices[j]` below.
+      // Using translatableTexts here would misalign translations when the
+      // filter skipped some paragraphs.
+      translated = filteredTexts.slice();
     }
 
-    // Map translated texts back to original paragraph indices (1:1 by
-    // construction — executeTranslation returns one line per pseudo-unit).
-    for (let j = 0; j < translatableIndices.length; j++) {
-      const origIdx = translatableIndices[j];
-      const fallback = translatableTexts[j];
-      // NOTE (T5.3): no unconditional <br>-stripping anymore — the line-break
-      // policy (table-like / preserveSourceLineBreaks) was already applied
-      // inside executeTranslation; stripping here would flatten tables again.
-      const line = (translated[j] || '').trim();
-      result[origIdx] = line || fallback;
+    // Phase 15.4: the previous `[⚠ untranslated] ` marker prefix has been
+    // REMOVED — it leaked into the rendered overlay and into the persisted
+    // .translations.md, where the leading `[` made the first line look like
+    // a Markdown task-list item and broke some downstream parsers. The
+    // fallback to original text is still preserved below; only the visible
+    // marker is gone. A Notice (Phase 15.6) tells the user the page fell back.
+
+    // Stage 2.4: map translated texts back to original paragraph indices.
+    // `translated[j]` corresponds to `filteredTexts[j]` which corresponds
+    // to `filteredIndices[j]` — NOT `translatableIndices[j]` (the latter
+    // includes filter-skipped paragraphs). Skipped paragraphs get their
+    // original text (no LLM call was made for them).
+    for (let j = 0; j < filteredIndices.length; j++) {
+      const origIdx = filteredIndices[j];
+      const fallback = filteredTexts[j];
+      // Strip <br> tags — translation should be continuous text (Phase 7)
+      const cleaned = (translated[j] || fallback)
+        .replace(/<br\s*\/?>/gi, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+      result[origIdx] = cleaned || fallback;
+    }
+
+    // Stage 2.4: fill in filter-skipped paragraphs with their original text.
+    for (const idx of skippedByFilter) {
+      result[idx] = paragraphs[idx].text;
     }
 
     return result;
@@ -1221,23 +1272,27 @@ export class PdfLayoutQueue {
       // FIX C4: skip paragraphs with no original text and no translation.
       if (!original && !translated) continue;
 
-      try {
-        // T2.5: single construction site (stable id + engine stamped inside
-        // the factory, invalid rects rejected by its invariant instead of
-        // silently producing corrupt records).
-        result.push(makeOverlay({
-          page: p.page,
-          rect: p.relativeRect,
-          text: p.text,
-          translated: translated || p.text,
-          fontFamily: p.fontFamily,
-          fontSize: p.fontSize,
-          originalFontSizes: p.originalFontSizes,
-          engine: getCurrentEngine(this.plugin),
-        }));
-      } catch {
-        // invalid rect/page — skip (factory invariant)
-      }
+      result.push({
+        selector: '',
+        textContent: p.text,
+        relativeRect: p.relativeRect,
+        page: p.page,
+        // If translation is empty but original exists, fall back to original
+        // (better than empty — at least the user sees the source text).
+        translatedText: translated || p.text,
+        fontSize: p.fontSize,
+        fontFamily: p.fontFamily,
+        originalFontSizes: p.originalFontSizes,
+        // Phase 7 (V4 Schema): stable id from page + rect@3dec + textContent.
+        // Matches the id produced by overlay.ts extractPositionDataFrom
+        // and headless-translate.ts buildOverlays for the same source
+        // paragraph — enables merge-by-id-first in updatePageOverlaysAndWrite.
+        id: generateOverlayId(p.page, p.relativeRect, p.text || ''),
+        // Phase 8 (V4 Schema): engine stamp from current provider/model.
+        // Queue path runs through the TranslationEngine (via processing.ts
+        // executeTranslation), so current settings match.
+        engine: getCurrentEngine(this.plugin),
+      });
     }
     return result;
   }

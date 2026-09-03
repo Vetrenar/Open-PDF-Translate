@@ -354,14 +354,6 @@ const EN: Record<string, string> = {
     'modal.watcher.done': 'Done',
     'modal.watcher.failed': 'Failed',
     'modal.watcher.status': 'Status',
-    'modal.watcher.activeTranslations': 'Active Translations',
-    'modal.watcher.availableFiles': 'Available Files',
-    'modal.watcher.hint': 'Click "Translate" on any file to add it to the queue. Files are processed in the order you click them.',
-    'modal.watcher.cleared': 'Cleared {n} finished item(s).',
-    'modal.watcher.noFinished': 'No finished items to clear.',
-    'modal.watcher.cancelling': 'Cancelling — running page will finish, no new pages will start.',
-    'modal.watcher.retranslating': 'Re-translating "{name}"...',
-    'modal.watcher.translating': 'Translating "{name}"...',
 
     // ─── OCR modal ───
     'modal.ocr.title': 'OCR: Recognize PDF',
@@ -848,14 +840,6 @@ const RU: Record<string, string> = {
     'modal.watcher.done': 'Готово',
     'modal.watcher.failed': 'Ошибка',
     'modal.watcher.status': 'Статус',
-    'modal.watcher.activeTranslations': 'Активные переводы',
-    'modal.watcher.availableFiles': 'Доступные файлы',
-    'modal.watcher.hint': 'Нажмите «Перевести» на любом файле, чтобы добавить его в очередь. Файлы обрабатываются в порядке нажатия.',
-    'modal.watcher.cleared': 'Очищено {n} завершённых элементов.',
-    'modal.watcher.noFinished': 'Нет завершённых элементов для очистки.',
-    'modal.watcher.cancelling': 'Отмена — текущая страница завершится, новые не начнутся.',
-    'modal.watcher.retranslating': 'Повторный перевод «{name}»...',
-    'modal.watcher.translating': 'Перевод «{name}»...',
 
     // ─── OCR modal ───
     'modal.ocr.title': 'OCR: распознать PDF',

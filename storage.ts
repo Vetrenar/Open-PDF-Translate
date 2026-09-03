@@ -18,11 +18,29 @@ import {
 // the `engine` field on overlays that predate Phase 8.
 import { generateOverlayId, computeLayoutSettingsHash, getCurrentEngine } from './overlay-id';
 
-// T2.4: DOMPurify config imported from shared.ts — the parser and the
-// renderer MUST use the identical whitelist or saved content would not
-// round-trip (a stray tag allowed in one place but stripped in the other
-// silently alters translations on reload).
-import { PURIFY_CONFIG } from './shared';
+// Phase 7 (C4): DOMPurify config for sanitizing translated text on read.
+//
+// Translation files (.translations.md) are user-editable markdown — anything
+// the user (or a malicious actor with vault write access) puts in the
+// `translatedText` line would otherwise end up in the DOM via innerHTML in
+// the overlay renderer. DOMPurify strips everything except a strict
+// whitelist of inline formatting tags so the rendered overlay can't execute
+// arbitrary HTML/JS.
+//
+// - ALLOWED_TAGS: only basic inline formatting (`<b>`, `<i>`, `<br>`, etc.).
+//   No `<a>` (click-handler / javascript: URL risk), no `<img>` (onerror
+//   risk), no `<script>`/`<style>`/`<iframe>`.
+// - ALLOWED_ATTR: empty — no attributes at all, so no `onerror`, `onclick`,
+//   `style`, `class`, `href`. This is stricter than necessary but matches
+//   the SPEC's defense-in-depth posture.
+// - KEEP_CONTENT: true — strip disallowed tags but keep their text content
+//   (so `<script>alert(1)</script>` becomes `alert(1)` instead of executing,
+//   and `<a href="...">click</a>` becomes `click`).
+const PURIFY_CONFIG: DOMPurify.Config = {
+    ALLOWED_TAGS: ['b', 'i', 'em', 'strong', 'br', 'sup', 'sub', 'u'],
+    ALLOWED_ATTR: [],
+    KEEP_CONTENT: true,
+};
 
 /**
  * VERSION HISTORY:
@@ -34,13 +52,8 @@ import { PURIFY_CONFIG } from './shared';
  *     V3 files continue to parse (back-compat) and are lazily migrated to
  *     V4 on the next write through `updatePageOverlaysAndWrite` (see
  *     `needsMigration` flag on SavedOverlay).
- * v5: T5.3/T4.3 — adds `lh` (persisted manual line-height adjustment)
- *     alongside the existing `fs`; the layoutSettingsHash semantics changed
- *     to LIVE-FIELDS-ONLY (T3.1), and the v4→v5 migration RE-STAMPS the
- *     hash so the upgrade does not mass-invalidate translated documents.
- *     Old readers ignore unknown keys — forward compatible.
  */
-export const STORAGE_FORMAT_VERSION = 5;
+export const STORAGE_FORMAT_VERSION = 4;
 
 /**
  * Manages storage and retrieval of translation overlays in individual .translations.md files.
@@ -262,24 +275,8 @@ export class TranslationStorage {
                 const metadataStr = JSON.stringify(metadata);
                 const comment = `%% ${metadataStr} %%`;
 
-                // Convert newlines in translated text to <br> for markdown rendering.
-                // T5.3 (format-protection): a line starting with `%%` would be
-                // misread as a metadata comment on the next parse — escape it
-                // with a leading backslash; the parser reverses this.
-                const translated = (item.translatedText || '')
-                    .trim()
-                    .replace(/\n/g, '<br>')
-                    .replace(/^(%%)/, '\\$1')
-                    .replace(/\n(%%)/g, '\n\\$1');
-
-                // T4.3 (v5): persist MANUAL style adjustments when present
-                // (dedicated keys — legacy `fs` stays the original size).
-                if (Number.isFinite((item as any).adjustedFontSize)) {
-                    (metadata as any).afs = parseFloat((item as any).adjustedFontSize.toFixed(2));
-                }
-                if (Number.isFinite((item as any).adjustedLineHeight)) {
-                    (metadata as any).alh = parseFloat((item as any).adjustedLineHeight.toFixed(2));
-                }
+                // Convert newlines in translated text to <br> for markdown rendering
+                const translated = (item.translatedText || '').trim().replace(/\n/g, '<br>');
 
                 md += `${comment}\n\n`;
                 if (translated) {
@@ -380,12 +377,12 @@ export class TranslationStorage {
                 primaryEngine = fmData.engine;
                 layoutSettingsHash = fmData.layoutSettingsHash;
                 // Phase 8 (V4 Schema): V3 files (format-version < 4) need
-                // id+engine back-fill. T5.3: v4 files (< 5) ALSO migrate —
-                // solely to RE-STAMP `layoutSettingsHash` with the new
-                // live-fields-only hash (T3.1); without this, every v4 file
-                // would hash-mismatch on first load after the overhaul and
-                // trigger a pointless full re-translation of the document.
-                if (formatVersion < 5) {
+                // migration. The flag is consumed by
+                // `updatePageOverlaysAndWrite`, which stamps `id` + `engine`
+                // on every overlay and bumps format-version to 4 on the next
+                // write. Lazy migration keeps V3 files working without a
+                // forced one-time rewrite of every file in the vault.
+                if (formatVersion < 4) {
                     needsMigration = true;
                 }
             } catch (err) {
@@ -429,127 +426,126 @@ export class TranslationStorage {
 
                 const metaMatch = line.match(V3_META_REGEX);
                 if (metaMatch) {
-                    // T5.3 (format-protection): a line that merely LOOKS like
-                    // a metadata comment (model echoed `%% {"fake":1} %%` into
-                    // its translation, or a user pasted one) must not corrupt
-                    // the file. Only JSON that parses AND passes schema
-                    // validation acts as a real overlay separator; anything
-                    // else is treated as translation CONTENT and appended to
-                    // the current page's most recent overlay.
-                    let metadata: any = null;
                     try {
-                        metadata = JSON.parse(metaMatch[1]);
-                    } catch { /* not JSON → content, handled below */ }
-
-                    if (metadata === null || !this.validateMetadata(metadata)) {
-                        if (this.plugin.settings.debugMode) {
-                            console.warn('PDF Translator: %% line failed metadata validation — treated as translation content:', line.substring(0, 80));
-                        }
-                        const bucket = pageOverlays[currentPage];
-                        const lastOverlay = bucket && bucket.length > 0 ? bucket[bucket.length - 1] : null;
-                        if (lastOverlay && line.trim()) {
-                            lastOverlay.translatedText = (lastOverlay.translatedText || '')
-                                ? lastOverlay.translatedText + '\n' + line
-                                : line;
-                        }
-                        continue;
-                    }
-
-                    // P2-45 (Phase 7): read ALL non-empty lines until the
-                    // next `%%` overlay comment, `## Page` header, or
-                    // `<!-- empty -->` marker — not just the first one.
-                    // (A multi-line translation used to be silently truncated
-                    // to its first line on reload.)
-                    //
-                    // Empty-line handling: a SINGLE blank line between two
-                    // content lines is preserved (joined with `\n`). A blank
-                    // line immediately followed by `%%` or `## Page` is the
-                    // writer's separator and ends the translation.
-                    //
-                    // `<br>` is converted to `\n` to reverse the writer's
-                    // `\n` → `<br>` substitution.
-                    const translatedLines: string[] = [];
-                    for (let j = i + 1; j < lines.length; j++) {
-                        const nextLine = lines[j].trim();
-
-                        // End-of-translation markers. T5.3: only a line that
-                        // parses as VALID metadata ends the block — a fake
-                        // `%% … %%` line inside the translation is content.
-                        if (V3_META_REGEX.test(nextLine)) {
-                            let nextMeta: any = null;
-                            try { nextMeta = JSON.parse(nextLine.match(V3_META_REGEX)![1]); } catch { /* content */ }
-                            if (nextMeta !== null && this.validateMetadata(nextMeta)) break;
-                            translatedLines.push(nextLine);
-                            i = j;
+                        const metadata = JSON.parse(metaMatch[1]);
+                        if (!this.validateMetadata(metadata)) {
+                            if (this.plugin.settings.debugMode) {
+                                console.warn('PDF Translator: Invalid V3 metadata structure', metadata);
+                            }
                             continue;
                         }
-                        if (V3_PAGE_HEADER.test(nextLine)) break;      // page header → stop
-                        if (V3_EMPTY_MARKER.test(nextLine)) {          // explicit empty marker
-                            i = j; // consume the marker so the outer loop skips it
-                            break;
-                        }
 
-                        if (nextLine === '') {
-                            // Blank line: end of translation if followed by
-                            // a structural marker; otherwise it's an
-                            // in-translation paragraph break — preserve it.
-                            const after = lines[j + 1]?.trim() ?? '';
-                            if (after === '' || V3_META_REGEX.test(after) || V3_PAGE_HEADER.test(after)) {
+                        // P2-45 (Phase 7): read ALL non-empty lines until the
+                        // next `%%` overlay comment, `## Page` header, or
+                        // `<!-- empty -->` marker — not just the first one.
+                        //
+                        // Previously this loop grabbed only the first
+                        // non-empty line after the `%%` metadata block, so a
+                        // multi-line translation (e.g. a stanza, a list, or
+                        // any translation whose source paragraph spanned
+                        // multiple display lines) was silently TRUNCATED on
+                        // reload — only line 1 survived. pdf-export.ts:264-268
+                        // already joined all lines until the next `%%`/`#`;
+                        // this aligns the two parsers.
+                        //
+                        // Empty-line handling: a SINGLE blank line between two
+                        // content lines is preserved (joined with `\n`). A
+                        // blank line immediately followed by `%%` or `## Page`
+                        // is treated as the end of the translation (the blank
+                        // is the writer's separator, not part of the content —
+                        // see `generateMarkdownForOverlay` which always emits
+                        // `\n\n` between an overlay's text and the next `%%`).
+                        //
+                        // `<br>` (case-insensitive, optional self-closing
+                        // slash) is converted to `\n` to reverse the writer's
+                        // `\n` → `<br>` substitution.
+                        const translatedLines: string[] = [];
+                        for (let j = i + 1; j < lines.length; j++) {
+                            const nextLine = lines[j].trim();
+
+                            // End-of-translation markers
+                            if (V3_META_REGEX.test(nextLine)) break;        // next overlay → stop
+                            if (V3_PAGE_HEADER.test(nextLine)) break;      // page header → stop
+                            if (V3_EMPTY_MARKER.test(nextLine)) {          // explicit empty marker
+                                i = j; // consume the marker so the outer loop skips it
                                 break;
                             }
-                            translatedLines.push('');
-                            continue;
+
+                            if (nextLine === '') {
+                                // Blank line: end of translation if followed by
+                                // a structural marker (writer emits `\n\n`
+                                // between translated text and the next `%%`/
+                                // `## Page`). Otherwise it's an in-translation
+                                // paragraph break — preserve it.
+                                const after = lines[j + 1]?.trim() ?? '';
+                                if (after === '' || V3_META_REGEX.test(after) || V3_PAGE_HEADER.test(after)) {
+                                    break;
+                                }
+                                translatedLines.push('');
+                                continue;
+                            }
+
+                            translatedLines.push(nextLine);
+                            i = j; // advance past the last consumed content line
+                        }
+                        let translatedText = translatedLines.length > 0
+                            ? translatedLines.join('\n').replace(/<br\s*\/?>/gi, '\n')
+                            : '';
+
+                        // Phase 7 (C4): sanitize translated text to prevent stored XSS.
+                        // The overlay renderer injects this string via innerHTML, so any
+                        // HTML/JS in the file would otherwise execute. The whitelist
+                        // (PURIFY_CONFIG) only permits inline formatting tags.
+                        translatedText = DOMPurify.sanitize(translatedText, PURIFY_CONFIG);
+
+                        // FIX A2: bucket by metadata.page (canonical), NOT by ## Page header.
+                        // Recovery mode: if an overlay sits under a mismatched header
+                        // (e.g. due to a previous writer bug or manual edit), we
+                        // re-bucket it to its canonical page and log a warning.
+                        const realPageKey = String(metadata.page);
+                        if (metadata.page !== Number(currentPage)) {
+                            console.warn(
+                                `[storage] Recovery: overlay under ## Page ${currentPage} ` +
+                                `has metadata.page=${metadata.page}. Re-bucketing to page ${metadata.page}.`
+                            );
+                            if (!pageOverlays[realPageKey]) pageOverlays[realPageKey] = [];
                         }
 
-                        translatedLines.push(nextLine);
-                        i = j; // advance past the last consumed content line
+                        const overlayData: OverlayPositionData = {
+                            selector: '', // Selector is deprecated
+                            textContent: metadata.ot || '', // Original Text from metadata
+                            relativeRect: {
+                                left: metadata.r.l,
+                                top: metadata.r.t,
+                                width: metadata.r.w,
+                                height: metadata.r.h,
+                            },
+                            page: metadata.page,
+                            translatedText,
+                            fontSize: metadata.fs,
+                            fontFamily: metadata.ff,
+                            originalFontSizes: metadata.ofs,
+                            // Phase 7 (V4 Schema): read `id` if present.
+                            // V3 files (no `id` key) get `undefined` here —
+                            // merge-by-id-first in `updatePageOverlaysAndWrite`
+                            // falls back to rect-overlap for these, so V3
+                            // files continue to work without migration.
+                            id: metadata.id,
+                            // Phase 8 (V4 Schema): read `engine` if present.
+                            // V3 files (no `engine` key) get `undefined`;
+                            // the V3→V4 migration in `updatePageOverlaysAndWrite`
+                            // back-fills this on first write. Consumers
+                            // (e.g. future stale-engine-detection) should
+                            // treat `undefined` as "unknown — pre-V4".
+                            engine: metadata.engine,
+                        };
+                        if (!pageOverlays[realPageKey]) pageOverlays[realPageKey] = [];
+                        pageOverlays[realPageKey].push(overlayData);
+                    } catch (e) {
+                         if (this.plugin.settings.debugMode) {
+                            console.debug('PDF Translator: Invalid V3 metadata JSON', e);
+                        }
                     }
-                    let translatedText = translatedLines.length > 0
-                        ? translatedLines.join('\n')
-                            .replace(/<br\s*\/?>/gi, '\n')
-                            .replace(/^\\(%%)/, '$1')
-                            .replace(/\n\\(%%)/g, '\n$1')
-                        : '';
-
-                    // Phase 7 (C4): sanitize translated text to prevent stored XSS.
-                    translatedText = DOMPurify.sanitize(translatedText, PURIFY_CONFIG);
-
-                    // FIX A2: bucket by metadata.page (canonical), NOT by ## Page header.
-                    // Recovery mode: if an overlay sits under a mismatched header
-                    // (e.g. due to a previous writer bug or manual edit), we
-                    // re-bucket it to its canonical page and log a warning.
-                    const realPageKey = String(metadata.page);
-                    if (metadata.page !== Number(currentPage)) {
-                        console.warn(
-                            `[storage] Recovery: overlay under ## Page ${currentPage} ` +
-                            `has metadata.page=${metadata.page}. Re-bucketing to page ${metadata.page}.`
-                        );
-                    }
-                    if (!pageOverlays[realPageKey]) pageOverlays[realPageKey] = [];
-
-                    const overlayData: OverlayPositionData = {
-                        selector: '', // Selector is deprecated
-                        textContent: metadata.ot || '', // Original Text from metadata
-                        relativeRect: {
-                            left: metadata.r.l,
-                            top: metadata.r.t,
-                            width: metadata.r.w,
-                            height: metadata.r.h,
-                        },
-                        page: metadata.page,
-                        translatedText,
-                        fontSize: metadata.fs,
-                        fontFamily: metadata.ff,
-                        originalFontSizes: metadata.ofs,
-                        // Phase 7 (V4 Schema): read `id` if present.
-                        id: metadata.id,
-                        // Phase 8 (V4 Schema): read `engine` if present.
-                        engine: metadata.engine,
-                        // T4.3 (v5): persisted MANUAL style adjustments.
-                        ...(Number.isFinite(metadata.afs) ? { adjustedFontSize: metadata.afs } as any : {}),
-                        ...(Number.isFinite(metadata.alh) ? { adjustedLineHeight: metadata.alh } as any : {}),
-                    };
-                    pageOverlays[realPageKey].push(overlayData);
                 }
             }
         } else {
@@ -804,16 +800,6 @@ export class TranslationStorage {
      *     — without it, merge-by-overlap can silently resurrect deleted
      *     items (P0-9) when the caller's "new" array omits items that
      *     overlap the survivors.
-     *
-     *     T-FULLPAGE-OVERWRITE: EVERY full-page writer (interactive save,
-     *     background queue, headless, layout-file regeneration, repair)
-     *     now passes `replace: true` — a full-page translation/render
-     *     produces the COMPLETE new page state, and merge semantics kept
-     *     the previous generation's items alive wherever rects drifted
-     *     apart (re-segmentation, engine change, or pre-hotfix junk),
-     *     visibly duplicating overlays. MERGE remains only as the API
-     *     default for hypothetical partial writes; no production caller
-     *     relies on it anymore.
      *   - `opts.originalsOnly: true` → emit `originals-only: true` in
      *     frontmatter (used by `createLayoutFileWithOriginals`).
      *   - `opts.frontmatter` → additional frontmatter fields merged after
@@ -930,13 +916,6 @@ export class TranslationStorage {
                         }
                     }
                 }
-                // T5.3: re-stamp the layoutSettingsHash with the NEW
-                // live-fields-only hash (T3.1). v4 files carry the OLD
-                // full-object hash — without this re-stamp every existing
-                // document would hash-mismatch on first load after the
-                // overhaul and be fully re-translated (money + time) for
-                // zero behavioural change.
-                savedOverlay.layoutSettingsHash = computeLayoutSettingsHash(this.plugin.layoutSettings);
                 // Clear the flag so we don't re-migrate on subsequent writes
                 // (the format-version bump on disk will also prevent
                 // `parseMarkdownOverlay` from re-setting it on next read).
@@ -1022,24 +1001,13 @@ export class TranslationStorage {
                 // Phase 8 (C5): atomic write (modify path).
                 await this.atomicWrite(mdFile, mdFile.path, md);
             } else {
-                // T5.4 (duplicate-file guard): if a translation file is
-                // ALREADY linked to this PDF (e.g. the user renamed it and
-                // pdfToMdMap has not been rebuilt yet), creating a second
-                // canonical file would fork the truth — two files, one PDF.
-                // Re-check the link under the write lock and redirect.
-                const linked = await this.findTranslationFileForPdf(pdfFile);
-                if (linked && linked.path !== translationPath) {
-                    mdFile = linked;
-                    const mdExisting = this.generateMarkdownForOverlay(savedOverlay, pdfFile, opts);
-                    await this.atomicWrite(mdFile, mdFile.path, mdExisting);
-                } else {
                 // CREATE PATH: File does not exist, so create it.
                 await this.ensureStorageFolder();
                 // Phase 2 (markSelfWrite fold): atomicWrite stamps self-write internally.
+                // Phase 8 (C5): atomic write (create path).
                 await this.atomicWrite(null, translationPath, md);
                 // This map update is now safely inside the sequential queue
                 this.plugin.pdfToMdMap.set(pdfFile.path, translationPath);
-                }
             }
 
             // FIX B1 (revised): directly update the renderer's in-memory cache
@@ -1155,28 +1123,97 @@ export class TranslationStorage {
     // ============================================================
 
     /**
-     * T5.1 (Q6 decision, variant 2): serialized direct write.
+     * Atomic write: write to a temp file, then rename it over the destination.
      *
-     * The previous temp-file + `vault.rename(temp, target)` dance claimed
-     * atomicity it did not have: renaming over an EXISTING file throws on
-     * Obsidian's adapters, so every real write fell into the non-atomic
-     * fallback anyway — while STILL creating/deleting a .tmp file each time
-     * (noise for Obsidian Sync / Dropbox / file watchers).
+     * Why: `vault.modify(file, content)` truncates the file in place and writes
+     * the new content. If Obsidian (or the OS) is interrupted mid-write — crash,
+     * power loss, sync conflict, mobile app being killed by the OS — the file
+     * can be left with a partial write, corrupting the user's translation data.
      *
-     * Concurrency safety comes from the per-file `writingPromises` chain in
-     * `updatePageOverlaysAndWrite` (all writers serialize through it), and
-     * `markSelfWrite` suppresses the self-triggered cache rebuild.
+     * How: we write `targetPath + '.tmp'` first, then `vault.rename(temp, targetPath)`
+     * which is a single atomic filesystem operation on most platforms. Either the
+     * rename succeeds (new content fully visible) or it fails (old content still
+     * intact). No partial state.
+     *
+     * Fallback: if rename fails (e.g. cross-device, permission, or adapter
+     * doesn't support rename on mobile), we fall back to direct modify/create.
+     * This is non-atomic but matches the pre-Phase-8 behaviour so we don't
+     * regress on platforms where rename is unavailable.
+     *
+     * Temp cleanup: any leftover `.tmp` file from a previous failed write is
+     * deleted at the start. If the rename itself fails, the temp file we just
+     * created is deleted in the catch block (best-effort) before falling back.
+     *
+     * @param targetFile Existing TFile to overwrite, or `null` if the target
+     *                   doesn't exist yet (in which case we create it).
+     * @param targetPath Vault path of the destination file.
+     * @param content    Full text content to write.
      */
     private async atomicWrite(
         targetFile: TFile | null,
         targetPath: string,
         content: string
     ): Promise<void> {
+        // Phase 2 (markSelfWrite fold): every caller of `atomicWrite` previously
+        // had to remember to call `this.plugin.markSelfWrite(targetPath)` right
+        // before invoking us. Six storage.ts sites did so; some forgot (audit 09).
+        // Folding the call into `atomicWrite` itself makes self-write suppression
+        // (metadataCache.on('changed') short-circuit) guaranteed for every
+        // atomic-write path, and lets us delete the redundant manual calls at
+        // the 6 storage.ts sites. The 2 ms-window is the same: markSelfWrite
+        // stamps the path before `vault.create(tempPath, ...)` runs, so the
+        // eventual rename into `targetPath` (and the metadataCache.on('changed')
+        // event it fires) lands inside the TTL window.
         this.plugin.markSelfWrite(targetPath);
-        if (targetFile) {
-            await this.app.vault.modify(targetFile, content);
-        } else {
-            await this.app.vault.create(targetPath, content);
+
+        const tempPath = targetPath + '.tmp';
+        let tempFile: TFile | null = null;
+        try {
+            // Clean up any existing temp file first (leftover from a previous
+            // failed write). `vault.create` would otherwise throw "file already
+            // exists".
+            const existingTemp = this.app.vault.getAbstractFileByPath(tempPath);
+            if (existingTemp instanceof TFile) {
+                await this.app.vault.delete(existingTemp);
+            }
+
+            // Write temp file (same folder as target — required for rename to
+            // be atomic; cross-folder renames can be non-atomic on some
+            // filesystems).
+            tempFile = await this.app.vault.create(tempPath, content);
+
+            // Rename temp over target. `vault.rename` handles both the
+            // "overwrite existing" and "create new" cases atomically —
+            // Obsidian's adapter delegates to the underlying FS rename which
+            // is atomic on POSIX systems and on Windows (with ReplaceFile semantics).
+            await this.app.vault.rename(tempFile, targetPath);
+            // After a successful rename, `tempFile` is no longer at `tempPath`
+            // (it now lives at `targetPath`), so the finally/cleanup below
+            // must not try to delete it.
+            tempFile = null;
+        } catch (e) {
+            console.warn('Atomic write failed, falling back to direct write:', e);
+            // Cleanup temp file if it still exists (rename didn't happen).
+            if (tempFile) {
+                try { await this.app.vault.delete(tempFile); } catch { /* ignore cleanup errors */ }
+                tempFile = null;
+            }
+            // Best-effort cleanup of any other leftover temp at this path
+            // (e.g. the rename succeeded on the FS but threw in Obsidian's
+            // event dispatch — leaving a stale entry in the cache).
+            try {
+                const staleTemp = this.app.vault.getAbstractFileByPath(tempPath);
+                if (staleTemp instanceof TFile) {
+                    await this.app.vault.delete(staleTemp);
+                }
+            } catch { /* ignore */ }
+
+            // Fallback to direct write (non-atomic, but matches pre-Phase-8 behaviour).
+            if (targetFile) {
+                await this.app.vault.modify(targetFile, content);
+            } else {
+                await this.app.vault.create(targetPath, content);
+            }
         }
     }
 }

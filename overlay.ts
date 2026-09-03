@@ -14,10 +14,6 @@ import { OverlayUIRenderer } from './overlay-ui'; // Import the new UI renderer
 // paths can locate the exact entry by id instead of fuzzy-matching on
 // textContent (which is ambiguous when a page contains duplicate paragraphs).
 import { generateOverlayId, getCurrentEngine } from './overlay-id';
-// T2.4: single source of truth for the bleed constants (was a hand-synced
-// duplicate of overlay-ui.ts's — the exact duplication class that produced
-// the historical double-bleed bug).
-import { BLEED_X, BLEED_Y_NORMAL, BLEED_Y_TIGHT } from './shared';
 // Phase 16 (C17): i18n shim — replaces hardcoded English menu strings with
 // localizable keys. Falls back to the key itself when no translation is
 // registered, so the plugin stays functional in English even without a
@@ -106,6 +102,10 @@ export class OverlayRenderer {
     //   - `invalidatePage(pageNumber)` — clear a single page entry + its
     //     `loadedOverlayPages` tracking bit so the next access force-reloads.
     //     Replaces `storage.invalidateDomCache(path, pageNumber)` (P1-34).
+    //   - `mergePage(pageNumber, data)` — write a single page entry directly
+    //     into the cache (kept for completeness; no live external callers —
+    //     all writes go through `storage.updatePageOverlaysAndWrite` which
+    //     calls `updateCacheFromWrite` internally).
     //   - `reloadPage(pageNumber)` — convenience wrapper that delegates to
     //     `loadSavedOverlayForPage(pageNumber, true)`.
     private _cachedOverlayData: SavedOverlay | null = null;
@@ -440,16 +440,6 @@ export class OverlayRenderer {
         // Cleanup previous observers
         this.cleanupMonitoring();
 
-        // Bug fix: re-attach marquee listeners if BBox edit mode is ON.
-        // The OverlayUIRenderer constructor attaches them once, but if the
-        // user opens a NEW PDF (leaf change), the old listeners are still on
-        // `document` — however, they may have been detached by a prior
-        // cleanupMonitoring() or leaf switch. Re-attach to be safe.
-        if (this.plugin.settings.bboxEditMode && this.uiRenderer) {
-            this.uiRenderer.detachMarqueeListeners();
-            this.uiRenderer.attachMarqueeListeners();
-        }
-
         // Load translation data and identify pages that need overlays
         await this.initializeOverlayStateForPdf(leaf.view.file);
 
@@ -466,14 +456,6 @@ export class OverlayRenderer {
             const viewerContainer = leaf.view.containerEl.querySelector('.pdfViewer, #viewer');
             if (viewerContainer) {
                 this.logDebug(`PDF viewer found. Monitoring for ${this.pagesWithOverlays.size} pages with saved translations.`);
-                // T4.2 (scale-init fix): seed the scale from the viewer BEFORE
-                // any overlay renders. lastKnownScale used to stay 1.0 until
-                // the zoom MutationObserver first fired — overlays rendered
-                // before that got font sizes computed for the wrong zoom and
-                // were then "fixed" by shrink-to-fit, losing the intended
-                // typography.
-                const initialScale = this.plugin.pdfDom.getScaleFactor(leaf);
-                if (initialScale > 0) this.lastKnownScale = initialScale;
                 // Determine scroll container first so IO uses the correct root
                 this.monitorScrolling(viewerContainer as HTMLElement);
                 // Now IO uses scrollableContainer as root
@@ -1372,6 +1354,27 @@ export class OverlayRenderer {
         return currentPage ? this.plugin.pdfDom.getTextLayerOf(currentPage) : null;
     }
 
+    public getCurrentVisiblePage(pages: NodeListOf<HTMLElement> | null): HTMLElement | null {
+        // Kept for backward compatibility; the adapter owns the real logic.
+        if (!pages || pages.length === 0) return this.plugin.pdfDom.getCurrentVisiblePage();
+        let bestPage: HTMLElement | null = null;
+        let maxVisibleArea = -1;
+        for (const page of Array.from(pages)) {
+            const rect = page.getBoundingClientRect();
+            if (rect.width === 0 || rect.height === 0) continue;
+            const viewportHeight = window.innerHeight;
+            const visibleTop = Math.max(0, rect.top);
+            const visibleBottom = Math.min(viewportHeight, rect.bottom);
+            const visibleHeight = Math.max(0, visibleBottom - visibleTop);
+            const visibleArea = visibleHeight * rect.width;
+            if (visibleArea > maxVisibleArea) {
+                maxVisibleArea = visibleArea;
+                bestPage = page;
+            }
+        }
+        return bestPage;
+    }
+
     // ============================================================
     // Overlay Creation & Rendering
     // ============================================================
@@ -1721,7 +1724,7 @@ export class OverlayRenderer {
                 return { positionData: [], pageNumber: currentPageNumber, hasData: false };
             }
 
-            const positionData = this.extractPositionDataFrom(textLayer, overlayContainer, textLayerRect, currentPageNumber);
+            const positionData = this.extractPositionDataFrom(textLayer, overlayContainer, textLayerRect);
 
             return {
                 positionData,
@@ -1734,20 +1737,7 @@ export class OverlayRenderer {
         }
     }
 
-    public extractPositionDataFrom(
-        textLayer: HTMLElement,
-        overlayContainer: Element,
-        textLayerRect: DOMRect,
-        /**
-         * T1.4 (P0-4 fix): the page number of the page being EXTRACTED. The
-         * old code took `plugin.getCurrentPageNumber()` — a LIVE read of the
-         * scroll position — so scrolling during the LLM await / rAF window
-         * stamped records with page B while the geometry came from page A;
-         * the parser's recovery then re-bucketed them onto the WRONG page
-         * (the historical cross-page contamination bug).
-         */
-        pageNumberOverride?: number,
-    ): OverlayPositionData[] {
+    public extractPositionDataFrom(textLayer: HTMLElement, overlayContainer: Element, textLayerRect: DOMRect): OverlayPositionData[] {
         if (!textLayer || !overlayContainer) {
             return [];
         }
@@ -1762,7 +1752,7 @@ export class OverlayRenderer {
 
         const positionData: OverlayPositionData[] = [];
         const overlays = Array.from(overlayContainer.querySelectorAll<HTMLElement>('.pdf-text-overlay-reflow'));
-        const pageNumber = pageNumberOverride ?? this.plugin.getCurrentPageNumber() ?? 0;
+        const pageNumber = this.plugin.getCurrentPageNumber() ?? 0;
 
         const saveScale = this.plugin.pdfDom.getScaleFactorFromPage(textLayer);
 
@@ -1770,48 +1760,15 @@ export class OverlayRenderer {
             try {
                 const rect = overlay.getBoundingClientRect();
 
-                // T4.5 (bbox drift fix, CORRECTED): for short phrases whose
-                // width was EXPANDED by adjustOverlayForOverflow, the live
-                // style.width is wider than the original text bbox; saving the
-                // expanded rect re-applies BLEED+expansion on the next load,
-                // drifting wider each save→load cycle. Creation-time
-                // attributes are the authoritative ORIGINAL geometry.
-                //
-                // ⚠ COORDINATE-SPACE FIX (user-reported left shift):
-                // `data-initial-left` is PAGE-RELATIVE px (createReflowOverlay
-                // receives page-relative rects from getSpansBbox /
-                // renderSavedOverlay), while `rect` here is VIEWPORT-absolute
-                // (getBoundingClientRect). The first version of this fix
-                // substituted initLeft directly into viewport math — every
-                // saved overlay shifted LEFT by the page's viewport offset
-                // (sidebars etc., measured −0.60 of page width on the user's
-                // PDF) and negative lefts clamped to 0, piling overlays on
-                // top of each other. Convert creation geometry into viewport
-                // space first by adding the page element's viewport left.
-                const initLeft = parseFloat(overlay.getAttribute('data-initial-left') || '');
-                const initWidth = parseFloat(overlay.getAttribute('data-initial-width') || '');
-                let baseLeft = rect.left, baseWidth = rect.width;
-                if (Number.isFinite(initLeft) && Number.isFinite(initWidth) && initWidth > 0) {
-                    const pageElForSpace = textLayer.closest('.page') as HTMLElement | null;
-                    const pageViewportLeft = pageElForSpace
-                        ? pageElForSpace.getBoundingClientRect().left
-                        : 0;
-                    // data-initial-* are bleed-adjusted (left −BLEED_X,
-                    // width +2×BLEED_X) and PAGE-relative — move into
-                    // viewport space before mixing with rect/textLayerRect.
-                    baseLeft = initLeft + pageViewportLeft;
-                    baseWidth = initWidth;
-                }
-
                 // Reverse the bleed applied by createReflowOverlay to recover the
                 // tight bbox of the original text. This ensures that on reload,
                 // createReflowOverlay can re-apply the bleed correctly.
                 const isTight = overlay.getAttribute('data-is-tight') === 'true';
                 const bleedY = isTight ? BLEED_Y_TIGHT : BLEED_Y_NORMAL;
                 const tightRect = {
-                    left:   baseLeft  + BLEED_X,
+                    left:   rect.left   + BLEED_X,
                     top:    rect.top    + bleedY,
-                    width:  baseWidth  - (BLEED_X * 2),
+                    width:  rect.width  - (BLEED_X * 2),
                     height: rect.height - (bleedY * 2),
                 };
                 // Clamp to non-negative
@@ -1841,29 +1798,6 @@ export class OverlayRenderer {
                     ? originalFontSizes.map(fs => fs / saveScale)
                     : [];
 
-                // T4.3 (format v5, CORRECTED): persist MANUAL style
-                // adjustments ONLY when the user actually made them
-                // (dataset.styleAdjusted is set by the context-menu handlers).
-                // The first version persisted style.fontSize/lineHeight
-                // unconditionally — but those are ALWAYS set (creation +
-                // auto-fit shrink), so every save looked like a manual
-                // adjustment, freezing auto-fitted sizes and misreading the
-                // legacy `fs` field (original dominant size, no outputScale)
-                // as an override on reload.
-                let adjustedFontSize: number | undefined = undefined;
-                let adjustedLineHeight: number | undefined = undefined;
-                if (overlay.dataset.styleAdjusted === '1') {
-                    const liveFontSize = parseFloat(overlay.style.fontSize);
-                    const innerEl = overlay.querySelector('div');
-                    const liveLineHeight = innerEl ? parseFloat(innerEl.style.lineHeight) : NaN;
-                    if (Number.isFinite(liveFontSize) && saveScale > 0) {
-                        adjustedFontSize = liveFontSize / saveScale;
-                    }
-                    if (Number.isFinite(liveLineHeight)) {
-                        adjustedLineHeight = liveLineHeight;
-                    }
-                }
-
                 positionData.push({
                     selector: '',
                     textContent: overlay.getAttribute('data-original-text') || '',
@@ -1872,11 +1806,6 @@ export class OverlayRenderer {
                     page: pageNumber,
                     originalFontSizes: relativeFontSizes,
                     fontFamily: overlay.style.fontFamily || undefined,
-                    // v5: MANUAL style adjustments only (undefined when
-                    // untouched) — dedicated fields, never confused with the
-                    // legacy `fs` (original dominant size).
-                    ...(adjustedFontSize !== undefined ? { adjustedFontSize } : {}),
-                    ...(adjustedLineHeight !== undefined ? { adjustedLineHeight } : {}),
                     // Phase 7 (V4 Schema): stable id from page + rect@3dec + textContent.
                     // Generated here (DOM-extraction path) so the saved overlay has an
                     // id that matches what the retranslator/queue/processing paths
@@ -1946,7 +1875,7 @@ export class OverlayRenderer {
                 return false;
             }
 
-            const positionData = this.extractPositionDataFrom(textLayer, overlayContainer, textLayerRect, pageNumber);
+            const positionData = this.extractPositionDataFrom(textLayer, overlayContainer, textLayerRect);
             if (positionData.length === 0) {
                 this.logDebug(`No position data extracted from page ${pageNumber}.`);
                 return false;
@@ -1955,16 +1884,7 @@ export class OverlayRenderer {
             this.logDebug(`Saving ${positionData.length} overlays for page ${pageNumber} (captured page element)`);
 
             const pagesToUpdate = { [pageNumber]: positionData };
-            // T-FULLPAGE-OVERWRITE (user-reported duplicate overlays): this
-            // save extracts the ENTIRE current page state from the DOM right
-            // after a full-page render (preparePageForOverlay wiped the old
-            // overlays first), so the incoming array IS the complete new page.
-            // MERGE semantics kept any old on-disk item whose rect did not
-            // intersect a new one — after a segmentation change (or after the
-            // pre-hotfix clamped-left junk records) those leftovers piled up
-            // as a second "generation" of overlays. REPLACE makes the saved
-            // page exactly what is rendered.
-            await this.plugin.storage.updatePageOverlaysAndWrite(activeFile, pagesToUpdate, { replace: true });
+            await this.plugin.storage.updatePageOverlaysAndWrite(activeFile, pagesToUpdate);
 
             // Keep runtime state in sync
             this.pagesWithOverlays.add(pageNumber);
@@ -2226,6 +2146,34 @@ export class OverlayRenderer {
         // null) will rebuild it from the freshly-parsed overlay.
         this.memoCache.delete('currentPage');
         this.memoCache.delete('currentTextLayer');
+    }
+
+    /**
+     * Write a single page's overlay data directly into the cache. Provided
+     * for completeness — the canonical write path goes through
+     * `storage.updatePageOverlaysAndWrite` → `updateCacheFromWrite`, which
+     * installs the FULL merged savedOverlay (not just one page). The
+     * per-page `mergePage` here is intended for narrow cases where a caller
+     * has only the affected page's data and wants to update the cache
+     * without round-tripping through the storage layer.
+     *
+     * If `_cachedOverlayData` is null (PDF was open before any overlay
+     * existed), a stub SavedOverlay is created so the page entry can be
+     * stored. The stub's `fileName` / `filePath` are left empty — the
+     * next `initializeOverlayStateForPdf` call will replace the stub
+     * with the disk-parsed overlay.
+     */
+    public mergePage(pageNumber: number, data: OverlayPositionData[]): void {
+        if (!this._cachedOverlayData) {
+            this._cachedOverlayData = {
+                fileName: '',
+                filePath: '',
+                timestamp: Date.now(),
+                pageOverlays: {},
+            };
+        }
+        this._cachedOverlayData.pageOverlays[String(pageNumber)] = data;
+        this.pagesWithOverlays.add(pageNumber);
     }
 
     /**

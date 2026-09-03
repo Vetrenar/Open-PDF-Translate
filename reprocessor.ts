@@ -8,8 +8,6 @@ import { LayoutResult } from './layout-detector';
 // the DOM-extraction and queue paths produce for the same source paragraph —
 // enables merge-by-id-first in updatePageOverlaysAndWrite.
 import { generateOverlayId, getCurrentEngine } from './overlay-id';
-// T1.6/T2.4: shared overlap test (replaces the local dead isOverlapping copy).
-import { isRectOverlapping } from './shared';
 
 /**
  * RegionReprocessor
@@ -90,12 +88,7 @@ export class RegionReprocessor {
             this.finish();
             return;
         }
-        // T4.1 (split-view fix): resolve the page element through the
-        // leaf-scoped adapter instead of a global document.querySelector —
-        // with two PDFs open side by side, the global query returned the
-        // FIRST matching page across ALL leaves, silently operating on the
-        // WRONG file.
-        const pageEl = this.plugin.pdfDom.getPageElement(pageNumber, this.plugin.pdfDom.getActivePdfLeaf());
+        const pageEl = document.querySelector<HTMLElement>(`.page[data-page-number="${pageNumber}"]`);
         if (!pageEl) {
             new Notice('Page is not rendered. Please scroll into view.');
             this.finish();
@@ -271,8 +264,7 @@ export class RegionReprocessor {
             // Don't abort — let user decide. Just warn.
         }
 
-        // T4.1: leaf-scoped resolution (see run() note).
-        const pageEl = this.plugin.pdfDom.getPageElement(pageNumber, this.plugin.pdfDom.getActivePdfLeaf());
+        const pageEl = document.querySelector<HTMLElement>(`.page[data-page-number="${pageNumber}"]`);
         const textLayer = pageEl?.querySelector<HTMLElement>('.textLayer');
         if (!pageEl || !textLayer) {
             new Notice('⚠️ Page or text layer not available.');
@@ -432,47 +424,11 @@ export class RegionReprocessor {
         // We construct a minimal SavedOverlay containing only the new items for
         // the modified page — `saveOverlay` extracts that page and forwards it
         // to `updatePageOverlaysAndWrite` as `{ [modifiedPage]: items }`.
-        // T1.6 (P0-2 fix): the old code wrote ONLY the region's newItems with
-        // replace:true — silently deleting every OTHER saved overlay on the
-        // page (its own comment promised "existing non-overlapping + new"
-        // but never implemented it). We now read the page's saved items,
-        // drop only those INSIDE the selection region, and write the union.
-        let itemsToWrite = newItems;
-        try {
-            const existing = await this.plugin.storage.readSavedOverlayForFile(file);
-            const pageItems = existing?.overlay?.pageOverlays?.[String(pageNumber)];
-            if (Array.isArray(pageItems) && pageItems.length > 0) {
-                const pageRect = pageEl.getBoundingClientRect();
-                // Selection rect (screen coords) → page-relative fractions.
-                const selLeft = (Math.max(screenRect.left, pageRect.left) - pageRect.left) / pageRect.width;
-                const selRight = (Math.min(screenRect.right, pageRect.right) - pageRect.left) / pageRect.width;
-                const selTop = (Math.max(screenRect.top, pageRect.top) - pageRect.top) / pageRect.height;
-                const selBottom = (Math.min(screenRect.bottom, pageRect.bottom) - pageRect.top) / pageRect.height;
-                const regionRect = {
-                    left: selLeft,
-                    top: selTop,
-                    width: Math.max(0, selRight - selLeft),
-                    height: Math.max(0, selBottom - selTop),
-                };
-                const survivors = pageItems.filter(item =>
-                    !isRectOverlapping(item.relativeRect, regionRect, 0.0005)
-                );
-                itemsToWrite = [...survivors, ...newItems];
-                if (this.debug) {
-                    console.log(`[RegionReprocessor] page ${pageNumber}: kept ${survivors.length} existing, replacing ${pageItems.length - survivors.length}, adding ${newItems.length} new.`);
-                }
-            }
-        } catch (e) {
-            // Read failed → fall back to writing only the new items (the
-            // pre-fix behaviour) rather than aborting the user's work.
-            console.warn('[RegionReprocessor] Failed to read existing overlays for merge; writing region items only.', e);
-        }
-
         const savedOverlay: SavedOverlay = {
             fileName: file.basename.replace(/\.pdf$/i, ''),
             filePath: file.path,
             timestamp: Date.now(),
-            pageOverlays: { [pageNumber]: itemsToWrite },
+            pageOverlays: { [pageNumber]: newItems },
         };
         await this.saveOverlay(savedOverlay, file, pageNumber);
 
@@ -507,6 +463,27 @@ export class RegionReprocessor {
         if (this.debug) {
             console.log(`[RegionReprocessor] Saved page ${modifiedPage} for ${file.path}`);
         }
+    }
+
+    private isOverlapping(
+        a: { left: number; top: number; width: number; height: number },
+        b: { left: number; top: number; width: number; height: number }
+    ): boolean {
+        // P2-70 (Phase 12): eps matches the `toFixed(4)` serialization precision
+        // used by storage.ts when persisting `relativeRect` to .translations.md
+        // (4 decimal places → 0.0001 resolution). Two rects that differ only in
+        // the 5th decimal place round to identical serialized values, so the
+        // overlap test must treat them as equal — otherwise the reprocessor
+        // would emit "non-overlapping" duplicates for what is effectively the
+        // same on-disk rect, breaking the merge-by-rect-overlap in
+        // updatePageOverlaysAndWrite.
+        const eps = 0.0001;
+        return !(
+            a.left + a.width < b.left - eps ||
+            b.left + b.width < a.left - eps ||
+            a.top + a.height < b.top - eps ||
+            b.top + b.height < a.top - eps
+        );
     }
 
     private cleanupAll(): void {

@@ -1,10 +1,13 @@
 // watcher-modal.ts
-// Queue view for the PDF watcher: Card Stack layout with Active / Available sections.
+// Queue view for the PDF watcher: list detected PDFs, run one / run all, remove.
 
 import { App, Modal, Setting, ButtonComponent, Notice } from 'obsidian';
 import { t } from './i18n';
 import type OpenRouterTranslatorPlugin from './main';
 import { TFile } from 'obsidian';
+// Stage 0.5 (Q22): SingletonModal with 'focus' reopen behavior — opening
+// a second watcher modal just brings the existing one to the front
+// instead of replacing it (which would lose scroll position).
 import { SingletonModal } from './modal-base';
 
 type SortMode = 'addedAt' | 'name' | 'modifiedAt';
@@ -13,13 +16,16 @@ export class WatcherQueueModal extends SingletonModal<WatcherQueueModal> {
     private plugin: OpenRouterTranslatorPlugin;
     private listEl: HTMLElement | null = null;
     private sortMode: SortMode = 'addedAt';
-    private layoutQueueUnsub: (() => void) | null = null;
+    private selectedPaths: Set<string> = new Set();
 
     constructor(app: App, plugin: OpenRouterTranslatorPlugin) {
         super(app);
         this.plugin = plugin;
     }
 
+    // Stage 0.5 (Q22): 'focus' instead of default 'replace' — the watcher
+    // modal shows live progress; opening a second one would just duplicate
+    // the view. Better to bring the existing one to the front.
     protected reopenBehavior() {
         return 'focus' as const;
     }
@@ -28,6 +34,7 @@ export class WatcherQueueModal extends SingletonModal<WatcherQueueModal> {
         this.titleEl.setText(t('modal.watcher.title'));
         const watcher = this.plugin.watcher;
 
+        // Show which engine is active.
         const engine = this.plugin.settings.layoutEngine;
         const engineLabel = engine === 'python' ? 'Python (PyMuPDF)' : 'Internal (pdfjs)';
         this.titleEl.createEl('span', {
@@ -35,7 +42,7 @@ export class WatcherQueueModal extends SingletonModal<WatcherQueueModal> {
             attr: { style: 'font-size: 0.75em; color: var(--text-muted); margin-left: 8px;' }
         });
 
-        // ── Sort control ──
+        // ── Row 1: Sort control ──
         const sortSetting = new Setting(this.contentEl)
             .setName(t('watcher.queue.label'))
             .setDesc(t('modal.watcher.desc'));
@@ -50,35 +57,39 @@ export class WatcherQueueModal extends SingletonModal<WatcherQueueModal> {
               });
         });
 
-        // ── Action buttons — flex-wrap to prevent overflow ──
-        const btnContainer = this.contentEl.createDiv();
-        btnContainer.style.cssText = 'display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0;';
-
-        const scanBtn = btnContainer.createEl('button', { text: t('watcher.queue.btn.scan') });
-        scanBtn.style.cssText = 'padding: 4px 10px; font-size: 0.85em;';
-        scanBtn.onclick = async () => {
+        // ── Row 2: Action buttons ──
+        const actionSetting = new Setting(this.contentEl).setName('');
+        actionSetting.addButton(b => b.setButtonText(t('watcher.queue.btn.scan')).onClick(async () => {
             const n = await watcher.scanExisting();
             this.render();
             if (n === 0) this.flash(t('modal.watcher.scan.none'));
-        };
-
-        const scanAllBtn = btnContainer.createEl('button', { text: t('modal.watcher.scanAll') });
-        scanAllBtn.style.cssText = 'padding: 4px 10px; font-size: 0.85em;';
-        scanAllBtn.onclick = async () => {
+        }));
+        actionSetting.addButton(b => b.setButtonText(t('modal.watcher.scanAll')).onClick(async () => {
             const n = await watcher.scanAllUntranslated();
             this.render();
-            new Notice(n > 0 ? t('modal.watcher.scan.found', { n: String(n) }) : t('modal.watcher.scan.none'), 4000);
-        };
-
-        const runAllBtn = btnContainer.createEl('button', { text: t('modal.watcher.btn.runall') });
-        runAllBtn.style.cssText = 'padding: 4px 10px; font-size: 0.85em; font-weight: bold;';
-        runAllBtn.onclick = async () => {
+            new Notice(n > 0 ? `Found ${n} untranslated PDF(s) in vault.` : 'No untranslated PDFs found in vault.', 4000);
+        }));
+        // FIX: "Translate Selected" — runs each checked file through watcher.runOne
+        // for proper progress tracking + cancel support (bg-queue audit fix).
+        // Previously called enqueuePdf directly → no onChange subscription, no
+        // progress updates, items stuck at "running" forever.
+        actionSetting.addButton(b => b.setButtonText(t('modal.watcher.translateSelected')).setCta().onClick(async () => {
+            const paths = [...this.selectedPaths];
+            if (paths.length === 0) {
+                new Notice('Select at least one file first (checkboxes on the left).', 3000);
+                return;
+            }
+            this.selectedPaths.clear();
+            // Run each file through watcher.runOne (serial — runAllPending pattern)
+            for (const path of paths) {
+                await watcher.runOne(path);
+            }
+            this.render();
+        }));
+        actionSetting.addButton(b => b.setButtonText(t('modal.watcher.btn.runall')).onClick(async () => {
             await watcher.runAllPending();
-        };
-
-        const clearBtn = btnContainer.createEl('button', { text: t('modal.watcher.clearFinished') });
-        clearBtn.style.cssText = 'padding: 4px 10px; font-size: 0.85em;';
-        clearBtn.onclick = () => {
+        }));
+        actionSetting.addButton(b => b.setButtonText(t('modal.watcher.clearFinished')).onClick(() => {
             let cleared = 0;
             for (const item of this.plugin.watcher.getQueue()) {
                 if (item.status === 'done' || item.status === 'skipped' || item.status === 'error') {
@@ -87,38 +98,121 @@ export class WatcherQueueModal extends SingletonModal<WatcherQueueModal> {
                 }
             }
             this.render();
-            const clearedMsg = cleared > 0
-                ? t('modal.watcher.cleared', { n: String(cleared) })
-                : t('modal.watcher.noFinished');
-            new Notice(clearedMsg, 3000);
-        };
+            new Notice(cleared > 0 ? `Cleared ${cleared} finished item(s).` : 'No finished items to clear.', 3000);
+        }));
 
-        // Auto-scan on open
+        // Auto-scan all untranslated PDFs on modal open (non-blocking).
         void watcher.scanAllUntranslated().then(n => {
             if (n > 0) {
-                new Notice(t('modal.watcher.scan.found', { n: String(n) }), 3000);
+                new Notice(`Found ${n} untranslated PDF(s) in vault.`, 3000);
                 this.render();
             }
         });
 
-        // Hint
-        const hint = this.contentEl.createDiv();
-        hint.style.cssText =
-            'font-size: 0.8em; color: var(--text-muted); margin: 6px 0; ' +
-            'padding: 4px 8px; border-left: 2px solid var(--background-modifier-border);';
-        hint.setText(t('modal.watcher.hint'));
+        // Background queue section (PdfLayoutQueue state).
+        this.renderLayoutQueueSection();
 
-        // File list container — render() fills it with Active + Available sections
+        // File list.
         this.listEl = this.contentEl.createDiv();
         watcher.setOnChange(() => this.render());
-
-        // Subscribe to queue changes for live progress
-        const queue = this.plugin.pdfLayoutQueue;
-        if (queue) {
-            this.layoutQueueUnsub = queue.onChange(() => this.render());
-        }
-
         this.render();
+    }
+
+    /**
+     * FIX: render a section showing PdfLayoutQueue state. This covers
+     * translations started via:
+     *   - TranslateMultiplePagesModal (enqueuePageRange)
+     *   - "Layout: extract entire PDF (background)" command (enqueuePdf)
+     *   - "Layout: extract current page (background)" command (enqueuePage)
+     *
+     * Without this section, the user would have no visibility into background
+     * translations that weren't triggered by the watcher.
+     */
+    private layoutQueueSection: HTMLElement | null = null;
+    private layoutQueueUnsub: (() => void) | null = null;
+
+    private renderLayoutQueueSection() {
+        const queue = this.plugin.pdfLayoutQueue;
+        if (!queue) return;
+
+        this.layoutQueueSection = this.contentEl.createDiv();
+        this.layoutQueueSection.createEl('h3', {
+            text: t('modal.watcher.backgroundQueue'),
+            attr: { style: 'margin-top: 16px; margin-bottom: 8px;' },
+        });
+
+        const queueList = this.layoutQueueSection.createDiv();
+        const renderQueue = () => {
+            queueList.empty();
+            const state = queue.getState();
+
+            // Phase 14.4: was `this.layoutQueueSection.createEl('p', {...})`
+            // which created a NEW `<p>` on every render, leaving stale
+            // duplicates stacked up in the DOM. Now we re-use a single
+            // `.queue-summary` div (created on first render, looked up
+            // thereafter) and update its `textContent` in place.
+            let summaryDiv = this.layoutQueueSection.querySelector('.queue-summary') as HTMLElement | null;
+            if (!summaryDiv) {
+                summaryDiv = this.layoutQueueSection.createDiv({ cls: 'queue-summary' });
+                summaryDiv.style.cssText = 'font-size: 0.85em; color: var(--text-muted); margin-bottom: 8px;';
+                // Insert before the queueList so the summary stays on top.
+                this.layoutQueueSection.insertBefore(summaryDiv, queueList);
+            }
+
+            if (state.files.length === 0) {
+                summaryDiv.textContent = '';
+                queueList.createEl('p', {
+                    text: t('modal.watcher.noBackground'),
+                    attr: { style: 'color: var(--text-muted); font-size: 0.9em;' },
+                });
+                return;
+            }
+
+            // Summary line (updated in place — no DOM churn)
+            summaryDiv.textContent =
+                t('modal.watcher.summary', {
+                    pending: String(state.totalPending),
+                    done: String(state.totalDone),
+                    failed: String(state.totalError),
+                });
+
+            // Per-file rows
+            for (const fileState of state.files) {
+                const tasks = [...fileState.tasks.values()];
+                const done = tasks.filter(t => t.status === 'done').length;
+                const err = tasks.filter(t => t.status === 'error').length;
+                const pend = tasks.filter(t => t.status === 'pending' || t.status === 'running').length;
+                const total = fileState.totalPages || tasks.length;
+
+                const row = new Setting(queueList)
+                    .setName(fileState.file.basename)
+                    .setDesc(
+                        (err > 0
+                            ? t('modal.watcher.rowStatusWithError', { done: String(done), total: String(total), pend: String(pend), err: String(err) })
+                            : t('modal.watcher.rowStatus', { done: String(done), total: String(total), pend: String(pend) })
+                        ) + (queue.isCancelled() ? t('modal.watcher.paused') : '')
+                    );
+
+                if (pend > 0 && !queue.isCancelled()) {
+                    row.addButton(b => b
+                        .setButtonText(t('modal.watcher.pause'))
+                        .onClick(() => {
+                            queue.cancel();
+                            renderQueue();
+                        }));
+                } else if (queue.isCancelled() && state.totalPending > 0) {
+                    row.addButton(b => b
+                        .setButtonText(t('modal.watcher.resume'))
+                        .setCta()
+                        .onClick(() => {
+                            queue.resume();
+                            renderQueue();
+                        }));
+                }
+            }
+        };
+        renderQueue();
+        this.layoutQueueUnsub = queue.onChange(renderQueue);
     }
 
     private flash(msg: string) {
@@ -142,168 +236,120 @@ export class WatcherQueueModal extends SingletonModal<WatcherQueueModal> {
             return;
         }
 
+        // FIX: sort items based on sortMode
         items = this.sortItems(items);
 
-        // Split into active (running) and available (everything else)
-        const activeItems = items.filter(i => i.status === 'running');
-        const availableItems = items.filter(i => i.status !== 'running');
+        const isRunning = this.plugin.watcher.isRunning();
 
-        // ── ACTIVE TRANSLATIONS section (scrollable, limited height) ──
-        if (activeItems.length > 0) {
-            const activeSection = el.createDiv();
-            activeSection.style.cssText = 'margin-bottom: 16px;';
-
-            const activeHeader = activeSection.createDiv();
-            activeHeader.style.cssText =
-                'font-weight: 600; font-size: 0.8em; text-transform: uppercase; ' +
-                'letter-spacing: 1px; color: var(--interactive-accent); margin-bottom: 8px;';
-            activeHeader.setText(`▸ ${t('modal.watcher.activeTranslations')} (${activeItems.length})`);
-
-            // Scrollable container with limited height
-            const activeList = activeSection.createDiv();
-            activeList.style.cssText =
-                'max-height: 200px; overflow-y: auto; ' +
-                'border: 1px solid var(--interactive-accent); border-radius: 8px; ' +
-                'padding: 10px; ' +
-                'background: color-mix(in srgb, var(--interactive-accent) 5%, transparent);';
-
-            for (const item of activeItems) {
-                const file = this.plugin.app.vault.getAbstractFileByPath(item.path);
-                const card = activeList.createDiv();
-                card.style.cssText = 'margin-bottom: 10px; padding-bottom: 10px; ' +
-                    (activeItems.indexOf(item) < activeItems.length - 1
-                        ? 'border-bottom: 1px solid var(--background-modifier-border);'
-                        : '');
-
-                // Title row
-                const titleRow = card.createDiv();
-                titleRow.style.cssText = 'display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;';
-                titleRow.createEl('span', {
-                    text: item.name,
-                    attr: { style: 'font-weight: 600; font-size: 0.9em;' }
-                });
-                const cancelBtn = titleRow.createEl('button', { text: t('modal.watcher.btn.cancel') });
-                cancelBtn.style.cssText = 'font-size: 0.8em; padding: 2px 10px;';
-                cancelBtn.onclick = () => {
-                    this.plugin.watcher.cancelRunning();
-                    new Notice(t('modal.watcher.cancelling'), 3000);
-                };
-
-                // Status text
-                const statusText = `${this.statusLabel(item.status)}${item.message ? ' — ' + item.message : ''}`;
-                card.createEl('div', {
-                    text: statusText,
-                    attr: { style: 'font-size: 0.8em; color: var(--text-muted); margin-bottom: 6px;' }
-                });
-
-                // Progress bar
-                this.appendProgressBarTo(card, item);
+        for (const item of items) {
+            // FIX: get file modification time and size for display
+            const file = this.plugin.app.vault.getAbstractFileByPath(item.path);
+            let fileInfo = '';
+            if (file instanceof TFile) {
+                const mtime = file.stat.mtime;
+                const size = file.stat.size;
+                const dateStr = new Date(mtime).toLocaleDateString();
+                const sizeStr = size > 1024 * 1024
+                    ? `${(size / 1024 / 1024).toFixed(1)} MB`
+                    : `${Math.round(size / 1024)} KB`;
+                fileInfo = ` · ${dateStr} · ${sizeStr}`;
             }
-        }
 
-        // ── AVAILABLE FILES section (full, no scroll limit) ──
-        if (availableItems.length > 0) {
-            const availSection = el.createDiv();
+            const row = new Setting(el)
+                .setName(item.name)
+                .setDesc(`${this.statusLabel(item.status)}${item.message ? ' — ' + item.message : ''}${fileInfo}`);
 
-            const availHeader = availSection.createDiv();
-            availHeader.style.cssText =
-                'font-weight: 600; font-size: 0.8em; text-transform: uppercase; ' +
-                'letter-spacing: 1px; color: var(--text-muted); margin-bottom: 8px;';
-            availHeader.setText(`▸ ${t('modal.watcher.availableFiles')} (${availableItems.length})`);
-
-            const availList = availSection.createDiv();
-            availList.style.cssText =
-                'border: 1px solid var(--background-modifier-border); border-radius: 8px; padding: 4px;';
-
-            for (const item of availableItems) {
-                const file = this.plugin.app.vault.getAbstractFileByPath(item.path);
-                let fileInfo = '';
-                if (file instanceof TFile) {
-                    const size = file.stat.size;
-                    const sizeStr = size > 1024 * 1024
-                        ? `${(size / 1024 / 1024).toFixed(1)} MB`
-                        : `${Math.round(size / 1024)} KB`;
-                    fileInfo = ` · ${sizeStr}`;
-                }
-
-                const row = availList.createDiv();
-                row.style.cssText =
-                    'display: flex; justify-content: space-between; align-items: center; ' +
-                    'padding: 6px 8px; font-size: 0.85em; ' +
-                    'border-bottom: 1px solid var(--background-modifier-border);';
-                // Remove border on last item
-                if (availableItems.indexOf(item) === availableItems.length - 1) {
-                    row.style.borderBottom = 'none';
-                }
-
-                // Left: name + status (wrap instead of truncate)
-                const leftDiv = row.createDiv();
-                leftDiv.style.cssText = 'flex: 1; min-width: 0; margin-right: 8px;';
-                leftDiv.createEl('span', {
-                    text: item.name,
-                    attr: { style: 'font-weight: 500; word-break: break-word;' }
+            // FIX: add checkbox for multi-select (only for non-running items)
+            if (item.status !== 'running') {
+                row.addExtraButton(b => {
+                    b.setIcon(this.selectedPaths.has(item.path) ? 'check-square' : 'square')
+                        .setTooltip(this.selectedPaths.has(item.path) ? 'Deselect' : 'Select')
+                        .onClick(() => {
+                            if (this.selectedPaths.has(item.path)) {
+                                this.selectedPaths.delete(item.path);
+                            } else {
+                                this.selectedPaths.add(item.path);
+                            }
+                            this.render();
+                        });
                 });
-                leftDiv.createEl('span', {
-                    text: `  ${this.statusLabel(item.status)}${item.message ? ' — ' + item.message : ''}${fileInfo}`,
-                    attr: { style: 'color: var(--text-muted); font-size: 0.9em; word-break: break-word;' }
-                });
-
-                // Right: action buttons
-                const rightDiv = row.createDiv();
-                rightDiv.style.cssText = 'display: flex; gap: 4px; flex-shrink: 0; margin-left: 8px;';
-
-                if (item.status === 'done' || item.status === 'skipped') {
-                    const btn = rightDiv.createEl('button', { text: t('modal.watcher.btn.retranslate') });
-                    btn.style.cssText = 'font-size: 0.85em; padding: 2px 8px;';
-                    btn.onclick = async () => {
-                        if (file instanceof TFile) {
-                            new Notice(t('modal.watcher.retranslating', { name: item.name }), 3000);
-                            void this.plugin.watcher.runOne(file.path, { force: true }).then(() => this.render());
-                        }
-                    };
-                } else {
-                    // pending / error
-                    const btn = rightDiv.createEl('button', { text: t('modal.watcher.btn.translate') });
-                    btn.style.cssText = 'font-size: 0.85em; padding: 2px 8px; font-weight: bold;';
-                    btn.onclick = async () => {
-                        if (file instanceof TFile) {
-                            new Notice(t('modal.watcher.translating', { name: item.name }), 3000);
-                            void this.plugin.watcher.runOne(file.path).then(() => this.render());
-                        }
-                    };
-                }
-
-                // Trash button
-                const trashBtn = rightDiv.createEl('button', { text: '🗑' });
-                trashBtn.style.cssText = 'font-size: 0.85em; padding: 2px 6px; cursor: pointer;';
-                trashBtn.title = t('modal.watcher.btn.remove');
-                trashBtn.onclick = () => {
-                    this.plugin.watcher.remove(item.path);
-                };
             }
+
+            // FIX (W-7): every non-running item gets a Translate button.
+            // Don't disable when another job is running — PdfLayoutQueue supports
+            // multiple files. Individual "Translate" enqueues into the queue
+            // (non-blocking).
+            if (item.status === 'running') {
+                row.addButton((b: ButtonComponent) => b
+                    .setButtonText(t('modal.watcher.btn.cancel'))
+                    .setDisabled(false)
+                    .onClick(async () => {
+                        this.plugin.watcher.cancelRunning();
+                    }));
+            } else if (item.status === 'done' || item.status === 'skipped') {
+                // P2-16 (Phase 11): "Retranslate" — use enqueuePageRange(1, totalPages)
+                // so EVERY page is re-queued (reset to `pending`), even pages whose
+                // overlays are already on disk. The previous shared handler called
+                // `enqueuePdf`, which silently skipped cached pages — so "Retranslate"
+                // on an already-translated file was a no-op, leaving the user
+                // staring at unchanged overlays after switching providers or editing
+                // a prompt. enqueuePageRange's reset-to-pending branch (see
+                // pdf-layout-queue.ts lines 311-323) only skips tasks currently
+                // `running`, so it's safe even if another job is mid-flight.
+                row.addButton((b: ButtonComponent) => b
+                    .setButtonText(t('modal.watcher.btn.retranslate'))
+                    .onClick(async () => {
+                        if (file instanceof TFile) {
+                            try {
+                                const totalPages = await this.plugin.pdfLayoutService.getPageCount(file);
+                                const count = await this.plugin.pdfLayoutQueue.enqueuePageRange(file, 1, totalPages);
+                                item.status = 'running';
+                                item.message = `${count} pages re-queued`;
+                                this.render();
+                                new Notice(`Re-queued ${count} pages for "${item.name}".`, 3000);
+                            } catch (e: any) {
+                                new Notice(`Retranslate failed: ${e?.message || e}`);
+                            }
+                        }
+                    }));
+            } else {
+                // P2-15 (Phase 11): per-item "Translate" button now routes through
+                // `watcher.runOne(file.path)` instead of calling
+                // `pdfLayoutQueue.enqueuePdf` directly. runOne updates the
+                // QueueItem to `running`, subscribes to queue progress to relay
+                // per-page status into `item.message` (so the modal shows live
+                // `worker: 3/12 done, 9 pending` updates), waits for completion
+                // via waitForQueueCompletion, and finally marks the item
+                // `done` / `error` based on the terminal task states. The
+                // previous direct `enqueuePdf` call left the item stuck at
+                // `running` forever — it only kicked the queue and never
+                // observed the result.
+                row.addButton((b: ButtonComponent) => b
+                    .setButtonText(t('modal.watcher.btn.translate'))
+                    .onClick(async () => {
+                        if (file instanceof TFile) {
+                            item.status = 'running';
+                            item.message = 'Starting...';
+                            this.render();
+                            void this.plugin.watcher.runOne(file.path).then(() => {
+                                this.render();
+                            });
+                        }
+                    }));
+            }
+            row.addExtraButton(b => b.setIcon('trash').setTooltip(t('modal.watcher.btn.remove')).onClick(() => {
+                this.plugin.watcher.remove(item.path);
+                this.selectedPaths.delete(item.path);
+            }));
         }
     }
 
-    private appendProgressBarTo(container: HTMLElement, item: any): void {
-        if (item.status !== 'running' || !item.message) return;
-        const match = String(item.message).match(/(\d+)\s*\/\s*(\d+)/);
-        if (!match) return;
-        const done = parseInt(match[1], 10);
-        const total = parseInt(match[2], 10);
-        if (!Number.isFinite(done) || !Number.isFinite(total) || total <= 0) return;
-        const pct = Math.max(0, Math.min(100, (done / total) * 100));
-
-        const barContainer = container.createDiv();
-        barContainer.style.cssText =
-            'height: 8px; background: var(--background-modifier-border); ' +
-            'border-radius: 4px; overflow: hidden;';
-        const barFill = barContainer.createDiv();
-        barFill.style.cssText =
-            `height: 100%; width: ${pct.toFixed(1)}%; ` +
-            'background: var(--interactive-accent); transition: width 0.3s ease; ' +
-            'border-radius: 4px;';
-    }
-
+    /**
+     * FIX: sort items based on current sortMode.
+     * - 'addedAt': by queue-add time (oldest first)
+     * - 'name': alphabetical by filename
+     * - 'modifiedAt': by file modification time (newest first)
+     */
     private sortItems(items: any[]): any[] {
         const sorted = [...items];
         switch (this.sortMode) {
@@ -316,7 +362,7 @@ export class WatcherQueueModal extends SingletonModal<WatcherQueueModal> {
                     const fb = this.plugin.app.vault.getAbstractFileByPath(b.path);
                     const ma = (fa instanceof TFile) ? fa.stat.mtime : 0;
                     const mb = (fb instanceof TFile) ? fb.stat.mtime : 0;
-                    return mb - ma;
+                    return mb - ma;  // newest first
                 });
                 break;
             case 'addedAt':
@@ -324,6 +370,12 @@ export class WatcherQueueModal extends SingletonModal<WatcherQueueModal> {
                 sorted.sort((a, b) => a.addedAt - b.addedAt);
                 break;
         }
+        // Always sort running items to top so user sees active job first
+        sorted.sort((a, b) => {
+            if (a.status === 'running' && b.status !== 'running') return -1;
+            if (b.status === 'running' && a.status !== 'running') return 1;
+            return 0;
+        });
         return sorted;
     }
 
@@ -334,6 +386,8 @@ export class WatcherQueueModal extends SingletonModal<WatcherQueueModal> {
             this.layoutQueueUnsub = null;
         }
         this.contentEl.empty();
+        // Stage 0.5 (Q22): MUST call super.onClose() so SingletonModal can
+        // remove us from the per-subclass instances Map.
         super.onClose();
     }
 }

@@ -146,70 +146,27 @@ export class LayoutDetector {
     // Map back to HTMLSpanElements.
     // CRITICAL FIX: paragraphs store page-relative coords in their span rects,
     // so we must compare against page-relative coords too.
-    //
-    // T3.4: O(n) matching via a rect-keyed index (was O(paragraphSpans ×
-    // allSpans) with 4-coordinate fuzzy compares — millions of iterations
-    // on main thread for pages with 1000+ spans). The rect of a given span
-    // is identical in both arrays (they are built from the SAME infoMap in
-    // this same synchronous pass), so exact key equality is safe; the old
-    // 1px tolerance only masked nothing. Bonus fix: when two DOM spans
-    // shared identical rects, the old loop matched the FIRST one twice
-    // (duplicating its text in a paragraph) and lost the second — the
-    // queue-per-key below assigns each span exactly once.
-    const spanIndex = new Map<string, HTMLSpanElement[]>();
-    for (const s of spans) {
-      const info = infoMap.get(s);
-      if (!info) continue;
-      const key = [
-        Math.round(info.rect.left - pageLeft),
-        Math.round(info.rect.top - pageTop),
-        Math.round(info.rect.right - pageLeft),
-        Math.round(info.rect.bottom - pageTop),
-      ].join(',');
-      const bucket = spanIndex.get(key);
-      if (bucket) bucket.push(s); else spanIndex.set(key, [s]);
-    }
-
     const result: HTMLSpanElement[][] = paragraphs.map(para => {
       const paraSpans: HTMLSpanElement[] = [];
       for (const r of para.spans) {
-        const key = [
-          Math.round(r.left),
-          Math.round(r.top),
-          Math.round(r.right),
-          Math.round(r.bottom),
-        ].join(',');
-        const bucket = spanIndex.get(key);
-        if (bucket && bucket.length > 0) {
-          paraSpans.push(bucket.shift()!);
+        for (const s of spans) {
+          const info = infoMap.get(s);
+          if (!info) continue;
+          const sLeft   = info.rect.left   - pageLeft;
+          const sTop    = info.rect.top    - pageTop;
+          const sRight  = info.rect.right  - pageLeft;
+          const sBottom = info.rect.bottom - pageTop;
+          if (Math.abs(sLeft   - r.left)   < 1 &&
+              Math.abs(sTop    - r.top)    < 1 &&
+              Math.abs(sRight  - r.right)  < 1 &&
+              Math.abs(sBottom - r.bottom) < 1) {
+            paraSpans.push(s);
+            break;
+          }
         }
       }
       return paraSpans;
     }).filter(p => p.length > 0);
-
-    // T-LD-F4: coverage self-check — every input span must land in exactly
-    // one output paragraph. The sweep-up step (IslandBuilder Step 5.5)
-    // guarantees this; the check turns any future regression into an
-    // immediate, visible warning instead of silently missing text.
-    // NOTE (hotfix): computed from the LOCAL `spans` argument (this method
-    // is detectLayoutFromPrepared — the first version referenced
-    // `textSpans`, a variable of the OUTER detectLayout wrapper, which
-    // crashed every interactive translation with "textSpans is not
-    // defined" — user-reported on page 3).
-    {
-      const totalChars = spans.reduce(
-        (n, s) => n + ((s as any).textContent?.length ?? 0), 0);
-      const gotChars = result.reduce(
-        (n, ps) => n + ps.reduce(
-          (m, s) => m + ((s as any).textContent?.length ?? 0), 0), 0);
-      if (totalChars !== gotChars) {
-        console.warn(
-          `[LayoutDetector] COVERAGE: ${gotChars}/${totalChars} chars — ` +
-          `${totalChars - gotChars} chars would be LOST. ` +
-          `(spans=${spans.length}, paragraphs=${result.length})`
-        );
-      }
-    }
 
     // Build column analysis (backward-compat).
     // CRITICAL FIX: convert page-relative paragraph coords → viewport-absolute

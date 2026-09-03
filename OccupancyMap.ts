@@ -44,77 +44,6 @@ export interface LineInfo {
   bottom: number;
 }
 
-/**
- * T3.5: shared line-grouping tolerance. The old hardcoded 3px did not
- * scale with font size — on a 24pt heading (or at high zoom) glyphs of the
- * SAME visual line can differ in `top` by more than 3px, splitting the
- * line and corrupting downstream paragraph logic. The tolerance is now
- * `max(3, 25% of the global median span height)` — 3px stays the floor for
- * tiny 8pt text, larger type gets proportionally more slack.
- */
-export function lineGroupingTolerance(rects: InputRect[]): number {
-    const heights = rects.map(r => r.bottom - r.top).filter(h => h > 0).sort((a, b) => a - b);
-    if (heights.length === 0) return 3;
-    const median = heights[Math.floor(heights.length / 2)];
-    return Math.max(3, median * 0.25);
-}
-
-/**
- * T3.6: shared line grouping used by BOTH OccupancyMap's Step 2 and
- * IslandBuilder's groupIntoLines (previously two divergent copies with the
- * same hardcoded 3px). Groups spans into lines whose `top` values differ
- * from the line's first span by at most `tol` (input order irrelevant —
- * sorts by top, then left).
- */
-export function groupSpansIntoLines(spans: InputRect[], tol: number): InputRect[][] {
-    // T-LD-F1 (v2): vertical-OVERLAP line grouping.
-    //
-    // History: top-based grouping split raised superscripts into phantom
-    // one-glyph lines; the first fix (pure baseline/bottom grouping) had
-    // the mirrored failure — markers raised by MORE than the tolerance
-    // (author numerals "1 1 2 3", citation markers "25,31") still fell
-    // into their own line, which then became a separate overlapping
-    // paragraph fragment.
-    //
-    // Overlap criterion: a span joins the current line when their bboxes
-    // overlap vertically by at least half the SMALLER height. This is
-    // invariant to font-size mix on the line (superscripts overlap the
-    // upper half of the body bbox; subscripts the lower half; same-size
-    // neighbours on adjacent lines barely overlap at all).
-    const sorted = [...spans].sort((a, b) => a.top - b.top || a.left - b.left);
-    const lines: InputRect[][] = [];
-    let curr: InputRect[] = [];
-    let currTop = 0;
-    let currBottom = 0;
-    for (const s of sorted) {
-        const h = Math.max(0.01, s.bottom - s.top);
-        if (curr.length === 0) {
-            curr = [s];
-            currTop = s.top;
-            currBottom = s.bottom;
-            continue;
-        }
-        const lineH = Math.max(0.01, currBottom - currTop);
-        const ov = Math.min(currBottom, s.bottom) - Math.max(currTop, s.top);
-        const joins = ov >= 0.5 * Math.min(h, lineH)
-            // fallback for the touching-bbox case: baselines within tol
-            // with any positive overlap (tight leading, equal sizes)
-            || (ov > 0 && Math.abs(s.bottom - currBottom) <= tol);
-        if (joins) {
-            curr.push(s);
-            currTop = Math.min(currTop, s.top);
-            currBottom = Math.max(currBottom, s.bottom);
-        } else {
-            lines.push(curr);
-            curr = [s];
-            currTop = s.top;
-            currBottom = s.bottom;
-        }
-    }
-    if (curr.length > 0) lines.push(curr);
-    return lines;
-}
-
 export interface OccupancyMapResult {
   gridW: number;
   gridH: number;
@@ -208,11 +137,16 @@ export function buildOccupancyMap(
   }
 
   // ── STEP 2: Detect text lines ──────────────────────────────────────
-  // T3.5: tolerance is font-scale-aware (see lineGroupingTolerance) — the
-  // old hardcoded 3px split large-type lines whose glyphs differ in `top`.
-  // T3.6: shared grouping helper (was a duplicate of IslandBuilder's).
-  const tol = lineGroupingTolerance(rects);
-  const textLines: InputRect[][] = groupSpansIntoLines(rects, tol);
+  const sortedSpans = [...rects].sort((a, b) => a.top - b.top || a.left - b.left);
+  const textLines: InputRect[][] = [];
+  let currLineSpans: InputRect[] = [];
+  let currTop = -Infinity;
+  for (const r of sortedSpans) {
+    if (currLineSpans.length === 0) { currLineSpans = [r]; currTop = r.top; }
+    else if (Math.abs(r.top - currTop) <= 3) { currLineSpans.push(r); }
+    else { textLines.push(currLineSpans); currLineSpans = [r]; currTop = r.top; }
+  }
+  if (currLineSpans.length > 0) textLines.push(currLineSpans);
 
   // P2-6 (Phase 17): defensive guard — `textLines` only ever contains
   // non-empty arrays (the grouping loop in Step 2 always pushes a

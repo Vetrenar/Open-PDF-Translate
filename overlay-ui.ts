@@ -6,6 +6,7 @@ import type OpenRouterTranslatorPlugin from './main';
 import { RetranslateUsingOverlaysModal } from './modal-retranslate';
 import { EditSpecificTranslationModal } from './modal-edit-translation';
 import type { OverlayPositionData } from './types';
+import type { LayoutSettings } from './layout-modal';
 // Phase 7 (C4): sanitize translated-text HTML before it ever touches the DOM.
 // DOMPurify is configured with a strict whitelist (only inline-formatting
 // tags, no attributes) so even if a malicious or buggy translation backend
@@ -26,23 +27,36 @@ const LINE_HEIGHT_MAX = 1.3;
 const LINE_HEIGHT_STEP = 0.05;
 
 // --- Visual Tweaks & Overlap Prevention ---
-// T2.4: BLEED constants imported from shared.ts (single source of truth —
-// overlay.ts reverses the exact same values when extracting).
-// T4.2: TIGHT_LINE_HEIGHT_THRESHOLD (absolute 24px) REMOVED — tight-line
-// detection is now scale-relative inside createReflowOverlay.
-import { BLEED_X, BLEED_Y_NORMAL, BLEED_Y_TIGHT, PURIFY_CONFIG } from './shared';
+const BLEED_X = 4;
+const BLEED_Y_NORMAL = 2;
+const BLEED_Y_TIGHT = 0;
+const TIGHT_LINE_HEIGHT_THRESHOLD = 24;
+
+const DEFAULT_BG = '#ffffff';
 
 // --- Safeguard Constants for Short Phrases/Headings ---
-// (T6.1: SHORT_PHRASE_WIDTH_SAFETY_MARGIN_PX and WIDTH_EXPANSION_LIMIT were
-// dead constants — never read — and have been removed.)
 const SHORT_PHRASE_WORD_LIMIT = 4;
+const SHORT_PHRASE_WIDTH_SAFETY_MARGIN_PX = 10;
 const SHORT_PHRASE_PADDING_RIGHT_EM = 0.2;
+const WIDTH_EXPANSION_LIMIT = 1.35;
 
 // --- Auto-fit constants ---
 const MIN_FONT_SIZE_PX = 6;
 const FONT_SHRINK_FACTOR = 0.95;
 const MAX_SHRINK_ITERATIONS = 40; // more iterations = finer fit
 const MIN_LINE_HEIGHT_SHRINK = 0.85;
+
+// Phase 7 (C4): DOMPurify whitelist. Only inline-formatting tags survive —
+// no `<a>`, no `<img>`, no `<script>`, no attributes (so no `style=`,
+// no `onerror=`, no `href="javascript:"`). `KEEP_CONTENT: true` means
+// disallowed tags are unwrapped (their text content is preserved) instead
+// of being dropped wholesale, so a translation that arrives wrapped in a
+// `<span>` still renders its text.
+const PURIFY_CONFIG: DOMPurify.Config = {
+    ALLOWED_TAGS: ['b', 'i', 'em', 'strong', 'br', 'sup', 'sub', 'u'],
+    ALLOWED_ATTR: [],
+    KEEP_CONTENT: true,
+};
 
 // Types for internal state
 type OverlayHandlers = {
@@ -67,28 +81,22 @@ export class OverlayUIRenderer {
     // Reusable measurement element — created once, reused every call (perf fix)
     private measureSpan: HTMLSpanElement | null = null;
     private selectedOverlays: Set<HTMLElement> = new Set();
-
-    // fix-bbox-selection: full-screen transparent overlay that captures
-    // ALL pointer events while BBox Edit Mode is ON. This replaces the old
-    // document-level capture-phase mousedown/mousemove/mouseup listeners
-    // which conflicted with per-overlay click handlers (the document
-    // handler fired first in the capture phase, called stopPropagation(),
-    // and prevented the overlay's click from ever firing). With a
-    // dedicated overlay div we get clean event ownership: this overlay
-    // owns all pointer events in BBox mode, and per-overlay handlers
-    // only fire in non-BBox mode (when this overlay is not in the DOM).
-    private selectionOverlay: HTMLElement | null = null;
-    // The marquee selection rectangle drawn on top of selectionOverlay.
-    private selectionDiv: HTMLElement | null = null;
-    // True while BBox Edit Mode is ON (selectionOverlay is present in DOM).
-    private isSelecting: boolean = false;
-    // True while a pointer drag is in progress (pointerdown → pointerup).
-    private isDragging: boolean = false;
-    // Anchor point of the current drag (clientX/Y from pointerdown).
-    private startX: number = 0;
-    private startY: number = 0;
-    // Escape-key listener registered while selectionOverlay is attached.
-    private boundOnKeyDown: ((e: KeyboardEvent) => void) | null = null;
+    private selectionBox: HTMLDivElement | null = null;
+    private marqueeActive = false;
+    private marqueeStart: { x: number; y: number } | null = null;
+    private marqueeContainer: HTMLElement | null = null;
+    private marqueeHoldTimer: number | null = null;
+    private marqueeHandlers: {
+        down?: (event: MouseEvent) => void;
+        move?: (event: MouseEvent) => void;
+        up?: (event: MouseEvent) => void;
+    } = {};
+    // P1-17 (Phase 14): marquee listeners are now attached lazily on BBox
+    // edit-mode enter and detached on exit / cleanup. Previously they were
+    // attached once in the constructor and remained for the lifetime of the
+    // OverlayUIRenderer — meaning every mousedown / mousemove / mouseup on
+    // the entire document fired the handler even when BBox mode was off.
+    private marqueeListenersAttached = false;
 
     // P1-16 (Phase 15): monotonic z-index counter for `bringToTop`. The
     // previous implementation scanned every `.pdf-text-overlay-reflow` node
@@ -111,10 +119,7 @@ export class OverlayUIRenderer {
     constructor(plugin: OpenRouterTranslatorPlugin) {
         this.plugin = plugin;
         this.ensureGlobalStyles();
-        // fix-bbox-selection: marquee/selection system is now lazily
-        // attached via attachMarqueeListeners() when BBox Edit Mode is
-        // toggled ON, and fully torn down via detachMarqueeListeners() on
-        // OFF / cleanup. No constructor-time initialisation is needed.
+        this.initMarqueeSelection();
     }
 
     /**
@@ -198,236 +203,197 @@ export class OverlayUIRenderer {
         return !!this.plugin.settings.bboxEditMode;
     }
 
-    // ============================================================
-    // BBox Selection (pointer-events based, fix-bbox-selection)
-    // ============================================================
-    //
-    // WHY POINTER EVENTS ON A FULL-SCREEN OVERLAY?
-    //
-    // The previous implementation registered mousedown/mousemove/mouseup
-    // listeners on `document` with capture phase (`true`). Because the
-    // capture phase fires top-down, the document-level handler ran BEFORE
-    // the per-overlay click handler — and called `event.stopPropagation()`,
-    // which prevented the click from ever reaching the overlay. Result:
-    // shift+LMB mass-selection and empty-space deselect silently did
-    // nothing.
-    //
-    // The empty-space deselect also failed because `marqueeActive` was
-    // only armed when the mousedown landed on a `.pdf-text-overlay-container`
-    // but NOT on a `.pdf-text-overlay-reflow`. A plain click on empty space
-    // (e.g. on the page background outside the container) didn't even enter
-    // the marquee code path, so `onMouseUp` early-returned and never ran
-    // the deselect branch.
-    //
-    // The fix follows the user-provided reference pattern: while BBox Edit
-    // Mode is ON, a full-screen transparent `div` is appended to
-    // `document.body` with `position: fixed; inset: 0; z-index: 99999`. It
-    // intercepts ALL pointer events (pointerdown / pointermove / pointerup)
-    // and uses `setPointerCapture` so the same element keeps receiving
-    // events even if the pointer leaves its bounds. On pointerup:
-    //   - If the pointer moved > 5px → marquee drag → intersect the
-    //     drawn rect against every `.pdf-text-overlay-reflow` on the page
-    //     and add the hits to the selection.
-    //   - Otherwise it's a click → temporarily hide the overlay, call
-    //     `elementFromPoint` to find what's underneath, then either toggle
-    //     / select that overlay or clear the selection (empty space).
-    //
-    // Right-clicks are forwarded to the underlying overlay's
-    // `showContextMenu` via a `contextmenu` listener on the overlay, so the
-    // existing context-menu workflow keeps working in BBox mode.
+    private initMarqueeSelection(): void {
+        const startSelectionBox = (x: number, y: number) => {
+            if (this.selectionBox) return;
+            const box = document.createElement('div');
+            box.style.position = 'fixed';
+            box.style.left = `${x}px`;
+            box.style.top = `${y}px`;
+            box.style.width = '0px';
+            box.style.height = '0px';
+            box.style.border = '1px dashed var(--interactive-accent)';
+            // Phase 17 (C19): color-mix gives a 12%-opacity accent fill,
+            // matching the old `rgba(29,122,252,0.12)` but theme-aware.
+            box.style.background = 'color-mix(in srgb, var(--interactive-accent) 12%, transparent)';
+            box.style.pointerEvents = 'none';
+            box.style.zIndex = '100000';
+            document.body.appendChild(box);
+            this.selectionBox = box;
+        };
 
-    /**
-     * fix-bbox-selection: turn BBox Edit Mode ON. Creates the full-screen
-     * pointer-capture overlay and registers the Escape key listener.
-     * Idempotent — safe to call multiple times. Called from
-     * `overlay.attachMarqueeListeners()` (in turn called from `main.ts`
-     * when the user toggles BBox edit mode ON, and from `overlay.ts`
-     * constructor if BBox mode was already enabled at plugin load).
-     */
-    public attachMarqueeListeners(): void {
-        if (this.isSelecting) return;
-        this.isSelecting = true;
-
-        // NEW APPROACH: No permanent overlay. BBox Edit Mode is non-invasive:
-        //   - Normal cursor, scrolling works, all UI works
-        //   - Click on bbox → select (per-overlay clickHandler already handles this)
-        //   - Ctrl/shift+click → toggle (per-overlay clickHandler handles this)
-        //   - Click on empty space → deselect (document-level click listener)
-        //   - Shift+LMB+drag → temporary marquee overlay (created on pointerdown, removed on pointerup)
-        //
-        // Listeners are on `document` (not a full-screen overlay) so they
-        // don't block scrolling, menus, or any other Obsidian UI.
-
-        // 1. Shift+LMB mousedown → start temporary marquee
-        //    Use mousedown (not pointerdown) for broader compatibility —
-        //    some Obsidian/Electron environments don't fire pointerdown reliably.
-        document.addEventListener('mousedown', this.onDocMouseDown, true);
-
-        // 2. Click on empty space → deselect (uses click, not mousedown,
-        //    so it doesn't interfere with scrolling or drag-start)
-        document.addEventListener('click', this.onDocClick, true);
-
-        // 3. Escape clears selection
-        this.boundOnKeyDown = (e: KeyboardEvent) => {
-            if (e.key === 'Escape') {
-                e.preventDefault();
-                e.stopPropagation();
-                this.clearSelection();
+        const clearHoldTimer = () => {
+            if (this.marqueeHoldTimer !== null) {
+                window.clearTimeout(this.marqueeHoldTimer);
+                this.marqueeHoldTimer = null;
             }
         };
-        document.addEventListener('keydown', this.boundOnKeyDown);
-    }
 
-    /**
-     * fix-bbox-selection: turn BBox Edit Mode OFF. Removes the full-screen
-     * overlay, aborts any in-flight drag, and unregisters the Escape
-     * listener. Idempotent. Called from `overlay.detachMarqueeListeners()`
-     * on BBox edit mode OFF and from `cleanup()`.
-     */
-    public detachMarqueeListeners(): void {
-        document.removeEventListener('mousedown', this.onDocMouseDown, true);
-        document.removeEventListener('click', this.onDocClick, true);
-        // Clean up any in-flight marquee
-        if (this.selectionOverlay) {
-            this.selectionOverlay.remove();
-            this.selectionOverlay = null;
-        }
-        this.selectionDiv?.remove();
-        this.selectionDiv = null;
-        this.isSelecting = false;
-        this.isDragging = false;
-        this.startX = 0;
-        this.startY = 0;
-        if (this.boundOnKeyDown) {
-            document.removeEventListener('keydown', this.boundOnKeyDown);
-            this.boundOnKeyDown = null;
-        }
-    }
+        const onMouseDown = (event: MouseEvent) => {
+            if (!this.isBBoxEditMode()) return;
+            if (event.button !== 0) return;
+            const target = event.target as HTMLElement | null;
+            if (!target) return;
+            const container = target.closest('.pdf-text-overlay-container') as HTMLElement | null;
+            if (!container) return;
+            const clickedOverlay = target.closest('.pdf-text-overlay-reflow');
+            if (clickedOverlay) return;
 
-    /**
-     * Document-level pointerdown (capture phase). Only fires when:
-     *   - BBox Edit Mode is ON
-     *   - Shift is held (marquee mode)
-     *   - Left mouse button
-     *   - NOT on a .pdf-text-overlay-reflow (let per-overlay handler deal with clicks)
-     *
-     * Creates a TEMPORARY overlay only for the duration of the drag.
-     * Does NOT block scrolling or any UI when not dragging.
-     */
-    private onDocMouseDown = (e: MouseEvent): void => {
-        if (!this.isBBoxEditMode()) return;
-        if (e.button !== 0) return;
-        if (!e.shiftKey) return;
-        const target = e.target as HTMLElement | null;
-        if (target?.closest('.pdf-text-overlay-reflow')) return;
+            event.preventDefault();
+            event.stopPropagation();
+            this.marqueeActive = true;
+            this.marqueeContainer = container;
+            this.marqueeStart = { x: event.clientX, y: event.clientY };
+            this.selectionBox?.remove();
+            this.selectionBox = null;
+            clearHoldTimer();
+            // Hold LMB briefly to trigger marquee box, like standard bbox tools.
+            this.marqueeHoldTimer = window.setTimeout(() => {
+                if (!this.marqueeActive || !this.marqueeStart) return;
+                startSelectionBox(this.marqueeStart.x, this.marqueeStart.y);
+            }, 140);
+        };
 
-        e.preventDefault();
-        e.stopPropagation();
+        const onMouseMove = (event: MouseEvent) => {
+            if (!this.marqueeActive || !this.marqueeStart) return;
+            const dist = Math.hypot(event.clientX - this.marqueeStart.x, event.clientY - this.marqueeStart.y);
+            if (dist > 6 && !this.selectionBox) {
+                clearHoldTimer();
+                startSelectionBox(this.marqueeStart.x, this.marqueeStart.y);
+            }
+            if (!this.selectionBox) return;
+            const left = Math.min(this.marqueeStart.x, event.clientX);
+            const top = Math.min(this.marqueeStart.y, event.clientY);
+            const width = Math.abs(event.clientX - this.marqueeStart.x);
+            const height = Math.abs(event.clientY - this.marqueeStart.y);
+            this.selectionBox.style.left = `${left}px`;
+            this.selectionBox.style.top = `${top}px`;
+            this.selectionBox.style.width = `${width}px`;
+            this.selectionBox.style.height = `${height}px`;
+        };
 
-        // Create TEMPORARY full-screen overlay — only exists during drag
-        this.selectionOverlay = document.body.createEl('div', { cls: 'ort-bbox-marquee-overlay' });
-        this.selectionOverlay.style.cssText = [
-            'position: fixed', 'top: 0', 'left: 0', 'right: 0', 'bottom: 0',
-            'z-index: 99999', 'cursor: crosshair', 'background-color: transparent',
-        ].join('; ');
+        const onMouseUp = (event: MouseEvent) => {
+            if (!this.marqueeActive || !this.marqueeStart || !this.marqueeContainer) return;
+            clearHoldTimer();
+            const left = Math.min(this.marqueeStart.x, event.clientX);
+            const top = Math.min(this.marqueeStart.y, event.clientY);
+            const right = Math.max(this.marqueeStart.x, event.clientX);
+            const bottom = Math.max(this.marqueeStart.y, event.clientY);
 
-        this.startX = e.clientX;
-        this.startY = e.clientY;
-        this.isDragging = true;
+            // P2-27 (Phase 15): capture the page number BEFORE clearing
+            // marqueeContainer below — we use it for the page-scoped Notice.
+            // The marquee is bounded by `marqueeContainer` (the
+            // `.pdf-text-overlay-container` of the page where mousedown
+            // fired), so only overlays on THAT page can be selected — even
+            // if the user dragged the selection box across two pages
+            // visually. Inform the user so they don't expect overlays from
+            // the second page to also be selected.
+            const marqueePageEl = this.marqueeContainer.closest('.page') as HTMLElement | null;
+            const marqueePageNumber = marqueePageEl?.getAttribute('data-page-number') || '';
 
-        this.selectionDiv = this.selectionOverlay.createEl('div', { cls: 'ort-selection-box' });
-        this.selectionDiv.style.cssText = [
-            'position: fixed',
-            'border: 2px dashed var(--interactive-accent)',
-            'background-color: color-mix(in srgb, var(--interactive-accent) 12%, transparent)',
-            'left: 0', 'top: 0', 'width: 0', 'height: 0',
-            'pointer-events: none', 'z-index: 100000',
-            `transform: translate(${this.startX}px, ${this.startY}px)`,
-        ].join('; ');
+            // feat-1 (mass-select): shift+drag is additive (matches the
+            // pre-existing ctrl/meta behaviour), so an existing selection
+            // is preserved. Previously only ctrl/meta preserved it; a
+            // shift+drag would `clearSelection()` and silently wipe the
+            // mass-selection the user just built — breaking the
+            // shift+LMB-toggle → shift+drag-add workflow.
+            const additive = event.shiftKey || event.ctrlKey || event.metaKey;
 
-        // Mouse events on the temporary overlay
-        this.selectionOverlay.addEventListener('mousemove', this.onMarqueeMouseMove);
-        this.selectionOverlay.addEventListener('mouseup', this.onMarqueeMouseUp);
-    };
-
-    private onMarqueeMouseMove = (e: MouseEvent): void => {
-        if (!this.isDragging || !this.selectionDiv) return;
-        e.preventDefault();
-        const left = Math.min(this.startX, e.clientX);
-        const top = Math.min(this.startY, e.clientY);
-        const width = Math.abs(this.startX - e.clientX);
-        const height = Math.abs(this.startY - e.clientY);
-        this.selectionDiv.style.transform = `translate(${left}px, ${top}px)`;
-        this.selectionDiv.style.width = `${width}px`;
-        this.selectionDiv.style.height = `${height}px`;
-    };
-
-    private onMarqueeMouseUp = (e: MouseEvent): void => {
-        if (!this.isDragging) return;
-        e.preventDefault();
-
-        const rect = this.selectionDiv?.getBoundingClientRect();
-        const additive = e.shiftKey || e.ctrlKey || e.metaKey;
-
-        this.teardownMarqueeOverlay();
-
-        if (rect && rect.width > 5 && rect.height > 5) {
-            if (!additive) this.clearSelection();
-            const overlays = document.querySelectorAll<HTMLElement>('.pdf-text-overlay-reflow');
-            let added = 0;
-            for (const ov of overlays) {
-                const r = ov.getBoundingClientRect();
-                if (r.width === 0 || r.height === 0) continue;
-                const overlaps = !(r.right < rect.left || r.left > rect.right || r.bottom < rect.top || r.top > rect.bottom);
-                if (overlaps) {
-                    this.selectedOverlays.add(ov);
-                    this.updateSelectionVisual(ov, true);
-                    added++;
+            if (this.selectionBox) {
+                const overlays = Array.from(this.marqueeContainer.querySelectorAll<HTMLElement>('.pdf-text-overlay-reflow'));
+                if (!additive) this.clearSelection();
+                for (const ov of overlays) {
+                    const r = ov.getBoundingClientRect();
+                    const overlaps = !(r.right < left || r.left > right || r.bottom < top || r.top > bottom);
+                    if (overlaps) {
+                        this.selectedOverlays.add(ov);
+                        this.updateSelectionVisual(ov, true);
+                    }
+                }
+                // P2-27 (Phase 15): notify if marquee selection completed.
+                // The marquee is page-scoped — only overlays whose
+                // container matches the mousedown page can be selected.
+                // When the user drags across two pages visually they may
+                // expect overlays from BOTH pages to be selected; the
+                // Notice explains why only one page's overlays are.
+                const selectedCount = this.selectedOverlays.size;
+                if (selectedCount > 0) {
+                    const pageLabel = marqueePageNumber ? `page ${marqueePageNumber}` : 'the current page';
+                    new Notice(
+                        `Selected ${selectedCount} boxes on ${pageLabel}. (Marquee is page-scoped)`,
+                        3000
+                    );
+                }
+            } else {
+                // feat-1 (mass-select): mousedown landed on empty space
+                // (the marquee down-handler only arms `marqueeActive` when
+                // no overlay was hit) but no actual drag happened —
+                // `selectionBox` is null because movement stayed under the
+                // 6px threshold AND the 140ms hold timer didn't fire in
+                // time. Treat this as a plain click on empty space:
+                // clear the selection unless an additive modifier
+                // (shift/ctrl/meta) is held, which signals the user
+                // intended additive marquee and we should leave the
+                // existing selection alone.
+                if (!additive) {
+                    this.clearSelection();
                 }
             }
-            if (added > 0) {
-                new Notice(`Selected ${added} box${added === 1 ? '' : 'es'}.`, 2000);
-            }
-        }
-    };
 
-    private teardownMarqueeOverlay(): void {
-        if (this.selectionOverlay) {
-            this.selectionOverlay.removeEventListener('mousemove', this.onMarqueeMouseMove);
-            this.selectionOverlay.removeEventListener('mouseup', this.onMarqueeMouseUp);
-            this.selectionOverlay.remove();
-            this.selectionOverlay = null;
-        }
-        this.selectionDiv?.remove();
-        this.selectionDiv = null;
-        this.isDragging = false;
-    };
+            this.selectionBox?.remove();
+            this.selectionBox = null;
+            this.marqueeActive = false;
+            this.marqueeStart = null;
+            this.marqueeContainer = null;
+        };
+
+        this.marqueeHandlers = { down: onMouseDown, move: onMouseMove, up: onMouseUp };
+        // P1-17 (Phase 14): do NOT attach listeners here — they are now
+        // attached lazily by `attachMarqueeListeners()` when BBox edit mode
+        // is entered, and detached by `detachMarqueeListeners()` on exit /
+        // cleanup. This avoids firing marquee handlers on every document
+        // mouse event when BBox mode is off.
+    }
 
     /**
-     * Document-level click (capture phase). When BBox Edit Mode is ON and
-     * the click landed on empty space (inside PDF viewer but NOT on an
-     * overlay), clear the selection. Does NOT block scrolling or any UI
-     * because `click` fires AFTER pointerup — scrolling has already
-     * happened by then.
+     * P1-17 (Phase 14): attach the marquee mousedown/mousemove/mouseup
+     * listeners to the document. Idempotent — safe to call multiple times.
+     * Called from `overlay.attachMarqueeListeners()` which is in turn called
+     * from `main.ts` when BBox edit mode is toggled ON.
      */
-    private onDocClick = (e: MouseEvent): void => {
-        if (!this.isBBoxEditMode()) return;
-        // Only handle clicks inside the PDF viewer
-        const target = e.target as HTMLElement | null;
-        if (!target) return;
-        // If click landed on an overlay, let per-overlay clickHandler handle it
-        if (target.closest('.pdf-text-overlay-reflow')) return;
-        // If click is inside a PDF page container → it's "empty space" in the PDF
-        if (target.closest('.pdf-viewer, .pdf-view, .page')) {
-            if (!e.shiftKey && !e.ctrlKey && !e.metaKey) {
-                this.clearSelection();
-            }
-        }
-    };
+    public attachMarqueeListeners(): void {
+        if (this.marqueeListenersAttached) return;
+        if (this.marqueeHandlers.down) document.addEventListener('mousedown', this.marqueeHandlers.down, true);
+        if (this.marqueeHandlers.move) document.addEventListener('mousemove', this.marqueeHandlers.move, true);
+        if (this.marqueeHandlers.up) document.addEventListener('mouseup', this.marqueeHandlers.up, true);
+        this.marqueeListenersAttached = true;
+    }
 
-    // ============================================================
-    // Selection state helpers
-    // ============================================================
+    /**
+     * P1-17 (Phase 14): detach the marquee listeners. Idempotent. Also
+     * resets any in-flight marquee state (selection box, hold timer,
+     * marqueeActive flag) so a mid-drag BBox-mode-exit doesn't leave a
+     * dangling selection rectangle on the screen. Called from
+     * `overlay.detachMarqueeListeners()` on BBox edit mode OFF and from
+     * `cleanup()`.
+     */
+    public detachMarqueeListeners(): void {
+        if (!this.marqueeListenersAttached) return;
+        if (this.marqueeHandlers.down) document.removeEventListener('mousedown', this.marqueeHandlers.down, true);
+        if (this.marqueeHandlers.move) document.removeEventListener('mousemove', this.marqueeHandlers.move, true);
+        if (this.marqueeHandlers.up) document.removeEventListener('mouseup', this.marqueeHandlers.up, true);
+        this.marqueeListenersAttached = false;
+        // Reset in-flight marquee state so a dangling drag doesn't persist.
+        if (this.marqueeHoldTimer !== null) {
+            window.clearTimeout(this.marqueeHoldTimer);
+            this.marqueeHoldTimer = null;
+        }
+        this.selectionBox?.remove();
+        this.selectionBox = null;
+        this.marqueeActive = false;
+        this.marqueeStart = null;
+        this.marqueeContainer = null;
+    }
 
     private updateSelectionVisual(el: HTMLElement, isSelected: boolean): void {
         if (isSelected) el.classList.add('bbox-selected');
@@ -542,10 +508,7 @@ export class OverlayUIRenderer {
         // the engine is absent (V3 file rendered from disk without V4
         // migration), the attribute is omitted entirely, matching the
         // `data-translation-id` policy.
-        // T4.3 (v5): overlayData may carry MANUAL style overrides in the
-        // dedicated fields (parsed from `afs`/`alh`). Legacy `fontSize`/`fs`
-        // is the ORIGINAL dominant size — explicitly NOT an override.
-        overlayData?: { id?: string; engine?: string; adjustedFontSize?: number; adjustedLineHeight?: number } | OverlayPositionData
+        overlayData?: { id?: string; engine?: string } | OverlayPositionData
     ): HTMLElement {
         if (!rect || rect.width <= 0 || rect.height <= 0) {
             return document.createElement('div');
@@ -556,9 +519,25 @@ export class OverlayUIRenderer {
         const wordCount = plainText.split(/\s+/).filter(Boolean).length; // FIX: filter empty tokens
         const isShortPhrase = wordCount <= SHORT_PHRASE_WORD_LIMIT;
 
-        // --- 3 (hoisted). Font calculation ---
-        // (T4.2: hoisted ABOVE the tight-line check because the tight
-        // threshold is now derived from the dominant font size.)
+        // --- 2. Tight-line detection ---
+        const isTightLine = rect.height < TIGHT_LINE_HEIGHT_THRESHOLD;
+        const currentBleedY = isTightLine ? BLEED_Y_TIGHT : BLEED_Y_NORMAL;
+
+        const el = document.createElement('div');
+        el.className = 'pdf-text-overlay-reflow';
+
+        if (isShortPhrase) {
+            el.classList.add('force-top-align');
+        }
+
+        // FIX: store short-phrase flag in data attr so sizing logic doesn't depend on CSS class name
+        el.setAttribute('data-is-short-phrase', isShortPhrase ? 'true' : 'false');
+
+        // --- 3. Font calculation ---
+        // FIX (v5): use DOMINANT font size (most frequent) instead of average.
+        // Average is skewed by superscripts/subscripts (e.g. [22] in 8pt mixed
+        // with 10pt body → avg=9pt, but body should render at 10pt).
+        // Dominant = the size that appears most often in originalFontSizes.
         let avgOriginalFontSize: number;
         if (originalFontSizes.length > 0) {
             // Find dominant (mode) font size
@@ -580,40 +559,8 @@ export class OverlayUIRenderer {
             avgOriginalFontSize = parseFloat(window.getComputedStyle(referenceSpan).fontSize) || 12;
         }
 
-        // --- 2. Tight-line detection (T4.2: scale-RELATIVE) ---
-        // The old absolute threshold (24px) classified the SAME line as
-        // "tight" at 50% zoom and "normal" at 200% zoom, flipping BLEED and
-        // the line-height ceiling between zoom levels. A line is tight when
-        // its bbox height is under ~1.5× the rendered font size of its
-        // dominant span — invariant under viewer zoom.
-        const scaleFactor = (lastKnownScale > 0 ? lastKnownScale : 1);
-        const tightThreshold = avgOriginalFontSize * 1.5 * scaleFactor;
-        const isTightLine = rect.height < tightThreshold;
-        const currentBleedY = isTightLine ? BLEED_Y_TIGHT : BLEED_Y_NORMAL;
-
-        const el = document.createElement('div');
-        el.className = 'pdf-text-overlay-reflow';
-
-        if (isShortPhrase) {
-            el.classList.add('force-top-align');
-        }
-
-        // FIX: store short-phrase flag in data attr so sizing logic doesn't depend on CSS class name
-        el.setAttribute('data-is-short-phrase', isShortPhrase ? 'true' : 'false');
-
         const baseFontSize = avgOriginalFontSize * outputFontSizeScale;
-        let currentFontSize = baseFontSize * lastKnownScale;
-        // T4.3 (format v5): a persisted manual font-size adjustment
-        // (saved scale-free in extractPositionDataFrom) overrides the
-        // computed size so "increase/decrease text" survives reloads.
-        // T4.3 (CORRECTED): only the DEDICATED `adjustedFontSize` field counts
-        // — the legacy `fontSize` is the original dominant size and must never
-        // be treated as an override (the earlier version did, silently
-        // dropping outputFontSizeScale for every queue-saved overlay).
-        const persistedFS = (overlayData as any)?.adjustedFontSize;
-        if (typeof persistedFS === 'number' && Number.isFinite(persistedFS) && persistedFS > 0) {
-            currentFontSize = persistedFS * scaleFactor;
-        }
+        const currentFontSize = baseFontSize * lastKnownScale;
 
         // --- 3.5. Line height (computed early for vertical compensation) ---
         let startLH = outputLineHeight;
@@ -739,14 +686,7 @@ export class OverlayUIRenderer {
         }
 
         // --- 6. Line height (startLH computed in step 3.5) ---
-        // T4.3 (format v5, CORRECTED): a persisted MANUAL line-height
-        // adjustment (dedicated `adjustedLineHeight` field only) overrides
-        // the computed start value.
-        const persistedLH = (overlayData as any)?.adjustedLineHeight;
-        const effectiveLH = (typeof persistedLH === 'number' && Number.isFinite(persistedLH) && persistedLH > 0)
-            ? Math.max(LINE_HEIGHT_MIN, Math.min(LINE_HEIGHT_MAX, persistedLH))
-            : startLH;
-        this.applyLineHeight(inner, effectiveLH);
+        this.applyLineHeight(inner, startLH);
 
         // --- 7. Metadata ---
         el.setAttribute('data-original-text', originalTextContent);
@@ -824,6 +764,57 @@ export class OverlayUIRenderer {
     // Public API: Post-Processing Overlap Fixer
     // ============================================================
 
+    /**
+     * Resolves vertical overlaps between overlay elements after they are all placed.
+     *
+     * FIX: The original only compared each element to the *immediately next* sorted
+     *      element. If two non-adjacent boxes overlapped (e.g., a tall box spanning
+     *      several short ones), those were silently skipped.
+     *      Now each box is checked against ALL subsequent boxes, not just index i+1.
+     *
+     * FIX: parseFloat(el.style.top) returns NaN when top is not set inline.
+     *      Falls back to getBoundingClientRect() for robustness.
+     */
+    public fixVerticalOverlaps(overlays: HTMLElement[]): void {
+        if (!overlays || overlays.length < 2) return;
+
+        const getTop    = (el: HTMLElement) => parseFloat(el.style.top)    || el.getBoundingClientRect().top;
+        const getHeight = (el: HTMLElement) => parseFloat(el.style.height) || el.getBoundingClientRect().height;
+
+        const sorted = [...overlays].sort((a, b) => getTop(a) - getTop(b));
+
+        for (let i = 0; i < sorted.length - 1; i++) {
+            const current = sorted[i];
+            if (current.style.display === 'none') continue;
+
+            const currentTop    = getTop(current);
+            const currentHeight = getHeight(current);
+            let   currentBottom = currentTop + currentHeight;
+
+            // FIX: check against ALL subsequent boxes, not just i+1
+            for (let j = i + 1; j < sorted.length; j++) {
+                const next = sorted[j];
+                if (next.style.display === 'none') continue;
+
+                const nextTop = getTop(next);
+                if (currentBottom <= nextTop - 1) break; // sorted — no further collisions possible
+
+                const newBottom = nextTop - 1;
+                const newHeight = newBottom - currentTop;
+
+                if (newHeight > 8) {
+                    current.style.height = `${newHeight}px`;
+                    currentBottom = newBottom; // update for subsequent checks
+
+                    const innerEl = current.querySelector('div') as HTMLDivElement | null;
+                    const lh = innerEl ? parseFloat(innerEl.style.lineHeight) || 1.1 : 1.1;
+                    this.adjustOverlayForOverflow(current, lh);
+                }
+                break; // once we've resolved the first collision, stop (box is now smaller)
+            }
+        }
+    }
+
     // ============================================================
     // Sizing Logic (Overflow & Fit)
     // ============================================================
@@ -841,7 +832,7 @@ export class OverlayUIRenderer {
      *     `overflow:visible` is no longer set on the outer element.
      *  3. Long-text branch: after font shrink, we now *also* reset font size if the
      *     content fits at a *larger* size (i.e., it was shrunk in a previous call but
-     *     the box was later enlarged (e.g. by a caller growing it) — previously it would stay
+     *     the box was later enlarged by fixVerticalOverlaps — previously it would stay
      *     tiny forever).
      *  4. Removed the `el.style.overflow = 'auto'` line in Strategy 3; this is now
      *     handled exclusively by the `is-scrollable` CSS class to avoid inline style
@@ -937,7 +928,7 @@ export class OverlayUIRenderer {
             inner.scrollWidth  > el.clientWidth  + 1;
 
         if (!isOverflowing()) {
-            // FIX: box may have been grown by a caller between fits — recover size.
+            // FIX: box may have been grown (e.g. after fixVerticalOverlaps re-runs this).
             // Try to recover font size up toward original if there's now spare room.
             // (This is a mild upward-fit — only a few steps to avoid expensive loops.)
             const originalFontSize = parseFloat(el.getAttribute('data-original-font-size') || '0');
@@ -1043,9 +1034,6 @@ export class OverlayUIRenderer {
             let newValue = Math.round((currentLineHeight + delta) * 100) / 100; // FIX: round before clamp
             newValue = Math.max(LINE_HEIGHT_MIN, Math.min(LINE_HEIGHT_MAX, newValue));
             this.applyLineHeight(inner, newValue);
-            // T4.3: mark as a MANUAL adjustment so the extractor persists it
-            // (creation/auto-fit styles must NOT be persisted as overrides).
-            overlayEl.dataset.styleAdjusted = '1';
             // P2-24 (Phase 15): persist font adjustment to storage
             void this.persistOverlayAdjustment(overlayEl);
         } catch (error) {
@@ -1069,8 +1057,6 @@ export class OverlayUIRenderer {
             const FONT_SIZE_MAX_PX = 72;
             const newSize = Math.max(FONT_SIZE_MIN_PX, Math.min(FONT_SIZE_MAX_PX, currentSize * scaleFactor));
             overlayEl.style.fontSize = `${newSize}px`;
-            // T4.3: mark as a MANUAL adjustment (see adjustSingleOverlayLineHeight).
-            overlayEl.dataset.styleAdjusted = '1';
             // P2-24 (Phase 15): persist font adjustment to storage
             void this.persistOverlayAdjustment(overlayEl);
         } catch (error) {
@@ -1314,6 +1300,55 @@ export class OverlayUIRenderer {
         return updated;
     }
 
+    private buildLayoutSettingsForBBoxMode(
+        // Phase 2 (C3): 'column' / 'table' / 'split' branches have been
+        // removed. Only 'paragraphs' and 'block' remain — both have
+        // dedicated branches below; the final fall-back block (previously
+        // the default for the removed modes) is now unreachable and has
+        // been deleted along with them.
+        mode: 'paragraphs' | 'block',
+        base: LayoutSettings
+    ): LayoutSettings {
+        if (mode === 'paragraphs') {
+            return {
+                ...base,
+                useModeEnsemble: false,
+                minStripConfidence: Math.min(base.minStripConfidence, 0.5),
+                minStripWidthPx: Math.min(base.minStripWidthPx, 2.5),
+                maxIterMerges: Math.min(base.maxIterMerges, 6),
+                gapMinGapWidthPx: Math.min(base.gapMinGapWidthPx, 1.2),
+                gapBandStepFactor: Math.min(base.gapBandStepFactor, 0.6),
+                gapMinStripHeightFactor: Math.min(base.gapMinStripHeightFactor, 1.1),
+                gridMinHorizontalGapLineHeightMultiplier: Math.min(base.gridMinHorizontalGapLineHeightMultiplier, 1.1),
+                gridMinVerticalGapLineHeightMultiplier: Math.min(base.gridMinVerticalGapLineHeightMultiplier, 0.55),
+                gridProjectionProfileThreshold: Math.min(base.gridProjectionProfileThreshold, 0.6),
+                pmMinStripConfidenceSplit: Math.min(base.pmMinStripConfidenceSplit, 0.5),
+                pmMinStripWidthPx: Math.min(base.pmMinStripWidthPx, 2),
+                pmGeneralMergeVerticalGapMultiplier: Math.min(base.pmGeneralMergeVerticalGapMultiplier, 0.95),
+                pmGeneralMergeVerticalGapMaxMultiplier: Math.min(base.pmGeneralMergeVerticalGapMaxMultiplier, 1.5),
+                pmStackedMergeVerticalGapMultiplier: Math.min(base.pmStackedMergeVerticalGapMultiplier, 0.95),
+                pmStackedMergeVerticalGapMaxMultiplier: Math.min(base.pmStackedMergeVerticalGapMaxMultiplier, 1.5),
+                pmSplitBoundaryDedupTol: Math.min(base.pmSplitBoundaryDedupTol, 0.18),
+                pmSplitInterWordGapTol: Math.min(base.pmSplitInterWordGapTol, 0.85),
+                pmSplitColumnGapTol: Math.min(base.pmSplitColumnGapTol, 1.8),
+                profileRegionFlowCostBias: Math.min(base.profileRegionFlowCostBias, 0.05),
+            };
+        }
+
+        // mode === 'block'
+        return {
+            ...base,
+            useModeEnsemble: false,
+            pmForceLinearMerge: true,
+            minStripConfidence: Math.max(base.minStripConfidence, 0.75),
+            pmMinStripConfidenceSplit: Math.max(base.pmMinStripConfidenceSplit, 0.75),
+            maxIterMerges: Math.max(base.maxIterMerges, 12),
+            pmGeneralMergeVerticalGapMultiplier: Math.max(base.pmGeneralMergeVerticalGapMultiplier, 1.6),
+            pmGeneralMergeVerticalGapMaxMultiplier: Math.max(base.pmGeneralMergeVerticalGapMaxMultiplier, 2.8),
+            profileRegionFlowCostBias: Math.min(base.profileRegionFlowCostBias, -0.25),
+        };
+    }
+
     private getSelectedSpanPool(
         pageItems: OverlayPositionData[],
         selectedIndices: number[],
@@ -1369,11 +1404,7 @@ export class OverlayUIRenderer {
             return this.retranslateSelection(pageItems, selectedIndices, mode);
         }
 
-        // T4.1 (split-view fix): leaf-scoped lookup — the old global
-        // document.querySelector returned the first matching page across ALL
-        // open PDF leaves and re-translated/detected layout on the WRONG file.
-        const activeLeaf = this.plugin.pdfDom.getActivePdfLeaf();
-        const pageEl = this.plugin.pdfDom.getPageElement(pageNumber, activeLeaf);
+        const pageEl = document.querySelector<HTMLElement>(`.page[data-page-number="${pageNumber}"]`);
         const textLayer = pageEl?.querySelector<HTMLElement>('.textLayer');
         if (!pageEl || !textLayer) {
             return this.retranslateSelection(pageItems, selectedIndices, mode);
@@ -1384,16 +1415,25 @@ export class OverlayUIRenderer {
             return this.retranslateSelection(pageItems, selectedIndices, mode);
         }
 
+        const originalSettings = { ...this.plugin.layoutSettings };
+        const tuned = this.buildLayoutSettingsForBBoxMode(mode, originalSettings);
         const viewer = pageEl.closest('.pdfViewer, #viewer') as HTMLElement | null;
         const currentScale = parseFloat(viewer?.style.getPropertyValue('--scale-factor') || '1') || 1;
 
-        // T3.7 (Q12 decision): the old `buildLayoutSettingsForBBoxMode` tuned
-        // ~25 layout fields the contour pipeline never read — a placebo that
-        // only obscured what the two modes actually differ in: the
-        // TRANSLATION strategy (joined single block vs per-unit). Detection
-        // now runs with the user's global settings; the mode difference
-        // lives purely in the strategy branches below.
-        const units = await this.plugin.processor.prepareTranslationUnits(selectedSpans, pageEl, /* forceFresh */ true);
+        // P1-9 (Phase 13): pass `tuned` directly to
+        // `prepareTranslationUnits` instead of mutating the global
+        // `processor.layoutDetector` (via
+        // `updateLayoutDetectorSettings(tuned, true)` + `finally { restore
+        // originalSettings }`). The previous pattern was racy under rapid
+        // double-click retranslates: two concurrent calls would each
+        // `try`/`finally` the same global detector and one could end up
+        // restoring the other's tuned settings — corrupting
+        // `plugin.layoutSettings`-derived state for subsequent page
+        // translations. `originalSettings` is a shallow defensive copy of
+        // `plugin.layoutSettings` passed as `base` to
+        // `buildLayoutSettingsForBBoxMode`; it's no longer used for
+        // restore-on-finally.
+        const units = await this.plugin.processor.prepareTranslationUnits(selectedSpans, pageEl, /* forceFresh */ true, tuned);
         if (!units || units.length === 0) {
             return this.retranslateSelection(pageItems, selectedIndices, mode);
         }
@@ -1946,10 +1986,18 @@ export class OverlayUIRenderer {
         this.selectedOverlays.clear();
         this.createdOverlays = new WeakMap();
         this.tempDiv = null;
-        // fix-bbox-selection: detachMarqueeListeners() is now responsible
-        // for the full teardown of the selection overlay, in-flight drag
-        // state, and the Escape key listener. It is idempotent — safe to
-        // call whether BBox mode is currently ON or OFF.
+        this.selectionBox?.remove();
+        this.selectionBox = null;
+        if (this.marqueeHoldTimer !== null) {
+            window.clearTimeout(this.marqueeHoldTimer);
+            this.marqueeHoldTimer = null;
+        }
+        // P1-17 (Phase 14): delegate marquee listener removal to the
+        // idempotent detachMarqueeListeners() helper. The previous inline
+        // removeEventListener calls + `this.marqueeHandlers = {}` wipe
+        // would have made a later attachMarqueeListeners() call a no-op
+        // (handlers gone) — detachMarqueeListeners preserves the handlers
+        // so re-init cycles are safe.
         this.detachMarqueeListeners();
 
         // FIX: also clean up the persistent measure span

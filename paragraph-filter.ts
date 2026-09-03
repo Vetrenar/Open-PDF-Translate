@@ -32,13 +32,7 @@ export interface ParagraphFilterRule {
     enabled: boolean;
 }
 
-/** Default rules — 2 enabled, as per Q-F4 decision.
- *
- * VERIFICATION FIX: the single-letter pattern now covers ANY letter of ANY
- * alphabet via `\p{L}` + 'u' flag (the old `[a-zA-Zа-яА-Я]` silently missed
- * ä/ö/ü/ß, accented Latin, Greek, CJK drop-caps … — those single letters
- * were still sent to the LLM).
- */
+/** Default rules — 2 enabled, as per Q-F4 decision. */
 export const DEFAULT_PARAGRAPH_FILTER_RULES: ParagraphFilterRule[] = [
     {
         id: 'preset-page-numbers',
@@ -49,7 +43,7 @@ export const DEFAULT_PARAGRAPH_FILTER_RULES: ParagraphFilterRule[] = [
     {
         id: 'preset-single-letter',
         name: 'Single letter',
-        pattern: '^\\p{L}$',
+        pattern: '^[a-zA-Zа-яА-Я]$',
         enabled: true,
     },
 ];
@@ -67,14 +61,6 @@ interface CompiledRule {
  * Compile enabled rules into RegExp objects. Called once per translation
  * batch (not per paragraph) for performance.
  *
- * VERIFICATION FIX (user-requested audit of exclusion regexes):
- * The flags are now 'i' ONLY — no 'm'. With the old 'im' flags, a pattern
- * like `^\d{1,4}$` matched when ANY LINE of a multi-line paragraph was a
- * bare number, so a table block such as "Years 45\n70\n180" was excluded
- * from translation ENTIRELY (including its translatable words). Whole-
- * text anchoring keeps the intended semantics: the rule fires only when
- * the paragraph IS a page number, not when it CONTAINS one.
- *
  * Invalid regex patterns are silently skipped (with a console.warn in
  * debug mode) — we don't want one bad rule to break the entire translation.
  */
@@ -83,17 +69,9 @@ export function compileRules(rules: ParagraphFilterRule[]): CompiledRule[] {
     for (const rule of rules) {
         if (!rule.enabled || !rule.pattern) continue;
         try {
-            // Case-insensitive. NOTE: intentionally NOT multiline — see doc.
-            // 'u' is required for Unicode property escapes (\p{L}); it is
-            // stricter about identity escapes, so a legacy user rule that
-            // contains e.g. '\-' falls back to non-'u' compilation instead
-            // of being dropped.
-            let regex: RegExp;
-            try {
-                regex = new RegExp(rule.pattern, 'iu');
-            } catch {
-                regex = new RegExp(rule.pattern, 'i');
-            }
+            // Case-insensitive, multiline (so ^ and $ match line boundaries
+            // within multi-line paragraph text).
+            const regex = new RegExp(rule.pattern, 'im');
             compiled.push({ id: rule.id, name: rule.name, regex });
         } catch (err) {
             console.warn(`[ParagraphFilter] Invalid regex in rule "${rule.name}": ${rule.pattern}`, err);

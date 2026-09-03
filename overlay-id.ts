@@ -162,30 +162,14 @@ export function generateOverlayId(
  * but that's an unsupported edge case (and the hash would just mismatch,
  * forcing an unnecessary re-translate — self-correcting).
  */
-/**
- * Compute a 16-hex-char hash of the LIVE fields of `LayoutSettings`.
- *
- * T3.1: previously this hashed the ENTIRE settings object, ~110 fields of
- * which ~100 were dead configuration inherited from retired detectors.
- * Touching any dead field changed the hash → `getCachedPages` treated every
- * translated document as stale → full re-translation for a no-op change.
- * Now only the fields the contour pipeline actually reads are hashed, and
- * they are sorted by key first so the hash is independent of key insertion
- * order (a user hand-editing data.json can no longer invalidate anything).
- *
- * Unknown/dead keys present in the object are ignored entirely.
- */
 export function computeLayoutSettingsHash(settings: unknown): string {
-    const liveKeys = [
-        'contourCellSize', 'contourIndentThreshold', 'contourFontSizeTolerance',
-        'maxMergePasses', 'columnGapThreshold', 'decorationThreshold', 'debugValidation',
-    ];
-    const src = (settings && typeof settings === 'object') ? settings as Record<string, unknown> : {};
-    const live: Record<string, unknown> = {};
-    for (const k of liveKeys) live[k] = src[k];
-    // `JSON.stringify(undefined)` returns undefined (not a string) — coerce
-    // to a stable representation that is distinct from any real value set.
-    const json = JSON.stringify(live) === undefined ? 'undefined' : JSON.stringify(live);
+    // `JSON.stringify(undefined)` returns `undefined` (not a string), which
+    // would break the hash. Coerce to a stable string representation that
+    // round-trips for the "no settings" case. The literal `'undefined'` is
+    // distinct from any valid JSON (which always starts with `{`, `[`, `"`,
+    // a digit, or `null`/`true`/`false`), so there's no collision risk with
+    // a real LayoutSettings object.
+    const json = settings === undefined ? 'undefined' : JSON.stringify(settings);
     const h1 = (hash32(json, 0)    >>> 0).toString(16).padStart(8, '0');
     const h2 = (hash32(json, 5381) >>> 0).toString(16).padStart(8, '0');
     return h1 + h2;

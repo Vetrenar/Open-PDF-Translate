@@ -90,21 +90,14 @@ export class PdfWatcher {
     }
 
     stop(): void {
-        // T1.1 (boot-bug fix): cancel in-flight work ONLY when this watcher
-        // actually owns running work. `start()` calls `stop()` unconditionally
-        // on EVERY plugin load — even with the watcher disabled — and the old
-        // unconditional `cancelRunning()` here set the layout queue's
-        // persistent `cancelled` flag at boot. That flag used to be probed by
-        // the shared translation core, so EVERY manual "Translate and add
-        // overlay" died with `Error: cancelled` right after starting the
-        // plugin (user-confirmed: "[PDF Translator] Queue cancelled —" in the
-        // load log, immediately followed by the failed manual translation).
-        const hasRunningWork =
-            this.current !== null ||
-            [...this.queue.values()].some(item => item.status === 'running');
-        if (hasRunningWork) {
-            this.cancelRunning();
-        }
+        // P1-3 (Phase 9): cancel any in-flight translation before tearing
+        // down listeners. Previously `stop()` only detached vault event
+        // refs, leaving a running HeadlessTranslator / PdfLayoutQueue job
+        // alive — it would still call back into `this.current` after stop,
+        // write to the .translations.md file, and notify subscribers whose
+        // modal had already been detached. `cancelRunning()` is a no-op if
+        // nothing is running, so this is safe to call unconditionally.
+        this.cancelRunning();
         // Drop the running-job references immediately so any late callback
         // from the cancelled job (Promise resolution, .then() in runOne*)
         // observes `this.current === null` and short-circuits its post-run
@@ -293,23 +286,14 @@ export class PdfWatcher {
      * For the internal engine, this calls `pdfLayoutQueue.cancel()` which
      * stops new tasks from starting (the in-flight page finishes naturally).
      * For the python engine, this calls `HeadlessTranslator.cancel()`.
-     *
-     * FIX (bg-queue audit fix): always call `queue.cancel()` directly instead
-     * of relying on the single `currentQueueCancel` slot. When multiple
-     * `runOneViaQueue` calls are in flight (Translate Selected / Run All
-     * kicked off in parallel), only the LAST one's cancel fn is stored — so
-     * after the first one finishes and clears the slot, the user's Cancel
-     * click would silently no-op for any still-running siblings. Calling
-     * `queue.cancel()` directly is safe (idempotent, no-op if already
-     * cancelled) and cancels ALL queue work in one shot.
      */
     cancelRunning() {
         if (this.current) {
             this.current.cancel();
         }
-        // Always cancel the layout queue — supports parallel runOneViaQueue
-        // calls. queue.cancel() is idempotent (no-op if already cancelled).
-        this.plugin.pdfLayoutQueue?.cancel();
+        if (this.currentQueueCancel) {
+            this.currentQueueCancel();
+        }
     }
 
     // ── manual trigger: run one item or the whole pending queue ───────────
@@ -318,27 +302,10 @@ export class PdfWatcher {
      * `plugin.settings.layoutEngine`:
      *   - 'internal' → PdfLayoutQueue (extract + translate + save, no Python)
      *   - 'python'   → HeadlessTranslator (extract via PyMuPDF + translate + save)
-     *
-     * @param opts.force  When true, re-queues ALL pages via `enqueuePageRange`
-     *                    (forces re-translation of already-cached pages).
-     *                    Used by the per-item "Retranslate" button. Default
-     *                    false — uses `enqueuePdf` which skips cached pages.
-     *
-     * FIX (bg-queue audit fix): allow retry when item is stuck at 'running'
-     * due to a prior queue cancel. Previously the guard was
-     * `if (item.status === 'running') return;` which permanently blocked
-     * retry on items that had been paused mid-flight (status was set to
-     * 'running' with a '(timeout)' message and never cleared). Now we allow
-     * re-entry when the queue is cancelled — the next `enqueuePdf` /
-     * `enqueuePageRange` call will auto-resume via `triggerProcessing`.
      */
-    async runOne(path: string, opts?: { force?: boolean }): Promise<void> {
+    async runOne(path: string): Promise<void> {
         const item = this.queue.get(path);
-        if (!item) return;
-        // Allow retry when item is stuck at 'running' due to queue cancel.
-        if (item.status === 'running' && !this.plugin.pdfLayoutQueue?.isCancelled()) {
-            return;
-        }
+        if (!item || item.status === 'running') return;
 
         const file = this.plugin.app.vault.getAbstractFileByPath(path);
         if (!(file instanceof TFile)) {
@@ -350,7 +317,7 @@ export class PdfWatcher {
 
         const engine = this.plugin.settings.layoutEngine;
         if (engine === 'internal') {
-            await this.runOneViaQueue(item, file, opts);
+            await this.runOneViaQueue(item, file);
         } else {
             await this.runOneViaPython(item, file);
         }
@@ -366,12 +333,8 @@ export class PdfWatcher {
      *
      * Note: enqueuePdf only queues pages that aren't already cached. If all
      * pages are already translated, the item is marked 'skipped'.
-     *
-     * @param opts.force  When true, re-queues ALL pages via `enqueuePageRange`
-     *                    so cached pages are re-translated. Used by the
-     *                    per-item "Retranslate" button.
      */
-    private async runOneViaQueue(item: QueueItem, file: TFile, opts?: { force?: boolean }): Promise<void> {
+    private async runOneViaQueue(item: QueueItem, file: TFile): Promise<void> {
         item.status = 'running';
         item.message = 'queued for worker extraction + translation';
         this.notifyChange();
@@ -404,17 +367,7 @@ export class PdfWatcher {
         };
 
         try {
-            // FIX (bg-queue audit fix): when `opts.force` is true, use
-            // `enqueuePageRange(1, totalPages)` instead of `enqueuePdf` so
-            // already-cached pages are re-queued for re-translation. Used by
-            // the per-item "Retranslate" button on done/skipped items.
-            let count: number;
-            if (opts?.force) {
-                const totalPages = await this.plugin.pdfLayoutService.getPageCount(file);
-                count = await queue.enqueuePageRange(file, 1, totalPages);
-            } else {
-                count = await queue.enqueuePdf(file);
-            }
+            const count = await queue.enqueuePdf(file);
             if (count === 0) {
                 // Distinguish "all cached" from "error": if file is NOT in
                 // queue state, enqueuePdf threw before creating the file state
@@ -467,22 +420,10 @@ export class PdfWatcher {
                         // `running` and, if so, leave the item at `running`
                         // with an explicit "(timeout)" suffix so the queue
                         // loop can pick it up on the next pass.
-                        //
-                        // FIX (bg-queue audit fix §3.5): if the queue is
-                        // cancelled, set status back to 'pending' (NOT
-                        // 'running') with a "paused" message so the user can
-                        // retry via the per-item "Translate" button. The
-                        // previous code stamped 'running' + '(timeout)' which
-                        // blocked retry via runOne's guard.
                         const pendingCount = tasks.filter(t => t.status === 'pending' || t.status === 'running').length;
                         if (pendingCount > 0) {
-                            if (queue.isCancelled()) {
-                                item.status = 'pending';
-                                item.message = `paused — ${doneCount} done, ${pendingCount} pending (click Translate to resume)`;
-                            } else {
-                                item.status = 'running';
-                                item.message = `${doneCount} done, ${pendingCount} still running (timeout)`;
-                            }
+                            item.status = 'running';
+                            item.message = `${doneCount} done, ${pendingCount} still running (timeout)`;
                         } else {
                             item.status = 'done';
                             item.message = `${doneCount} page(s) extracted + translated`;
@@ -494,8 +435,8 @@ export class PdfWatcher {
                 }
             }
         } catch (e: any) {
-            // enqueuePdf / enqueuePageRange threw — most likely pdfjs failed
-            // to load. Show the real error, not a misleading "skipped" status.
+            // enqueuePdf threw — most likely pdfjs failed to load.
+            // Show the real error, not a misleading "skipped" status.
             const msg = e?.message ?? String(e);
             console.error(`[PdfWatcher] runOneViaQueue failed for "${file.path}":`, e);
             item.status = 'error';
@@ -504,19 +445,8 @@ export class PdfWatcher {
             new Notice(`Background translation failed: ${item.message}`, 8000);
         } finally {
             unsub();
-            // FIX (bg-queue audit fix): only clear the shared refs if they
-            // still point to THIS call's unsub/cancel. When multiple
-            // runOneViaQueue calls run in parallel (Translate Selected / Run
-            // All), later calls overwrite these slots — clearing them
-            // unconditionally would strip the still-running siblings of their
-            // cancel hook. The local `unsub()` above always cleans up THIS
-            // call's subscription correctly.
-            if (this.currentQueueUnsub === unsub) {
-                this.currentQueueUnsub = null;
-            }
-            // currentQueueCancel is a fresh closure per call; we can't
-            // identity-compare meaningfully, so just leave it — cancelRunning
-            // now calls queue.cancel() directly anyway.
+            this.currentQueueUnsub = null;
+            this.currentQueueCancel = null;
             this.notifyChange();
         }
     }
@@ -615,50 +545,24 @@ export class PdfWatcher {
         );
     }
 
-    /**
-     * Run every pending/error item (manual trigger).
-     *
-     * FIX (bg-queue audit fix): kick off all eligible items IN PARALLEL via
-     * `Promise.allSettled` instead of awaiting each `runOne` sequentially.
-     * Previously the serial `await this.runOne(item.path)` loop blocked the
-     * UI thread for up to 60 minutes PER FILE (waitForQueueCompletion's
-     * timeout) — so clicking "Run All" on a queue of 5 untranslated PDFs
-     * would not even enqueue the 2nd file until the 1st finished. The user
-     * saw only the first item progress and assumed "Run All" was broken.
-     *
-     * The PdfLayoutQueue itself processes files SEQUENTIALLY (one page at a
-     * time, one file at a time), so running runOne in parallel doesn't
-     * actually parallelize the work — but it DOES enqueue all files
-     * immediately, sets all their item.status to 'running' immediately,
-     * and lets each runOne's queue.onChange subscription relay progress
-     * for its own file. The user sees all items as 'running' with live
-     * progress, and the queue drains them in FIFO order.
-     *
-     * P2-14 (Phase 11): retry both `pending` AND `error` items. Previously
-     * only `pending` was retried, so a transient failure permanently doomed
-     * the file until the user manually clicked its per-item Translate
-     * button. Now `error` items get another shot when the user clicks
-     * "Run All". (`done` / `skipped` are terminal-success; `running` means
-     * another call already picked it up.)
-     */
+    /** Run every pending item sequentially (manual trigger). */
     async runAllPending(): Promise<void> {
         if (this.running) { new Notice('Background translation already running.'); return; }
         this.running = true;
         this.notifyChange();
         try {
-            const items = this.getQueue().filter(
-                item => item.status !== 'done' && item.status !== 'skipped' && item.status !== 'running'
-            );
-            if (items.length === 0) {
-                new Notice('No pending items to translate.', 3000);
-                return;
+            for (const item of this.getQueue()) {
+                // P2-14 (Phase 11): retry both `pending` AND `error` items.
+                // Previously only `pending` was retried, so a transient
+                // failure (network blip, pdfjs load error on the first page,
+                // etc.) permanently doomed the file until the user manually
+                // clicked its per-item Translate button. Now `error` items
+                // get another shot when the user clicks "Run all pending".
+                // (`done` / `skipped` are terminal-success; `running` means
+                // another call already picked it up.)
+                if (item.status === 'done' || item.status === 'skipped' || item.status === 'running') continue;
+                await this.runOne(item.path);
             }
-            new Notice(`Starting translation for ${items.length} file(s)...`, 3000);
-            // Kick off all in parallel — each runOne enqueues into the
-            // PdfLayoutQueue and subscribes to its own file's progress. The
-            // queue processes files sequentially, but the UI shows all items
-            // as "running" with live progress immediately.
-            await Promise.allSettled(items.map(item => this.runOne(item.path)));
             new Notice('Background translation queue finished.', 4000);
         } finally {
             this.running = false;

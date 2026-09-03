@@ -26,11 +26,7 @@ import { LayoutDetector, LayoutSettings } from './layout-detector';
 // the cache→OverlayPositionData construction site below so the merged
 // result has the same id as the on-disk version (which the DOM-extraction
 // and queue paths also produce for the same source paragraph).
-import { getCurrentEngine } from './overlay-id';
-// T2.4: shared constants/utilities (was duplicated across 5 modules).
-import { isTableLikeText, normalizeWithLineBreaks, collapseToSingleLine, CancelToken, isCancelled as tokenCancelled } from './shared';
-// T2.5: THE single construction site for saved overlay records.
-import { makeOverlay } from './overlay-factory';
+import { generateOverlayId, getCurrentEngine } from './overlay-id';
 import type { VerticalStrip } from './layout-detector';
 // Phase 13.3: import the provider registry so we can read `contextWindow`
 // for the auto-chunk check. (We do NOT call buildRequest from here —
@@ -64,8 +60,8 @@ export class TextProcessor {
   private measurementCache = new Map<HTMLElement, { rect: DOMRect; timestamp: number }>();
   private styleCache = new Map<HTMLElement, CSSStyleDeclaration>();
 
-  // FIX D4 (REMOVED, T6.1): `lastPreparedUnits` was global mutable state shared
-  // between the (now deleted) translatePageContent() and createOverlayWithText(). If the user switched
+  // FIX D4 (REMOVED): `lastPreparedUnits` was global mutable state shared between
+  // `translatePageContent()` and `createOverlayWithText()`. If the user switched
   // pages between the two calls (or if a third party called
   // createOverlayWithText), the overlay would be created on the wrong page with
   // the wrong units. Now createOverlayWithText accepts TranslationUnit[] +
@@ -119,25 +115,11 @@ export class TextProcessor {
       }
 
       const translatedLines = await this.executeTranslation(translationUnits);
-      // T1.8: a cancelled/failed run must not render fallback originals over
-      // this page's existing overlays — stop here. executeTranslation already
-      // surfaced the error Notice.
-      const degradedPageNum = parseInt(pageElement.getAttribute('data-page-number') || '0', 10);
-      if (this.lastRunDegraded && this.plugin.overlay?.pagesWithOverlays?.has?.(degradedPageNum)) {
-        new Notice('Translation incomplete — existing saved overlays left untouched.', 5000);
-        return;
-      }
       const successfulTranslations = translatedLines.filter(line => line !== 'Translation missing').length;
 
       await this.createOverlayWithText(pageElement, translationUnits, translatedLines);
       new Notice(`✓ Translation complete. Rendered ${successfulTranslations} segment(s).`, 3000);
     } catch (error: any) {
-      if (error?.message === 'cancelled') {
-        // T1.2/T1.8: cancellation is a user action, not a failure — render
-        // nothing, save nothing.
-        new Notice('Translation cancelled.', 3000);
-        return;
-      }
       console.error("addOverlayToPage process failed:", error);
       new Notice(`⚠ Translation failed: ${error.message}`, 4000);
     }
@@ -145,34 +127,89 @@ export class TextProcessor {
 
   // ==================== TRANSLATION PIPELINE ====================
 
-  // T6.1: `translatePageContent` (kept-for-back-compat wrapper over
-  // prepare+execute) was removed — it had zero live callers after the
-  // multi-page modal migrated to the background queue.
+  /**
+   * Translate the current page and return the joined translated text.
+   *
+   * FIX D4: previously this method stashed the TranslationUnit[] + translatedLines
+   * into a `lastPreparedUnits` field so that `createOverlayWithText()` could
+   * read them back. That implicit coupling was fragile (page switches,
+   * re-entrancy, third-party callers). Callers who need both the units and
+   * the translation should call `prepareTranslationUnits` + `executeTranslation`
+   * + `createOverlayWithText` directly (see `addOverlayToPage`).
+   *
+   * This method is kept for backward compatibility with modal.ts callers,
+   * but it NO LONGER stashes state — it's a pure translate-and-return.
+   */
+  public async translatePageContent(pageElement: HTMLElement): Promise<string | null> {
+    const textLayer = pageElement.querySelector('.textLayer') as HTMLElement;
+    if (!textLayer) {
+      new Notice('Text layer not found. Wait for PDF to fully render.');
+      return null;
+    }
+
+    const translationUnits = await this.prepareTranslationUnits(textLayer, pageElement, /* forceFresh */ true);
+    if (!translationUnits || translationUnits.length === 0) {
+      new Notice('No valid text to translate (or layout analysis failed).', 2000);
+      return null;
+    }
+
+    const translatedLines = await this.executeTranslation(translationUnits);
+    return translatedLines.join('\n');
+  }
 
   /**
-   * FIX D4 + T6.1: createOverlayWithText accepts TranslationUnit[] +
-   * translatedLines as explicit parameters. The legacy `(pageElement,
-   * joinedString)` overload relied on the removed `lastPreparedUnits`
-   * global state and had no live callers — deleted in this overhaul.
+   * FIX D4: createOverlayWithText now accepts TranslationUnit[] + translatedLines
+   * as explicit parameters. The old signature `(pageElement, translatedText)`
+   * relied on `lastPreparedUnits` global state, which was unreliable when the
+   * user switched pages between translate and render.
+   *
+   * The old single-string signature is kept as an overload for backward
+   * compatibility — but it now does a fresh layout detection instead of
+   * reading stale state. Callers should migrate to the new signature.
    */
   public async createOverlayWithText(
     pageElement: HTMLElement,
-    units: TranslationUnit[],
-    translatedLines: string[],
+    unitsOrText: TranslationUnit[] | string,
+    translatedLines?: string[],
   ): Promise<void> {
     const prepResult = this.validateAndPreparePrerequisites(pageElement, true);
     if (!prepResult) return;
     const { overlayContainer } = prepResult;
     this.overlayContainers.push(overlayContainer);
 
-    const translationUnits = units;
+    let translationUnits: TranslationUnit[];
+    let lines: string[];
+
+    if (Array.isArray(unitsOrText)) {
+      // New signature: caller passes units + lines directly (preferred).
+      translationUnits = unitsOrText;
+      lines = translatedLines ?? [];
+    } else {
+      // Legacy signature: caller passes a joined string. We have to re-detect
+      // layout because we no longer have `lastPreparedUnits` to recover the
+      // original spans. This is slower but keeps backward compat.
+      const textLayer = pageElement.querySelector('.textLayer') as HTMLElement;
+      if (!textLayer) {
+        new Notice('Text layer not found for legacy createOverlayWithText.', 3000);
+        overlayContainer.remove();
+        return;
+      }
+      const units = await this.prepareTranslationUnits(textLayer, pageElement, /* forceFresh */ true);
+      if (!units || units.length === 0) {
+        overlayContainer.remove();
+        return;
+      }
+      translationUnits = units;
+      lines = (unitsOrText as string).split('\n');
+    }
+
     if (!translationUnits || translationUnits.length === 0) {
       overlayContainer.remove();
       return;
     }
 
     // === Safety net: enforce equal length ===
-    let finalTranslatedLines = translatedLines ?? [];
+    let finalTranslatedLines = lines;
     if (finalTranslatedLines.length !== translationUnits.length) {
       console.error(`CRITICAL: Units (${translationUnits.length}) vs TranslatedLines (${finalTranslatedLines.length}) mismatch. Fixing.`);
       if (finalTranslatedLines.length < translationUnits.length) {
@@ -197,17 +234,12 @@ export class TextProcessor {
       this.plugin.overlay.markPageAsHavingOverlays(pageNumberForRefresh, pageElement);
     }
 
-    if (this.plugin.settings.autoSaveOverlay && !this.lastRunDegraded) {
+    if (this.plugin.settings.autoSaveOverlay) {
       // FIX H11: capture the page element in the rAF closure. Previously the rAF
       // callback called saveCurrentPageOverlay() which re-queries the current page
       // — if the user scrolled/flipped pages before the rAF fired, the wrong page
       // would be saved. Now we pass the page element so saveCurrentPageOverlay
       // can extract overlay data from the CORRECT page.
-      //
-      // T1.8 (Q2=2): a degraded run (fallback originals) is NEVER auto-saved —
-      // it would silently overwrite good existing translations with
-      // untranslated text (exactly the near-miss observed with the
-      // "Error: cancelled" boot bug).
       const pageElForSave = pageElement;
       requestAnimationFrame(() => {
         this.plugin.overlay.saveCurrentPageOverlayForPage(pageElForSave);
@@ -366,27 +398,20 @@ export class TextProcessor {
 
   // ==================== TRANSLATION EXECUTION ====================
 
-  /**
-   * T1.8: set whenever the most recent executeTranslation/translateSegments
-   * run degraded to fallbacks (any segment reverted to its original text,
-   * or a page-level failure). Consumers (createOverlayWithText) use this to
-   * avoid RENDERING original text over already-saved translations and to
-   * skip the auto-save — a failed run must never overwrite good data.
-   */
-  public lastRunDegraded = false;
-
-  public async executeTranslation(
-    units: TranslationUnit[],
-    opts?: { isCancelled?: CancelToken },
-  ): Promise<string[]> {
+  public async executeTranslation(units: TranslationUnit[]): Promise<string[]> {
     this.translationFailures = [];
-    this.lastRunDegraded = false;
 
     if (units.length === 0) return [];
 
-    // Stage 2.4: Apply paragraph filter rules. Paragraphs matching
+    // Stage 2.4 (NEW): Apply paragraph filter rules. Paragraphs matching
     // enabled filter rules (page numbers, single letters, etc.) are NOT
     // sent to the LLM — their original text is used as the "translation".
+    // This saves API costs on non-translatable content and prevents
+    // garbage translations of numeric/short patterns.
+    //
+    // Per Q-F1: filter is applied here (at executeTranslation), NOT at
+    // extraction. Overlays are still created for filtered paragraphs —
+    // they just show the original text instead of a translation.
     let translatableUnits = units;
     let skippedIndices = new Set<number>();
     const rules = this.plugin.settings.paragraphFilterRules;
@@ -411,55 +436,62 @@ export class TextProcessor {
       return units.map(u => u.text);
     }
 
+    // Build batch text from translatable units only.
+    const fullText = translatableUnits.map((u, i) => `[#${i + 1}] ${u.text}`).join('\n');
     const { useBatchTranslation: useBatch, maxBatchChars } = this.plugin.settings;
-    const translatableTexts = translatableUnits.map(u => u.text);
 
-    let translatedLines: string[];
+    // FIX: simplified to purely character-based chunking. Token estimation was
+    // inaccurate (especially for reasoning models) and caused more problems
+    // than it solved. The user controls chunk size via maxBatchChars — if a
+    // provider has a small context window, set maxBatchChars accordingly.
+    const shouldUseChunking = useBatch && translatableUnits.length > 1 &&
+      fullText.length > maxBatchChars;
+
     try {
-      if (useBatch && translatableUnits.length > 1) {
-        translatedLines = await this.translateSegments(translatableTexts, {
-          isCancelled: opts?.isCancelled,
-        });
+      let translatedLines: string[];
+
+      // Stage 2.4: use translatableUnits (filtered) for LLM calls, not
+      // the full units array. The LLM only sees non-filtered paragraphs.
+      if (shouldUseChunking) {
+        new Notice(`Long page detected. Translating in multiple batches...`, 4000);
+        translatedLines = await this.performChunkedTranslation(translatableUnits, maxBatchChars);
+      } else if (useBatch && translatableUnits.length > 1) {
+        const raw = await this.plugin.translation.translateBatch(fullText, translatableUnits.length);
+        if (this.plugin.settings.debugMode) {
+          console.log(`[Batch Input]:\n${fullText}`);
+          console.log(`[Batch Raw Output]:\n${raw}`);
+        }
+        translatedLines = await this.extractNumberedLinesRobust(raw, translatableUnits.length, translatableUnits.map(u => u.text));
       } else {
-        translatedLines = await this.performSequentialTranslation(translatableUnits, opts?.isCancelled);
+        translatedLines = await this.performSequentialTranslation(translatableUnits);
       }
 
-      // Restore leading numbering/bullets that LLMs sometimes strip.
       translatedLines = this.restoreStructure(translatableUnits, translatedLines);
 
-      // ── Line-break policy (Q9 + user-requested table handling) ─────────
-      // A segment keeps its line structure when EITHER the user explicitly
-      // asked for it (preserveSourceLineBreaks) OR the SOURCE segment was
-      // table-like (every line short → table rows / list items — the
-      // structure IS the meaning). Everything else collapses to one line.
-      translatedLines = translatedLines.map((line, i) => {
-        const origText = translatableUnits[i]?.text || '';
-        const keepBreaks = this.plugin.settings.preserveSourceLineBreaks
-          || isTableLikeText(origText);
-        return keepBreaks ? normalizeWithLineBreaks(line) : collapseToSingleLine(line);
-      });
+      // Final cleanup: strip any <br> that survived earlier stages
+      translatedLines = translatedLines.map(line =>
+        line.replace(/<br\s*\/?>/gi, ' ').replace(/\s+/g, ' ').trim()
+      );
 
-      // Detect degradation: any segment that fell back to its original
-      // text (missing marker / chunk failure). Drives T1.8 protection.
-      let degradedCount = 0;
       translatedLines = translatedLines.map((line, i) => {
-        if (!line || !line.trim()) {
-          degradedCount++;
-          console.warn(`Segment ${i + 1} empty. Reverting to original.`);
-          return translatableUnits[i].text;
+        if (line === 'Translation missing' || !line.trim()) {
+            console.warn(`Segment ${i + 1} missing. Reverting to original.`);
+            return translatableUnits[i].text;
         }
         return line;
       });
-      if (degradedCount > 0) this.lastRunDegraded = true;
 
       // Stage 2.4: merge translated lines back with skipped paragraphs.
+      // Skipped paragraphs use their original text (not translated).
       if (skippedIndices.size > 0) {
         const result: string[] = new Array(units.length);
         let transIdx = 0;
         for (let i = 0; i < units.length; i++) {
           if (skippedIndices.has(i)) {
+            // Filtered paragraph — use original text
             result[i] = units[i].text;
           } else {
+            // Translated paragraph
             result[i] = translatedLines[transIdx] || units[i].text;
             transIdx++;
           }
@@ -470,21 +502,11 @@ export class TextProcessor {
       return translatedLines;
 
     } catch (err: any) {
-      // T1.8: a CANCELLED run must not be treated as "translate failed →
-      // fall back to originals" — rendering and (worse) auto-SAVING
-      // original text over good saved translations is data corruption.
-      // Re-throw so addOverlayToPage stops before rendering anything.
-      if (err?.message === 'cancelled') {
-        this.lastRunDegraded = true;
-        throw err;
-      }
-      // FIX H14: fatal translation errors must be surfaced — otherwise the
-      // user sees a false "✓ Translation complete" while all segments
-      // silently fell back to originals. Mark degraded so the caller can
-      // refuse to overwrite existing saved overlays (Q2 decision, variant 2).
+      // FIX H14: was logDebug (silent, debugMode-gated). Fatal translation errors
+      // must be surfaced to the user — otherwise they see false "✓ Translation complete"
+      // while all segments silently fell back to originals.
       console.error('[PDF Translator] Translation failed:', err);
       new Notice(`Translation failed: ${err?.message || err}`, 8000);
-      this.lastRunDegraded = true;
       return units.map(u => u.text);
     }
   }
@@ -495,146 +517,203 @@ export class TextProcessor {
   // plugin can still handle large pages, but they do NOT alter paragraph
   // boundaries from the pipeline.
 
-  /**
-   * T2.1: THE unified translation orchestrator (all callers share this core).
-   *
-   * Contract: returns EXACTLY `texts.length` strings, aligned 1:1 with the
-   * input — one translation per input text, regardless of internal
-   * pre-splitting/chunking. This contract is what the old
-   * `translateTextsWithChunking` documented but VIOLATED (P0-1: pre-split
-   * long texts into N segments and returned one translation per SEGMENT,
-   * shifting every subsequent translation of the page onto the wrong
-   * paragraph in the headless/python path).
-   *
-   * Pipeline:
-   *   1. Pre-split texts longer than `maxBatchChars − 20` into sentence
-   *      groups, remembering each segment's ORIGIN index.
-   *   2. Pack segments into ≤ maxBatchChars chunks ([#N]-numbered).
-   *   3. translateBatch + extractNumberedLinesRobust per chunk; per-chunk
-   *      failure falls back to that chunk's ORIGINAL SEGMENT TEXTS (not
-   *      silently shifted translations).
-   *   4. Re-join each origin's segment translations back into one string.
-   *   5. restoreStructure-style marker restoration happens in the caller.
-   *
-   * Cancellation (T1.2): checks ONLY the caller-supplied token — never the
-   * global background-queue flag (the old shared checks cancelled manual
-   * translations whenever the queue had been paused — see T1.1/T1.2).
-   */
-  public async translateSegments(
-    texts: string[],
-    opts?: { isCancelled?: CancelToken; onProgress?: (done: number, total: number) => void },
-  ): Promise<string[]> {
-    if (texts.length === 0) return [];
-    this.lastRunDegraded = false;
+  private async performChunkedTranslation(units: TranslationUnit[], maxChars: number): Promise<string[]> {
+    const chunks: TranslationUnit[][] = [];
+    let currentChunk: TranslationUnit[] = [];
+    let currentSize = 0;
 
-    const maxBatchChars = this.plugin.settings.maxBatchChars ?? 4000;
-    const UNIT_OVERHEAD = 20;
+    for (const unit of units) {
+      const unitSize = unit.text.length + 20;
+      if (currentSize + unitSize > maxChars && currentChunk.length > 0) {
+        chunks.push(currentChunk);
+        currentChunk = [];
+        currentSize = 0;
+      }
+      currentChunk.push(unit);
+      currentSize += unitSize;
+    }
+    if (currentChunk.length > 0) chunks.push(currentChunk);
 
-    // ── Step 1: pre-split oversized texts, tracking origin indices ──
-    const segments: string[] = [];
-    const originOf: number[] = [];   // segments[i] belongs to texts[ originOf[i] ]
-    for (let t = 0; t < texts.length; t++) {
-      const text = texts[t];
-      if (text.length + UNIT_OVERHEAD > maxBatchChars) {
-        const parts = this.splitLongTextBySentences(text, maxBatchChars - UNIT_OVERHEAD);
-        for (const p of parts) {
-          segments.push(p);
-          originOf.push(t);
+    // FIX: removed token-based context-window splitting. Chunking is now
+    // purely character-based via maxBatchChars (handled above). If a provider
+    // has a small context window, the user should set maxBatchChars accordingly.
+    const finalChunks = chunks;
+
+    const allTranslated: string[] = [];
+    const delayMs = this.plugin.settings.sequentialDelayMs ?? 150;
+    for (let i = 0; i < finalChunks.length; i++) {
+      // P1-2 (Phase 9): per-chunk cancel check — break out of the chunk
+      // loop within ~one chunk of LLM latency when the queue is cancelled,
+      // instead of draining every remaining chunk for the in-flight page.
+      // The thrown error propagates to executeTranslation's catch, which
+      // falls back to originals for the page (same as a network failure).
+      // For the interactive path (queue NOT cancelled), `?.` short-circuits
+      // to undefined → no-op, so existing behaviour is preserved.
+      if (this.plugin.pdfLayoutQueue?.isCancelled?.()) {
+        throw new Error('cancelled');
+      }
+      const chunk = finalChunks[i];
+      const chunkText = chunk.map((u, j) => `[#${j + 1}] ${u.text}`).join('\n');
+      try {
+        const raw = await this.plugin.translation.translateBatch(chunkText, chunk.length);
+        const lines = await this.extractNumberedLinesRobust(raw, chunk.length, chunk.map(u => u.text));
+        allTranslated.push(...lines);
+        if (finalChunks.length > 1) {
+          new Notice(`Batch ${i + 1}/${finalChunks.length} complete.`, 2000);
         }
+      } catch (err) {
+        console.error(`Chunk ${i + 1} failed:`, err);
+        allTranslated.push(...chunk.map(u => u.text));
+      }
+      // FIX: respect sequentialDelayMs between chunks (rate-limit friendly).
+      // Without this, chunked translation fires API calls back-to-back,
+      // causing 429 rate limit errors on providers with strict limits.
+      if (i < finalChunks.length - 1 && delayMs > 0) {
+        await new Promise(r => setTimeout(r, delayMs));
+      }
+    }
+    return allTranslated;
+  }
+
+  /**
+   * FIX H2: shared chunking utility for all translation paths (interactive,
+   * queue, headless). Splits texts by `maxBatchChars`, then further by
+   * `contextWindow` if needed. Translates chunks sequentially, preserves
+   * order. Returns translated strings aligned 1:1 with input texts.
+   *
+   * Why this exists: `performChunkedTranslation` operates on
+   * `TranslationUnit[]` (interactive path), but the two background paths
+   * (`pdf-layout-queue.translateParagraphs` and
+   * `HeadlessTranslator.translateFile`) only have `string[]`. Previously
+   * they called `translateBatch(fullText, count)` directly — a single
+   * API call for an entire page. With a small-context provider (e.g.
+   * Ollama at 4K) and a large page (20 paragraphs × 500 chars = 10K),
+   * the whole page exceeded the context window and the LLM either
+   * truncated, errored, or silently fell back to originals.
+   *
+   * Order preservation: chunk 1 receives texts[0..n], chunk 2 receives
+   * texts[n+1..m], etc. Results are concatenated in the same order.
+   *
+   * Partial failure: each chunk is wrapped in its own try/catch. If a
+   * chunk fails (network error, parse error, etc.) its texts fall back
+   * to their originals — other chunks still return their translations.
+   * The whole batch only throws if the queue is cancelled mid-flight.
+   *
+   * Cancellation: between chunks, checks
+   * `this.plugin.pdfLayoutQueue?.isCancelled?.()`. If cancelled, throws
+   * `new Error('cancelled')` so callers can surface it (queue path) or
+   * fall back to originals (headless path).
+   *
+   * Edge cases:
+   *   - Empty input  → returns [].
+   *   - Single text  → no chunking (one chunk of size 1, but still goes
+   *                    through translateBatch for consistency with the
+   *                    rest of the pipeline).
+   *   - All filtered → caller is expected to short-circuit before
+   *                    calling this method (as both queue and headless
+   *                    already do).
+   */
+  public async translateTextsWithChunking(texts: string[]): Promise<string[]> {
+    if (texts.length === 0) return [];
+
+    // FIX: chunking is PURELY character-based via maxBatchChars.
+    // No token estimation — it was inaccurate and caused problems with
+    // reasoning models. If a provider has a small context window, the user
+    // should set maxBatchChars appropriately (e.g., 2000 chars for 4K context).
+    const maxBatchChars = this.plugin.settings.maxBatchChars ?? 4000;
+
+    // ── Step 0: pre-split texts that individually exceed maxBatchChars ──
+    // FIX: previously a single paragraph longer than maxBatchChars was sent
+    // as-is in one chunk → context overflow → "Empty response" → fallback to
+    // original (text effectively "lost" because translation failed). Now we
+    // split long paragraphs by sentences BEFORE chunking. The split markers
+    // [#N] are regenerated per-chunk, so the LLM sees coherent segments.
+    const UNIT_OVERHEAD = 20;
+    const preSplitTexts: string[] = [];
+    for (const text of texts) {
+      if (text.length + UNIT_OVERHEAD > maxBatchChars) {
+        const sentences = this.splitLongTextBySentences(text, maxBatchChars - UNIT_OVERHEAD);
+        preSplitTexts.push(...sentences);
       } else {
-        segments.push(text);
-        originOf.push(t);
+        preSplitTexts.push(text);
       }
     }
 
-    // ── Step 2: pack segments into ≤ maxBatchChars chunks ──
+    // ── Step 1: split by maxBatchChars ──────────────────────────────
+    // Accumulate texts until adding the next one would exceed the
+    // character budget. Use the same +20-char overhead per text as
+    // `performChunkedTranslation` (for the `[#N] ` prefix + `\n`).
     const charChunks: string[][] = [];
     let current: string[] = [];
     let currentSize = 0;
-    for (const seg of segments) {
-      const size = seg.length + UNIT_OVERHEAD;
-      if (currentSize + size > maxBatchChars && current.length > 0) {
+    for (const text of preSplitTexts) {
+      const textSize = text.length + UNIT_OVERHEAD;
+      if (currentSize + textSize > maxBatchChars && current.length > 0) {
         charChunks.push(current);
         current = [];
         currentSize = 0;
       }
-      current.push(seg);
-      currentSize += size;
+      current.push(text);
+      currentSize += textSize;
     }
     if (current.length > 0) charChunks.push(current);
 
-    if (charChunks.length > 1) {
-      new Notice(`Translating in ${charChunks.length} batches...`, 3000);
+    // ── Step 2: (removed token-based context window check) ──────────
+    // FIX: token estimation was inaccurate and caused problems with reasoning
+    // models. Chunking is now PURELY character-based via maxBatchChars (Step 1).
+    // If a provider has a small context window, the user should set maxBatchChars
+    // appropriately (e.g., 2000 chars for 4K context models).
+    const finalChunks = charChunks;
+
+    // FIX: show batch progress notices (matching the standard pipeline's UX).
+    // Without these notices, the user has no feedback during multi-chunk
+    // background translation — it looks like nothing is happening.
+    if (finalChunks.length > 1) {
+      new Notice(`Translating in ${finalChunks.length} batches...`, 3000);
     }
 
-    // ── Step 3: translate chunks sequentially (order preserved) ──
-    const segmentTranslations: string[] = new Array(segments.length);
-    const delayMs = this.plugin.settings.sequentialDelayMs ?? 150;
-    let segCursor = 0;
-    for (let i = 0; i < charChunks.length; i++) {
-      if (tokenCancelled(opts?.isCancelled)) {
+    // ── Step 3: translate each chunk sequentially, preserve order ───
+    // Per-chunk try/catch — a failed chunk falls back to its originals
+    // so a single bad chunk doesn't lose the rest of the page. The
+    // cancel-check between chunks lets `Pause`/`Cancel` in the watcher
+    // modal take effect within ~one chunk's worth of LLM latency.
+    const allTranslated: string[] = [];
+    for (let i = 0; i < finalChunks.length; i++) {
+      const chunk = finalChunks[i];
+      if (this.plugin.pdfLayoutQueue?.isCancelled?.()) {
         throw new Error('cancelled');
       }
-      const chunk = charChunks[i];
-      const originTextsOfChunk = chunk; // chunk[k] IS the origin segment text (pre-split piece)
       try {
         const chunkText = chunk.map((t, j) => `[#${j + 1}] ${t}`).join('\n');
         if (this.plugin.settings.debugMode) {
-          console.log(`[Chunk ${i + 1}/${charChunks.length} Input]:\n${chunkText.substring(0, 200)}...`);
+          console.log(`[Chunk ${i + 1}/${finalChunks.length} Input]:\n${chunkText.substring(0, 200)}...`);
         }
         const raw = await this.plugin.translation.translateBatch(chunkText, chunk.length);
-        const lines = await this.extractNumberedLinesRobust(raw, chunk.length, originTextsOfChunk);
-        for (let k = 0; k < chunk.length; k++) {
-          segmentTranslations[segCursor + k] = lines[k];
+        if (this.plugin.settings.debugMode) {
+          console.log(`[Chunk ${i + 1}/${finalChunks.length} Raw Output]:\n${raw?.substring(0, 200) || '(empty)'}`);
         }
-        if (charChunks.length > 1) {
-          new Notice(`Batch ${i + 1}/${charChunks.length} complete.`, 2000);
+        const lines = await this.extractNumberedLinesRobust(raw, chunk.length, chunk);
+        allTranslated.push(...lines);
+        // FIX: show per-chunk progress notice (matching standard pipeline)
+        if (finalChunks.length > 1) {
+          new Notice(`Batch ${i + 1}/${finalChunks.length} complete.`, 2000);
         }
       } catch (err) {
-        if (err?.message === 'cancelled') throw err;
-        // Per-chunk failure: fall back to THIS chunk's original segments.
-        // (The old code pushed the raw chunk texts too, but the pre-split
-        // misalignment above made even that wrong — P0-1.)
+        // Partial-failure fallback: this chunk's texts revert to
+        // originals. Other chunks still get their translations.
         console.error(
-          `[translateSegments] chunk ${i + 1}/${charChunks.length} failed, falling back to originals:`,
+          `[translateTextsWithChunking] chunk ${i + 1}/${finalChunks.length} failed, falling back to originals:`,
           err,
         );
         new Notice(
-          `Batch ${i + 1}/${charChunks.length} failed — using original text. ` +
+          `Batch ${i + 1}/${finalChunks.length} failed — using original text. ` +
           `Error: ${err?.message?.substring(0, 60) || err}`,
           5000,
         );
-        this.lastRunDegraded = true;
-        for (let k = 0; k < chunk.length; k++) {
-          segmentTranslations[segCursor + k] = chunk[k];
-        }
-      }
-      segCursor += chunk.length;
-      opts?.onProgress?.(Math.min(segCursor, segments.length), segments.length);
-      if (i < charChunks.length - 1 && delayMs > 0) {
-        await new Promise(r => setTimeout(r, delayMs));
+        allTranslated.push(...chunk);
       }
     }
-
-    // ── Step 4: re-join each origin's segments (1:1 with input texts) ──
-    const byOrigin: string[][] = Array.from({ length: texts.length }, () => []);
-    for (let s = 0; s < segments.length; s++) {
-      byOrigin[originOf[s]].push(segmentTranslations[s] ?? segments[s]);
-    }
-    return byOrigin.map(parts => parts.join(' ').replace(/[ \t]+/g, ' ').trim());
-  }
-
-  /**
-   * Back-compat wrapper (headless/python path). Now a pure delegate to the
-   * unified orchestrator — the historical 1:1-alignment bug (P0-1) is fixed
-   * INSIDE translateSegments, so this signature keeps working for callers
-   * that hold plain string arrays.
-   */
-  public async translateTextsWithChunking(
-    texts: string[],
-    opts?: { isCancelled?: CancelToken },
-  ): Promise<string[]> {
-    return this.translateSegments(texts, { isCancelled: opts?.isCancelled });
+    return allTranslated;
   }
 
   /**
@@ -689,38 +768,39 @@ export class TextProcessor {
     return result.length > 0 ? result : [text];
   }
 
-  private async performSequentialTranslation(units: TranslationUnit[], cancelToken?: CancelToken): Promise<string[]> {
+  private async performSequentialTranslation(units: TranslationUnit[]): Promise<string[]> {
     const results: string[] = [];
     const delayMs = this.plugin.settings.sequentialDelayMs ?? 150;
     const maxChars = this.plugin.settings.maxBatchChars;
 
     for (let i = 0; i < units.length; i++) {
-      // T1.2: cancellation is checked via the CALLER-OWNED token only. The
-      // old global `plugin.pdfLayoutQueue?.isCancelled?.()` probe here is
-      // what made every manual translation die with "Error: cancelled"
-      // after the queue flag got poisoned at plugin startup (see T1.1).
-      if (tokenCancelled(cancelToken)) {
+      // P1-2 (Phase 9): per-segment cancel check (see performChunkedTranslation
+      // for rationale). Place BEFORE the try so the throw escapes the loop
+      // instead of being swallowed by the per-segment fallback catch below.
+      if (this.plugin.pdfLayoutQueue?.isCancelled?.()) {
         throw new Error('cancelled');
       }
       try {
-        // Oversized single unit: route through the unified orchestrator
-        // (T2.1) — it pre-splits by sentences, chunks, and re-joins with a
-        // guaranteed 1:1 mapping, replacing the parallel implementation
-        // translateOversizedUnit that was removed in this overhaul.
+        // FIX #4: Oversized single unit handling.
+        // If a unit exceeds maxBatchChars, sending it as a single LLM request
+        // may exceed max_tokens and produce a truncated translation.
+        // Split by sentences and translate in sub-batches (each ≤ maxBatchChars),
+        // then concatenate the sub-translations.
         if (units[i].text.length > maxChars) {
-          const translated = await this.translateSegments([units[i].text], { isCancelled: cancelToken });
-          results.push(translated[0] ?? units[i].text);
+          const translated = await this.translateOversizedUnit(units[i].text, maxChars);
+          results.push(translated);
         } else {
           // FIX: TranslationEngine has only translateBatch() and translateWithOpenRouter().
           // The previous call to .translate() always threw TypeError, was caught
           // silently, and returned the original text — masking the failure.
+          // This is the root cause of "bulk didn't work on native": when units.length === 1
+          // (common on native layout), batch mode was bypassed and this broken sequential
+          // path was used, returning untranslated text.
           const text = await this.plugin.translation.translateWithOpenRouter(units[i].text);
           results.push(text);
         }
       } catch (err) {
-        if (err?.message === 'cancelled') throw err;
         console.error(`Segment ${i + 1} failed:`, err);
-        this.lastRunDegraded = true;
         results.push(units[i].text);
       }
       // Respect sequentialDelayMs between requests (rate-limit friendly).
@@ -729,6 +809,62 @@ export class TextProcessor {
       }
     }
     return results;
+  }
+
+  /**
+   * Translate an oversized unit by splitting it into sentence-based sub-batches.
+   *
+   * Algorithm:
+   *   1. Split text into sentences (regex: /[^.!?]+[.!?]+\s*|\S+$/).
+   *   2. Group sentences into sub-batches, each ≤ maxChars.
+   *   3. Use translateBatch() for each sub-batch (with [#N] numbering).
+   *   4. Concatenate all sub-translations into a single string.
+   *
+   * Fallback: if sentence split fails or produces 0 sentences, fall back to
+   * a single translateWithOpenRouter call (may truncate, but better than nothing).
+   */
+  private async translateOversizedUnit(text: string, maxChars: number): Promise<string> {
+    // Split into sentences. Keep the trailing punctuation with each sentence.
+    const sentences = text.match(/[^.!?]+[.!?]+\s*|\S+$/g) || [text];
+    if (sentences.length <= 1) {
+      // Can't split further — send as single request (may truncate)
+      return await this.plugin.translation.translateWithOpenRouter(text);
+    }
+
+    // Group sentences into sub-batches, each ≤ maxChars
+    const subBatches: string[][] = [];
+    let currentBatch: string[] = [];
+    let currentSize = 0;
+    const UNIT_OVERHEAD = 20;  // [#N] prefix + \n separator per unit
+
+    for (const sentence of sentences) {
+      const sentenceSize = sentence.length + UNIT_OVERHEAD;
+      if (currentSize + sentenceSize > maxChars && currentBatch.length > 0) {
+        subBatches.push(currentBatch);
+        currentBatch = [];
+        currentSize = 0;
+      }
+      currentBatch.push(sentence);
+      currentSize += sentenceSize;
+    }
+    if (currentBatch.length > 0) subBatches.push(currentBatch);
+
+    // Translate each sub-batch using batch mode (numbering helps LLM keep order)
+    const subTranslations: string[] = [];
+    for (const subBatch of subBatches) {
+      const batchText = subBatch.map((s, j) => `[#${j + 1}] ${s}`).join('\n');
+      try {
+        const raw = await this.plugin.translation.translateBatch(batchText, subBatch.length);
+        const lines = await this.extractNumberedLinesRobust(raw, subBatch.length, subBatch);
+        subTranslations.push(...lines);
+      } catch (err) {
+        console.error('Sub-batch translation failed, falling back to originals:', err);
+        subTranslations.push(...subBatch);
+      }
+    }
+
+    // Join all sub-translations into a single string
+    return subTranslations.join(' ').replace(/\s+/g, ' ').trim();
   }
 
   /**
@@ -788,16 +924,11 @@ export class TextProcessor {
 
     const flushCurrent = () => {
       if (currentIdx >= 0 && currentIdx < expectedCount) {
-        // T5.3 (table support): line structure of a translation is now
-        // PRESERVED through this parser. Multi-line content is joined
-        // with '\n' (not ' '), and `<br>` tags from the model's echo are
-        // KEPT — the caller (executeTranslation) applies the per-segment
-        // policy (isTableLikeText / preserveSourceLineBreaks) and either
-        // keeps the structure or collapses it. Previously this stripped
-        // <br> and space-joined everything, flattening table rows.
+        // Strip any <br> tags the LLM may have copied from source —
+        // translation should be continuous text, not mirror PDF line wrapping.
         const trimmed = currentText
-          .replace(/[ \t]+\n/g, '\n')
-          .replace(/\n[ \t]+/g, '\n')
+          .replace(/<br\s*\/?>/gi, ' ')
+          .replace(/\s+/g, ' ')
           .trim();
         if (trimmed.length > 0 && !found.has(currentIdx)) {
           found.set(currentIdx, trimmed);
@@ -818,10 +949,9 @@ export class TextProcessor {
         currentIdx = parseInt(numStr, 10) - 1;  // 0-based
         currentText = m[2] || '';
       } else {
-        // Continuation line — append to current segment, PRESERVING the
-        // model's line break as '\n' (see flushCurrent note above).
+        // Continuation line — append to current segment
         if (currentIdx >= 0) {
-          currentText += '\n' + line.trim();
+          currentText += ' ' + line.trim();
         }
         // If currentIdx < 0, this is preamble before any marker — ignore.
       }
@@ -859,17 +989,18 @@ export class TextProcessor {
 
   private restoreStructure(units: TranslationUnit[], lines: string[]): string[] {
     return lines.map((line, i) => {
+      // Strip <br> tags — translation should be continuous text
+      const cleaned = line
+        .replace(/<br\s*\/?>/gi, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
       const orig = units[i]?.text || '';
-      // Preserve leading numbering/bullets that may have been stripped.
-      // T5.3: whitespace cleanup is intentionally NOT done here anymore —
-      // the per-segment line-break policy in executeTranslation (collapse
-      // vs preserve) owns it, and table-like segments must keep <br>/\n.
-      const firstLine = line.split(/\r?\n/)[0] ?? line;
+      // Preserve leading numbering/bullets that may have been stripped
       const origLead = orig.match(/^\s*(\d+[\.\)]\s*|[-•*]\s*|#\s*)/);
-      if (origLead && !firstLine.match(/^\s*(\d+[\.\)]\s*|[-•*]\s*|#\s*)/)) {
-        return origLead[1] + line;
+      if (origLead && !cleaned.match(/^\s*(\d+[\.\)]\s*|[-•*]\s*|#\s*)/)) {
+        return origLead[1] + cleaned;
       }
-      return line;
+      return cleaned;
     });
   }
 
@@ -922,29 +1053,48 @@ export class TextProcessor {
           const extRect = unit._externalRect;
           const extFont = unit._externalFont;
           if (!extRect) return null;
-          try {
-            // T2.5: single construction site (id + engine stamped inside).
-            return makeOverlay({
-              page: pageNumber,
-              rect: { left: extRect.l, top: extRect.t, width: extRect.w, height: extRect.h },
-              text: unit.text,
-              translated: translatedLines[index] || unit.text,
-              fontFamily: extFont?.family,
-              fontSize: extFont?.size,
-              originalFontSizes: extFont?.sizes || [],
-              engine: getCurrentEngine(this.plugin),
-            });
-          } catch {
-            return null; // invalid rect — skip this unit (factory invariant)
-          }
+
+          return {
+            selector: '',
+            textContent: unit.text,
+            page: pageNumber,
+            translatedText: translatedLines[index] || unit.text,
+            relativeRect: {
+              left: extRect.l,
+              top: extRect.t,
+              width: extRect.w,
+              height: extRect.h,
+            },
+            fontSize: extFont?.size,
+            fontFamily: extFont?.family,
+            originalFontSizes: extFont?.sizes || [],
+            // Phase 7 (V4 Schema): stable id from page + rect@3dec + textContent.
+            // Replaces the unstable `cached-${pageNum}-${index}` that was on
+            // the TranslationUnit (regenerated each load → couldn't be used
+            // for disk lookup or merge-by-id). This id matches what
+            // overlay.ts extractPositionDataFrom and pdf-layout-queue.ts
+            // buildOverlayData produce for the same source paragraph, so
+            // merge-by-id-first in updatePageOverlaysAndWrite can supersede
+            // the existing entry instead of leaving an orphan that
+            // rect-overlap-merge would resurrect.
+            id: generateOverlayId(pageNumber, {
+              left: extRect.l, top: extRect.t, width: extRect.w, height: extRect.h,
+            }, unit.text || ''),
+            // Phase 8 (V4 Schema): engine stamp from current provider/model.
+            // This path runs after an interactive translation via the
+            // TranslationEngine (translation.ts makeApiCall uses the same
+            // apiProvider + providerSettings[apiProvider].model), so the
+            // current settings ARE the engine that produced this overlay.
+            engine: getCurrentEngine(this.plugin),
+          } as OverlayPositionData;
         })
         .filter((x): x is OverlayPositionData => x !== null);
 
       this.plugin.overlay.renderSavedOverlay(overlayData, pageNumber);
 
-      if (this.plugin.settings.autoSaveOverlay && activeFile && !this.lastRunDegraded) {
+      if (this.plugin.settings.autoSaveOverlay && activeFile) {
         this.plugin.storage
-          .updatePageOverlaysAndWrite(activeFile, { [pageNumber]: overlayData }, { replace: true })
+          .updatePageOverlaysAndWrite(activeFile, { [pageNumber]: overlayData })
           // Phase 2 (P1-19): the manual `cachedOverlayData.pageOverlays[pageNumber]
           // = overlayData` patch that lived in this `.then()` was redundant —
           // `updatePageOverlaysAndWrite` already calls `updateCacheFromWrite`
@@ -1076,14 +1226,7 @@ export class TextProcessor {
     const rect = this.getBoundingClientRectCached(span);
     const text = (span.textContent || '').trim();
     if (rect.width <= 1 || rect.height <= 1 || !text) return false;
-    // VERIFICATION FIX (user-requested audit): the old `/^\d{1,3}$/` test
-    // dropped EVERY standalone 1-3 digit span — including numbers that
-    // pdf.js emits as separate spans MID-SENTENCE ("Figure [123] shows…").
-    // Those digits were silently deleted from the translated text. Page
-    // numbers are now handled the same way on every path: the layout
-    // pipeline gives them their own spatially-isolated paragraph and the
-    // paragraph-filter rule `^\d{1,4}$` (whole-text anchored, see
-    // paragraph-filter.ts) keeps them out of the LLM call.
+    if (/^\d{1,3}$/.test(text)) return false;
     if (text.length === 1 && /[•\-»«]/.test(text)) return false;
     if (text.startsWith('http')) return false;
     return true;

@@ -21,7 +21,7 @@
 // populated during the merge passes and are not part of the public
 // contract.
 
-import { OccupancyMapResult, getFontFamily, InputRect, lineGroupingTolerance, groupSpansIntoLines } from './OccupancyMap';
+import { OccupancyMapResult, getFontFamily, InputRect } from './OccupancyMap';
 
 export interface Paragraph {
   pxLeft: number;
@@ -192,14 +192,12 @@ export function buildParagraphs(
         }
       }
 
-      // Grid-cell bbox — CONNECTIVITY and size-filter only. The published
-      // geometry is recomputed from real span rects below (T-LD-R).
-      let pxLeft = minX * cellSize;
-      let pxTop = minY * cellSize;
-      let pxRight = (maxX + 1) * cellSize;
-      let pxBottom = (maxY + 1) * cellSize;
-      let width = pxRight - pxLeft;
-      let height = pxBottom - pxTop;
+      const pxLeft = minX * cellSize;
+      const pxTop = minY * cellSize;
+      const pxRight = (maxX + 1) * cellSize;
+      const pxBottom = (maxY + 1) * cellSize;
+      const width = pxRight - pxLeft;
+      const height = pxBottom - pxTop;
       if (width < cellSize || height < cellSize) continue;
 
       // FIX: use cellIslandId (actual cells) instead of bounding box.
@@ -214,75 +212,11 @@ export function buildParagraphs(
       });
       if (paraSpans.length === 0) continue;
 
-      // T-LD-R (right-edge accuracy): the island's PUBLISHED bbox is the
-      // union of its member spans' REAL rects — pixel-exact. The previous
-      // quantized-cell bbox inflated right/bottom edges by up to a full
-      // cell (4px); multi-line column paragraphs then visually touched the
-      // neighbouring column, and the renderer's BLEED (+4px) extended them
-      // further past the original text (user-reported). Grid cells remain
-      // the connectivity medium (BFS/contours/touchPairs); geometry comes
-      // from the spans themselves.
-      pxLeft = Math.min(...paraSpans.map(r => r.left));
-      pxTop = Math.min(...paraSpans.map(r => r.top));
-      pxRight = Math.max(...paraSpans.map(r => r.right));
-      pxBottom = Math.max(...paraSpans.map(r => r.bottom));
-      width = pxRight - pxLeft;
-      height = pxBottom - pxTop;
-
       const { dominantFamily, dominantSize } = computeDominantFont(paraSpans);
       // Stage 0.2 (Q8): removed `as any` cast. `id` is now declared on
       // Paragraph as `string?` — we String()-coerce the numeric islandId
       // so the type checks cleanly.
       paragraphs.push({ id: String(islandId), pxLeft, pxTop, pxRight, pxBottom, width, height, spans: paraSpans, dominantFamily, dominantSize });
-    }
-  }
-
-  // ── STEP 5.5 (T-LD-F4): sweep-up — no input rect may be lost ─────────
-  //
-  // A rect is assigned to an island by its CENTER CELL. When that cell
-  // belongs to a different (filtered-out or adjacent) island, the rect
-  // silently vanished from the translation — on the user's PDF this ate
-  // one span per page ('Veterinary Pathology' in the journal header, the
-  // 'a' table footnote marker). Every unclaimed rect is now attached to
-  // the paragraph whose bbox contains it (else the nearest one), and an
-  // orphan with no host at all becomes its own paragraph.
-  {
-    const claimed = new Set<InputRect>();
-    for (const p of paragraphs) for (const r of p.spans) claimed.add(r);
-    const orphans = rects.filter(r => !claimed.has(r));
-    for (const r of orphans) {
-      const cx = (r.left + r.right) / 2;
-      const cy = (r.top + r.bottom) / 2;
-      let host: Paragraph | undefined = paragraphs.find(p =>
-        cx >= p.pxLeft && cx <= p.pxRight && cy >= p.pxTop && cy <= p.pxBottom);
-      if (!host) {
-        let bestDist = Infinity;
-        for (const p of paragraphs) {
-          const dx = cx - (p.pxLeft + p.pxRight) / 2;
-          const dy = cy - (p.pxTop + p.pxBottom) / 2;
-          const d = dx * dx + dy * dy;
-          if (d < bestDist) { bestDist = d; host = p; }
-        }
-      }
-      if (host) {
-        host.spans.push(r);
-        host.pxLeft = Math.min(host.pxLeft, r.left);
-        host.pxTop = Math.min(host.pxTop, r.top);
-        host.pxRight = Math.max(host.pxRight, r.right);
-        host.pxBottom = Math.max(host.pxBottom, r.bottom);
-        host.width = host.pxRight - host.pxLeft;
-        host.height = host.pxBottom - host.pxTop;
-        const dom = computeDominantFont(host.spans);
-        host.dominantFamily = dom.dominantFamily;
-        host.dominantSize = dom.dominantSize;
-      } else {
-        const dom = computeDominantFont([r]);
-        paragraphs.push({
-          pxLeft: r.left, pxTop: r.top, pxRight: r.right, pxBottom: r.bottom,
-          width: r.right - r.left, height: r.bottom - r.top,
-          spans: [r], dominantFamily: dom.dominantFamily, dominantSize: dom.dominantSize,
-        });
-      }
     }
   }
 
@@ -349,10 +283,52 @@ export function buildParagraphs(
 
   /**
    * Determine if two islands can be merged based on font compatibility.
-   * T3.6: delegates to the single primaryFamilyOf implementation.
+   *
+   * Rule: Both islands must share a "primary" font family. The primary
+   * family is the one with the most spans (ties broken by first-occurrence).
+   *
+   * Special case: spans that are MUCH smaller than the island's median size
+   * (e.g., footnote reference numbers, superscripts) are treated as
+   * "decorations" and excluded from the primary family calculation — they
+   * should not prevent merging of the main text.
    */
   function getPrimaryFamily(para: Paragraph): string {
-    return primaryFamilyOf(para.spans);
+    // Collect all (family, size) pairs
+    const candidates: Array<{ family: string; size: number }> = [];
+    for (const s of para.spans as any[]) {
+      const fam = getFontFamily(s.fontname, _preserveStyle);
+      const sz = Number.isFinite(s.fontsize) ? s.fontsize! : 10;
+      candidates.push({ family: fam, size: sz });
+    }
+
+    if (candidates.length === 0) return 'unknown';
+
+    // Find median size — spans much smaller than median are "decorations"
+    const sizes = candidates.map(c => c.size).sort((a, b) => a - b);
+    const median = sizes[Math.floor(sizes.length / 2)];
+    const DECORATION_THRESHOLD = median * _decorationThreshold;  // <70% of median = decoration
+
+    // Filter out decoration spans
+    const mainSpans = candidates.filter(c => c.size >= DECORATION_THRESHOLD);
+
+    // Count families among main spans
+    const famCounts: Record<string, number> = {};
+    let firstFamily = '';
+    for (const c of mainSpans) {
+      if (!firstFamily) firstFamily = c.family;
+      famCounts[c.family] = (famCounts[c.family] || 0) + 1;
+    }
+
+    // Pick family with most spans; ties broken by first-occurrence
+    let bestFam = firstFamily;
+    let bestCount = 0;
+    for (const [fam, count] of Object.entries(famCounts)) {
+      if (count > bestCount || (count === bestCount && fam === firstFamily)) {
+        bestCount = count;
+        bestFam = fam;
+      }
+    }
+    return bestFam;
   }
 
   function sameFont(a: Paragraph, b: Paragraph): boolean {
@@ -381,9 +357,21 @@ export function buildParagraphs(
       if (!sameFont(a, b)) continue;
 
       // ── TABLE-CELL GUARD (Step 6) ──────────────────────────────────
-      // T3.6: shared isTablePattern (was a verbatim duplicate of the
-      // Step-8.5 guard).
-      if (isTablePattern(a, b)) {
+      // Same logic as in remergeAfterFontSplit: do NOT merge side-by-side
+      // islands with a clear horizontal gap (table row pattern).
+      const hGap6 = Math.max(0, Math.max(a.pxLeft, b.pxLeft) - Math.min(a.pxRight, b.pxRight));
+      const vOverlapTop6 = Math.max(a.pxTop, b.pxTop);
+      const vOverlapBottom6 = Math.min(a.pxBottom, b.pxBottom);
+      const vOverlap6 = Math.max(0, vOverlapBottom6 - vOverlapTop6);
+      const smallerHeight6 = Math.min(a.pxBottom - a.pxTop, b.pxBottom - b.pxTop);
+      const vOverlapFrac6 = smallerHeight6 > 0 ? vOverlap6 / smallerHeight6 : 0;
+      const aSizes6 = a.spans.map((s: any) => Number.isFinite(s.fontsize) ? s.fontsize : 10).sort((x, y) => x - y);
+      const bSizes6 = b.spans.map((s: any) => Number.isFinite(s.fontsize) ? s.fontsize : 10).sort((x, y) => x - y);
+      const medianSize6 = aSizes6.length && bSizes6.length
+        ? Math.min(aSizes6[Math.floor(aSizes6.length / 2)], bSizes6[Math.floor(bSizes6.length / 2)])
+        : 10;
+      const estLineHeight6 = medianSize6 * 1.2;
+      if (hGap6 >= estLineHeight6 * 1.5 && vOverlapFrac6 > 0.5) {
         // Table-cell pattern — skip merge
         continue;
       }
@@ -428,10 +416,22 @@ export function buildParagraphs(
   // ── STEP 7: Split by font family / size ────────────────────────────
   finalParagraphs = splitByFont(finalParagraphs, FONT_SIZE_TOLERANCE);
 
-  // T-LD (moved to 8.7): the marker split previously ran here (7.5) and
-  // step 8.5's remergeAfterFontSplit immediately GLUED the split pieces
-  // back together (same family, same size, physically touching — they came
-  // from one island). The pass now runs AFTER remerge; see step 8.7.
+  // ── STEP 7.5: Split by paragraph-start markers ─────────────────────
+  // Footnotes and other distinct logical blocks (Corresponding Author,
+  // Supplemental Material, etc.) often have the SAME font and SAME indent
+  // as adjacent text, so Step 7 (font) and Step 8 (indent) cannot separate
+  // them. They also have <8px vertical gap, so contour detection (Step 4)
+  // doesn't create horizontal boundaries between them.
+  //
+  // This step detects line-level markers that signal a NEW paragraph:
+  //   - Leading footnote number: "1", "12" at start of line (after optional
+  //     whitespace, followed by capital letter or symbol)
+  //   - Known structural labels: "Corresponding", "Supplemental", "Email:",
+  //     "Author contributions", "Acknowledgments", "References", etc.
+  //
+  // When such a marker is found on a line that is NOT the first line of the
+  // paragraph, a new paragraph is started.
+  finalParagraphs = splitByParagraphMarkers(finalParagraphs);
 
   // ── STEP 8: Split by indentation ───────────────────────────────────
   finalParagraphs = splitByIndent(finalParagraphs, INDENT_THRESHOLD);
@@ -499,16 +499,6 @@ export function buildParagraphs(
   //          → DO NOT SPLIT (drop-cap is handled by remergeAfterFontSplit)
   finalParagraphs = splitByParagraphIndent(finalParagraphs, INDENT_THRESHOLD);
 
-  // ── STEP 8.7: Split by paragraph-start markers (T-LD, moved from 7.5) ──
-  // Footnotes, affiliation blocks and figure/table captions often share the
-  // font AND indent of neighbouring text and sit closer than the contour
-  // threshold, so steps 7/8/8.5/8.6 cannot separate them. A line-level
-  // marker (structural label, footnote number, "Figure N.") on a non-first
-  // line starts a new paragraph. Running AFTER remerge guarantees the split
-  // is final — nothing downstream re-joins logical blocks that were split
-  // on purpose.
-  finalParagraphs = splitByParagraphMarkers(finalParagraphs);
-
   // ── STEP 9: Column-aware reading order ─────────────────────────────
   // Reorder paragraphs to native reading order:
   //   1. Header (above column region) + Wide (cross-column spans) → beginning
@@ -529,149 +519,6 @@ export function buildParagraphs(
   }
 }
 
-/**
- * T3.6: THE single implementation of the decoration-aware "primary font
- * family" computation. Previously THREE divergent copies existed (Step 6's
- * getPrimaryFamily closure, splitByFont's inline version, and
- * remergeAfterFontSplit's getPrimaryFamilyLocal) — a change to one silently
- * desynchronized the merge and split passes.
- *
- * T-LD-F1/D3 fix: the family vote is now WEIGHTED BY CHARACTER COUNT.
- * Span-count voting let a short bold/italic LEAD-IN ("Figure 1.", "a",
- * "1") outvote the 80-character body text of the same line — flipping the
- * whole line's family and slicing captions/affiliations mid-sentence into
- * a "bold" fragment and a body fragment. Characters, not span fragments,
- * are what the reader sees.
- */
-function primaryFamilyOf(spans: InputRect[]): string {
-  const candidates: Array<{ family: string; size: number; weight: number }> = [];
-  for (const s of spans) {
-    const fam = getFontFamily(s.fontname, _preserveStyle);
-    const sz = Number.isFinite(s.fontsize) ? s.fontsize! : 10;
-    // Weight = visible characters (pdfjs str / DOM textContent). Missing
-    // text falls back to weight 1 so DOM/test callers without text still work.
-    const weight = Math.max(1, (s.text ?? '').length);
-    candidates.push({ family: fam, size: sz, weight });
-  }
-  if (candidates.length === 0) return 'unknown';
-
-  // Spans much smaller than the median are decorations (superscripts,
-  // footnote refs) — they must not influence the primary family.
-  const sizes = candidates.map(c => c.size).sort((a, b) => a - b);
-  const median = sizes[Math.floor(sizes.length / 2)];
-  const DECORATION_THRESHOLD = median * _decorationThreshold;
-  const mainSpans = candidates.filter(c => c.size >= DECORATION_THRESHOLD);
-
-  const famWeight: Record<string, number> = {};
-  let firstFamily = '';
-  for (const c of mainSpans) {
-    if (!firstFamily) firstFamily = c.family;
-    famWeight[c.family] = (famWeight[c.family] || 0) + c.weight;
-  }
-  let bestFam = firstFamily || 'unknown';
-  let bestWeight = 0;
-  for (const [fam, weight] of Object.entries(famWeight)) {
-    if (weight > bestWeight || (weight === bestWeight && fam === firstFamily)) {
-      bestWeight = weight;
-      bestFam = fam;
-    }
-  }
-  return bestFam;
-}
-
-/**
- * T-LD-F1: character-weighted median font size, decoration-filtered.
- *
- * Replaces the unweighted span median in every size decision (line styles
- * in splitByFont, size compatibility in remerge, table-pattern line-height
- * estimate). The old median had two failure modes on mixed lines:
- *   • an even span count takes the UPPER element, so one 11.5pt
- *     superscript digit "flipped" an 8pt line to 11.5pt → spurious
- *     size-split of affiliations;
- *   • decorations were not filtered at all here (the 0.7 filter existed
- *     only in the family vote — an inconsistency).
- * Weighted-by-characters + decoration filter makes the size statistic
- * describe the text the reader actually sees.
- */
-function charWeightedSize(spans: InputRect[]): number {
-  if (spans.length === 0) return 10;
-  const sizeOf = (s: InputRect) => (Number.isFinite(s.fontsize) ? s.fontsize! : 10);
-  const all = spans.map(sizeOf).sort((a, b) => a - b);
-  const med = all[Math.floor(all.length / 2)];
-  let src = spans.filter(s => sizeOf(s) >= med * _decorationThreshold);
-  if (src.length === 0) src = spans;
-  const entries = src
-    .map(s => ({ size: sizeOf(s), weight: Math.max(1, (s.text ?? '').length) }))
-    .sort((a, b) => a.size - b.size);
-  const total = entries.reduce((acc, e) => acc + e.weight, 0);
-  let acc = 0;
-  for (const e of entries) {
-    acc += e.weight;
-    if (acc * 2 >= total) return e.size;
-  }
-  return entries[entries.length - 1].size;
-}
-
-/**
- * T-LD-F1: glue one-glyph "decoration lines" back into their neighbours.
- *
- * Even with baseline grouping, a raised marker whose bottom deviates from
- * the baseline by more than the tolerance (or a subscript marker below it)
- * can still land in a line of its own. A single-span line whose size is
- * below the decoration threshold of the whole block is a marker, not a
- * paragraph — merge it into the NEXT line (markers precede their text),
- * or into the previous one when it is the last.
- */
-function glueDecorationLines(lines: InputRect[][]): InputRect[][] {
-  if (lines.length < 2) return lines;
-  const flat = lines.reduce<InputRect[]>((acc, l) => acc.concat(l), []);
-  const ref = charWeightedSize(flat);
-  const sizeOf = (s: InputRect) => (Number.isFinite(s.fontsize) ? s.fontsize! : 10);
-  const isDeco = (ln: InputRect[]) =>
-    ln.length === 1 && sizeOf(ln[0]) < ref * _decorationThreshold;
-  const deco = lines.map(isDeco);
-  const swallowed = new Array<boolean>(lines.length).fill(false);
-  for (let i = 0; i < lines.length; i++) {
-    if (!deco[i]) continue;
-    let j = i + 1;
-    while (j < lines.length && deco[j]) j++;
-    if (j < lines.length) {
-      lines[j] = [...lines[i], ...lines[j]];
-      swallowed[i] = true;
-    } else {
-      let k = i - 1;
-      while (k >= 0 && deco[k]) k--;
-      if (k >= 0) {
-        lines[k] = [...lines[k], ...lines[i]];
-        swallowed[i] = true;
-      }
-    }
-  }
-  return lines.filter((_, i) => !swallowed[i]);
-}
-
-/**
- * T3.6: THE single table-cell guard (was duplicated verbatim in Step 6 and
- * Step 8.5). Two side-by-side islands with a clear horizontal gap and
- * strong vertical overlap are table cells in the same row — never merge.
- */
-function isTablePattern(a: Paragraph, b: Paragraph): boolean {
-  const hGap = Math.max(0, Math.max(a.pxLeft, b.pxLeft) - Math.min(a.pxRight, b.pxRight));
-  const vOverlapTop = Math.max(a.pxTop, b.pxTop);
-  const vOverlapBottom = Math.min(a.pxBottom, b.pxBottom);
-  const vOverlap = Math.max(0, vOverlapBottom - vOverlapTop);
-  const smallerHeight = Math.min(a.pxBottom - a.pxTop, b.pxBottom - b.pxTop);
-  const vOverlapFrac = smallerHeight > 0 ? vOverlap / smallerHeight : 0;
-  // T-LD-F1: char-weighted, decoration-filtered sizes (a superscript in a
-  // cell no longer inflates the estimated line height and unlocks merges).
-  const estLineHeight = Math.min(charWeightedSize(a.spans), charWeightedSize(b.spans)) * 1.2;
-  return hGap >= estLineHeight * 1.5 && vOverlapFrac > 0.5;
-}
-
-/**
- * Dominant (most frequent) family+size across a paragraph's spans.
- * Kept for the merge passes' recomputation after islands are unioned.
- */
 function computeDominantFont(spans: InputRect[]): { dominantFamily: string; dominantSize: number } {
   const famCounts: Record<string, number> = {};
   const sizeCounts: Record<string, number> = {};
@@ -687,10 +534,17 @@ function computeDominantFont(spans: InputRect[]): { dominantFamily: string; domi
 }
 
 function groupIntoLines(spans: InputRect[]): InputRect[][] {
-  // T3.6: shared, font-scale-aware grouping (baseline-based since T-LD-F1).
-  // T-LD-F1: decoration lines (stray superscript markers) are glued back
-  // into their neighbours BEFORE any split pass sees them.
-  return glueDecorationLines(groupSpansIntoLines(spans, lineGroupingTolerance(spans)));
+  const sorted = [...spans].sort((a, b) => a.top - b.top || a.left - b.left);
+  const lines: InputRect[][] = [];
+  let curr: InputRect[] = [];
+  let currTop = -Infinity;
+  for (const s of sorted) {
+    if (curr.length === 0) { curr = [s]; currTop = s.top; }
+    else if (Math.abs(s.top - currTop) <= 3) { curr.push(s); }
+    else { lines.push(curr); curr = [s]; currTop = s.top; }
+  }
+  if (curr.length > 0) lines.push(curr);
+  return lines;
 }
 
 /**
@@ -721,46 +575,65 @@ function splitByFont(paras: Paragraph[], fontSizeTolerance: number): Paragraph[]
     const lines = groupIntoLines(para.spans);
     if (lines.length <= 1) { result.push(para); continue; }
 
-    // Compute primary family AND primary (median) size per line.
-    // T3.6: family calc delegates to the shared primaryFamilyOf.
-    // T3.2: primarySize is now actually USED — the old implementation
-    // computed it and never compared it, so a 22pt heading and 10pt body
-    // set in the SAME typeface stayed glued together whenever they
-    // physically touched (gap < contour threshold). Size change beyond
-    // fontSizeTolerance now starts a new sub-paragraph, honouring the
-    // step's own docstring ("Split by font family change … and size").
-    // T-LD-F1: family vote is char-weighted (a short bold "Figure 1."
-    // lead-in no longer flips the line), size is the char-weighted,
-    // decoration-filtered median (a stray superscript digit no longer
-    // flips an 8pt line to 11.5pt).
+    // Compute primary family for each line (decoration spans excluded)
     const lineStyles = lines.map(lineSpans => {
-      const primaryFam = primaryFamilyOf(lineSpans);
-      const primarySize = charWeightedSize(lineSpans);
+      const candidates: Array<{ family: string; size: number }> = [];
+      for (const s of lineSpans as any[]) {
+        const fam = getFontFamily(s.fontname, _preserveStyle);
+        const sz = Number.isFinite(s.fontsize) ? s.fontsize! : 10;
+        candidates.push({ family: fam, size: sz });
+      }
+
+      // Find median size of this line
+      const sizes = candidates.map(c => c.size).sort((a, b) => a - b);
+      const median = sizes.length > 0 ? sizes[Math.floor(sizes.length / 2)] : 10;
+      const DECORATION_THRESHOLD = median * _decorationThreshold;  // <70% of median = decoration
+
+      // Filter decorations out
+      const mainCandidates = candidates.filter(c => c.size >= DECORATION_THRESHOLD);
+
+      // Find primary family (most spans; ties broken by first occurrence)
+      const famCounts: Record<string, number> = {};
+      let firstFam = '';
+      for (const c of mainCandidates) {
+        if (!firstFam) firstFam = c.family;
+        famCounts[c.family] = (famCounts[c.family] || 0) + 1;
+      }
+      let primaryFam = firstFam || 'unknown';
+      let maxCount = 0;
+      for (const [fam, count] of Object.entries(famCounts)) {
+        if (count > maxCount || (count === maxCount && fam === firstFam)) {
+          maxCount = count;
+          primaryFam = fam;
+        }
+      }
+
+      // Also compute median size (for size-change detection)
+      const primarySize = median;
+
       return { lineSpans, primaryFam, primarySize };
     });
 
-    // Walk lines and group by (family, size) continuity
-    const subGroups: Array<{ lines: typeof lineStyles; family: string; size: number }> = [];
+    // Walk lines and group by primary family
+    // Split point: line N (N > 0) starts a new group if its primaryFam
+    // differs from line N-1's primaryFam.
+    const subGroups: Array<{ lines: typeof lineStyles; family: string }> = [];
     let currGroup: typeof lineStyles = [lineStyles[0]];
     let currFam = lineStyles[0].primaryFam;
-    let currSize = lineStyles[0].primarySize;
 
     for (let i = 1; i < lineStyles.length; i++) {
       const ls = lineStyles[i];
-      const famChanged = ls.primaryFam !== currFam;
-      const sizeChanged = Math.abs(ls.primarySize - currSize) > fontSizeTolerance;
-      if (famChanged || sizeChanged) {
-        // Family OR size change → start new group (T3.2)
-        subGroups.push({ lines: currGroup, family: currFam, size: currSize });
+      if (ls.primaryFam !== currFam) {
+        // Family change → start new group
+        subGroups.push({ lines: currGroup, family: currFam });
         currGroup = [ls];
         currFam = ls.primaryFam;
-        currSize = ls.primarySize;
       } else {
         currGroup.push(ls);
       }
     }
     if (currGroup.length > 0) {
-      subGroups.push({ lines: currGroup, family: currFam, size: currSize });
+      subGroups.push({ lines: currGroup, family: currFam });
     }
 
     if (subGroups.length <= 1) {
@@ -791,13 +664,21 @@ function splitByFont(paras: Paragraph[], fontSizeTolerance: number): Paragraph[]
  *      `touchPairs` Set from Step 6 — only pairs already known to touch).
  *   2. They share the same primary font family (decoration-aware).
  *   3. Their primary sizes are compatible: either within fontSizeTolerance,
- *      OR one of them is a "drop-cap" (size >= 2.5x the other's primary size),
+ *      OR one of them is a "drop-cap" (size ≥ 2.5× the other's primary size),
  *      in which case the larger is treated as an inline decoration of the
  *      smaller body text — they merge.
  *
  * CRITICAL RULE: only pairs in `touchPairs` (built from `cellIslandId`
  * 4-neighbour adjacency in Step 5) are considered. Non-touching islands
  * NEVER merge.
+ *
+ * Algorithm:
+ *   1. For each sub-paragraph, find its SOURCE island id (the original
+ *      island whose cellIslandId region contained it).
+ *   2. For each pair (P_a, P_b) of sub-paragraphs whose source islands
+ *      are in `touchPairs`:
+ *      - If sameFont(P_a, P_b) AND sizeCompatible(P_a, P_b) → merge.
+ *   3. Iterate until no changes (or MAX_MERGE_PASSES reached).
  */
 function remergeAfterFontSplit(
   paras: Paragraph[],
@@ -841,6 +722,9 @@ function remergeAfterFontSplit(
    * Collect the set of occupied cells that belong to a sub-paragraph.
    * For each span, mark its center cell (and surrounding cells if the
    * span covers more than one cell).
+   *
+   * Used to check physical adjacency between two sub-paragraphs that
+   * came from the SAME source island (after font split).
    */
   function collectCells(para: Paragraph): Set<number> {
     const cells = new Set<number>();
@@ -864,6 +748,7 @@ function remergeAfterFontSplit(
 
   /**
    * Check if two cell sets physically touch (4-neighbour adjacency).
+   * Returns true if any cell of A is 4-adjacent to any cell of B.
    */
   function cellSetsTouch(cellsA: Set<number>, cellsB: Set<number>): boolean {
     for (const idx of cellsA) {
@@ -883,16 +768,67 @@ function remergeAfterFontSplit(
   }
 
   /**
+   * Get primary family (decoration-aware, same as Step 6).
+   * Re-implemented locally to avoid capturing closure vars.
+   */
+  function getPrimaryFamilyLocal(para: Paragraph): string {
+    const candidates: Array<{ family: string; size: number }> = [];
+    for (const s of para.spans as any[]) {
+      const fam = getFontFamily(s.fontname, _preserveStyle);
+      const sz = Number.isFinite(s.fontsize) ? s.fontsize! : 10;
+      candidates.push({ family: fam, size: sz });
+    }
+    if (candidates.length === 0) return 'unknown';
+    const sizes = candidates.map(c => c.size).sort((a, b) => a - b);
+    const median = sizes[Math.floor(sizes.length / 2)];
+    const DECORATION_THRESHOLD = median * _decorationThreshold;
+    const mainSpans = candidates.filter(c => c.size >= DECORATION_THRESHOLD);
+    const famCounts: Record<string, number> = {};
+    let firstFamily = '';
+    for (const c of mainSpans) {
+      if (!firstFamily) firstFamily = c.family;
+      famCounts[c.family] = (famCounts[c.family] || 0) + 1;
+    }
+    let bestFam = firstFamily || 'unknown';
+    let bestCount = 0;
+    for (const [fam, count] of Object.entries(famCounts)) {
+      if (count > bestCount || (count === bestCount && fam === firstFamily)) {
+        bestCount = count;
+        bestFam = fam;
+      }
+    }
+    return bestFam;
+  }
+
+  /**
+   * Get primary size: the median fontsize of non-decoration spans.
+   * Used for size-compatibility check.
+   */
+  function getPrimarySize(para: Paragraph): number {
+    const candidates: number[] = [];
+    for (const s of para.spans as any[]) {
+      const sz = Number.isFinite(s.fontsize) ? s.fontsize! : 10;
+      candidates.push(sz);
+    }
+    if (candidates.length === 0) return 10;
+    const sorted = candidates.sort((a, b) => a - b);
+    const median = sorted[Math.floor(sorted.length / 2)];
+    const DECORATION_THRESHOLD = median * _decorationThreshold;
+    const mainSizes = candidates.filter(s => s >= DECORATION_THRESHOLD);
+    if (mainSizes.length === 0) return median;
+    mainSizes.sort((a, b) => a - b);
+    return mainSizes[Math.floor(mainSizes.length / 2)];
+  }
+
+  /**
    * Two paragraphs are size-compatible if:
    *   - |primarySize_a - primarySize_b| <= fontSizeTolerance  (same body text size)
-   *   - OR one is a "drop-cap": larger primary size >= 2.5 x smaller primary size
+   *   - OR one is a "drop-cap": larger primary size >= 2.5 × smaller primary size
    *     (the drop-cap is treated as an inline decoration of the body text)
    */
   function sizeCompatible(a: Paragraph, b: Paragraph): boolean {
-    // T-LD-F1: char-weighted, decoration-filtered size (replaces the old
-    // local unweighted getPrimarySize median).
-    const sa = charWeightedSize(a.spans);
-    const sb = charWeightedSize(b.spans);
+    const sa = getPrimarySize(a);
+    const sb = getPrimarySize(b);
     if (Math.abs(sa - sb) <= fontSizeTolerance) return true;
     const larger = Math.max(sa, sb);
     const smaller = Math.min(sa, sb);
@@ -902,6 +838,14 @@ function remergeAfterFontSplit(
 
   /**
    * Check if two paragraphs' source islands physically touched.
+   *
+   * Two cases:
+   *   1. Different source islands — check the original touchPairs Set.
+   *   2. SAME source island (after font split) — verify that their actual
+   *      occupied cells are 4-neighbour adjacent. This is more strict than
+   *      "they share an island ID" — we want to ensure the cells literally
+   *      touch, so that non-adjacent fragments (e.g. left column + right
+   *      column from a wrongly-merged super-island) do NOT re-merge.
    */
   function physicallyTouch(a: Paragraph, b: Paragraph): boolean {
     const idA = sourceIds.get(a);
@@ -920,6 +864,8 @@ function remergeAfterFontSplit(
   }
 
   // ── Merge loop ───────────────────────────────────────────────────
+  // Build working list of "alive" paragraphs (not merged).
+  // Each iteration: find first compatible touching pair, merge, repeat.
   let changed = true;
   let passes = 0;
   const MAX_PASSES = 10;
@@ -928,6 +874,7 @@ function remergeAfterFontSplit(
     changed = false;
     passes++;
 
+    // Sort by reading order for deterministic merge direction
     paras.sort((a, b) => a.pxTop - b.pxTop || a.pxLeft - b.pxLeft);
 
     for (let i = 0; i < paras.length; i++) {
@@ -943,16 +890,45 @@ function remergeAfterFontSplit(
         if (!touch) continue;
 
         // Same primary family
-        if (primaryFamilyOf(a.spans) !== primaryFamilyOf(b.spans)) continue;
+        const famA = getPrimaryFamilyLocal(a);
+        const famB = getPrimaryFamilyLocal(b);
+        if (famA !== famB) continue;
 
         // Size compatible (same body size OR drop-cap)
         const szCompat = sizeCompatible(a, b);
         if (!szCompat) continue;
 
         // ── TABLE-CELL GUARD ──────────────────────────────────────────
-        // T3.6: shared isTablePattern (was a verbatim duplicate of the
-        // Step-6 guard).
-        if (isTablePattern(a, b)) {
+        // Do NOT merge two paragraphs if they sit SIDE-BY-SIDE horizontally
+        // with a clear vertical gap between them. This pattern is typical of
+        // table cells in the same row:
+        //
+        //   | Cell A   | Cell B   | Cell C   |
+        //   | text...  | text...  | text...  |
+        //
+        // Cells in the same row touch vertically (same top/bottom) but are
+        // separated by a horizontal gap. Merging them would destroy the
+        // table structure and produce one giant paragraph per row.
+        //
+        // Detection: if the horizontal gap between A and B is significant
+        // (>= 1.5× the median line height of the smaller paragraph) AND
+        // their vertical ranges overlap by > 50% of the smaller height,
+        // treat them as table cells and SKIP the merge.
+        const hGap = Math.max(0, Math.max(a.pxLeft, b.pxLeft) - Math.min(a.pxRight, b.pxRight));
+        const vOverlapTop = Math.max(a.pxTop, b.pxTop);
+        const vOverlapBottom = Math.min(a.pxBottom, b.pxBottom);
+        const vOverlap = Math.max(0, vOverlapBottom - vOverlapTop);
+        const smallerHeight = Math.min(a.pxBottom - a.pxTop, b.pxBottom - b.pxTop);
+        const vOverlapFrac = smallerHeight > 0 ? vOverlap / smallerHeight : 0;
+        // Estimate line height from span sizes (median font size × 1.2)
+        const aSizes = a.spans.map((s: any) => Number.isFinite(s.fontsize) ? s.fontsize : 10).sort((x, y) => x - y);
+        const bSizes = b.spans.map((s: any) => Number.isFinite(s.fontsize) ? s.fontsize : 10).sort((x, y) => x - y);
+        const medianSize = aSizes.length && bSizes.length
+          ? Math.min(aSizes[Math.floor(aSizes.length / 2)], bSizes[Math.floor(bSizes.length / 2)])
+          : 10;
+        const estLineHeight = medianSize * 1.2;
+        const isTablePattern = hGap >= estLineHeight * 1.5 && vOverlapFrac > 0.5;
+        if (isTablePattern) {
           continue;
         }
 
@@ -967,7 +943,7 @@ function remergeAfterFontSplit(
         const recomputed = computeDominantFont(a.spans);
         a.dominantFamily = recomputed.dominantFamily;
         a.dominantSize = recomputed.dominantSize;
-        // Update cell cache: union of A and B cells
+        // Update cell cache: union of A and B cells (for future adjacency checks)
         const cellsA = cellsCache.get(a)!;
         const cellsB = cellsCache.get(b)!;
         for (const c of cellsB) cellsA.add(c);
@@ -982,21 +958,11 @@ function remergeAfterFontSplit(
   return paras.filter(p => !p._merged);
 }
 
-/**
- * Step 8.7: Split by paragraph-start markers (runs AFTER remerge — T-LD).
- *
- * Footnotes, affiliation blocks and figure/table captions often share the
- * font AND indent of neighbouring text and sit closer than the contour
- * threshold, so steps 7/8/8.5/8.6 cannot separate them. A line-level
- * marker (structural label, footnote number, "Figure N.") on a non-first
- * line starts a new paragraph. Running AFTER remerge guarantees the split
- * is final — nothing downstream re-joins logical blocks that were split
- * on purpose.
- */
 function splitByParagraphMarkers(paras: Paragraph[]): Paragraph[] {
   const result: Paragraph[] = [];
 
   // Known structural labels that ALWAYS start a new paragraph.
+  // Matched case-insensitively at the start of a line's text.
   const STRUCTURAL_LABELS = [
     /^corresponding\s+author/i,
     /^correspondence\s*:/i,
@@ -1014,102 +980,84 @@ function splitByParagraphMarkers(paras: Paragraph[]): Paragraph[] {
     /^abbreviations?\s*:/i,
     /^keywords?\s*:/i,
     /^abstract\s*:/i,
-    // T-LD (figure/table captions): a caption LABEL spans its OWN BOLD/ITALIC
-    // SPAN that starts a new block. Caption blocks on the user's PDF are
-    // glued by the contour threshold (< 8px gaps); the label span is the
-    // only reliable boundary. Matched against the SPAN TEXT, not the joined
-    // line — see CAPTION_LABEL below.
-    /^(figure|fig\.?|table|scheme|plate)\s+\d+\s*[.:)](\s|$)/i,
   ];
 
   // Footnote number pattern: 1-3 digits at start of line, followed by
   // a capital letter or symbol (avoid matching decimal numbers like "3.5"
   // or page numbers mid-line).
+  // Examples that match: "1University", "12Smith", "3The"
+  // Examples that don't match: "3.5", "100", "12."
   const FOOTNOTE_NUM = /^\d{1,3}(?=[A-ZÀ-Þ\u00c0-\u00de«ª])/;
-
-  // T-LD: caption-label pattern matched against INDIVIDUAL SPAN texts.
-  // The label ("Figure 2.", "Table 1.") is a distinct bold/italic span that
-  // sits mid-line: "Bar 25 mm. |Figure 2.| Mammary…". Splitting at the
-  // SPAN boundary (not a character offset in the joined line) keeps the
-  // bold lead-in as the OPENING of its caption block — per the user's
-  // correction, a caption label must never be separated from its caption.
-  const CAPTION_LABEL = /^(figure|fig\.?|table|scheme|plate)\s+\d+\s*[.:)](\s|$)/i;
 
   for (const para of paras) {
     const lines = groupIntoLines(para.spans);
     if (lines.length <= 1) { result.push(para); continue; }
 
-    // T-LD: build LOGICAL LINES first. A mid-line caption-label SPAN
-    // ("Bar 25 mm. |Figure 2.| Mammary…") cuts its line in two at the span
-    // boundary: the label span and everything to its right become a new
-    // logical line flagged as a block start — the bold lead-in OPENS its
-    // caption block and is never stranded in the previous one (user's
-    // requirement). Structural/footnote markers are then evaluated on the
-    // logical lines exactly as before (T3.3 guard intact).
-    const logicalLines: Array<{ spans: InputRect[]; isSplitStart: boolean }> = [];
-    let forceSplitNext = false;
+    // Get text content of each line (concatenated spans, trimmed)
+    const lineTexts = lines.map(line =>
+      line.map(s => (s as any).text || '').join('').trim()
+    );
 
-    for (let i = 0; i < lines.length; i++) {
-      let line = [...lines[i]].sort((a, b) => a.left - b.left);
+    // Detect split points: line N (N > 0) starts a new paragraph if:
+    //   - It matches a structural label, OR
+    //   - It starts with a footnote number pattern AND the previous line
+    //     doesn't look like a footnote continuation
+    const splitPoints: number[] = [];
+    for (let i = 1; i < lines.length; i++) {
+      const text = lineTexts[i];
+      if (!text) continue;
 
-      // Cut at every non-leading caption-label span (loop guards against
-      // multiple labels in one line, e.g. "… HE. Bar 25 mm. |Figure 5.|").
-      for (;;) {
-        const labelIdx = line.findIndex(s => CAPTION_LABEL.test(((s as any).text || '').trim()));
-        if (labelIdx <= 0) break; // no label, or the label already opens the line
-        const left = line.slice(0, labelIdx);
-        const right = line.slice(labelIdx);
-        if (left.length > 0) {
-          logicalLines.push({ spans: left, isSplitStart: forceSplitNext });
-          forceSplitNext = false;
-        }
-        logicalLines.push({ spans: right, isSplitStart: true });
-        line = [];
-        break;
-      }
-      if (line.length === 0) continue;
+      let isSplitPoint = false;
 
-      const text = line.map(s => (s as any).text || '').join('').trim();
-      let isSplit = forceSplitNext;
-      forceSplitNext = false;
-
-      if (i > 0 && text) {
-        // Structural labels (line-start anchored).
-        for (const pattern of STRUCTURAL_LABELS) {
-          if (pattern.test(text)) { isSplit = true; break; }
-        }
-        // Footnote numbers — T3.3 guard: a line starting with digits+capital
-        // is a NEW footnote only when the previous line does not also start
-        // with a footnote number (otherwise it is a wrapped continuation).
-        if (!isSplit && FOOTNOTE_NUM.test(text)) {
-          const prevText = logicalLines.length > 0
-            ? logicalLines[logicalLines.length - 1].spans
-                .map(s => (s as any).text || '').join('').trim()
-            : '';
-          if (prevText && !FOOTNOTE_NUM.test(prevText)) isSplit = true;
+      // Check structural labels
+      for (const pattern of STRUCTURAL_LABELS) {
+        if (pattern.test(text)) {
+          isSplitPoint = true;
+          break;
         }
       }
-      logicalLines.push({ spans: line, isSplitStart: isSplit });
+
+      // Check footnote number pattern
+      if (!isSplitPoint && FOOTNOTE_NUM.test(text)) {
+        // Footnote pattern: digit(s) immediately followed by capital letter.
+        // This is a strong signal of a new footnote even if the previous
+        // line doesn't end with a sentence terminator (footnote text often
+        // wraps without punctuation at line end).
+        //
+        // Additional guard: only trigger if previous line text is non-empty
+        // AND doesn't itself start with the same footnote pattern (otherwise
+        // we'd split every line of a single footnote that starts with a number).
+        const prevText = lineTexts[i - 1] || '';
+        const prevStartsWithFootnote = FOOTNOTE_NUM.test(prevText);
+        if (prevText && !prevStartsWithFootnote) {
+          isSplitPoint = true;
+        } else if (prevStartsWithFootnote) {
+          // Both prev and current start with footnote number — definitely
+          // different footnotes, split.
+          isSplitPoint = true;
+        }
+      }
+
+      if (isSplitPoint) {
+        splitPoints.push(i);
+      }
     }
 
-    // Emit groups of logical lines between split starts.
-    const groups: InputRect[][][] = [];
-    let currentGroup: InputRect[][] = [];
-    for (const ll of logicalLines) {
-      if (ll.isSplitStart && currentGroup.length > 0) {
-        groups.push(currentGroup);
-        currentGroup = [];
-      }
-      currentGroup.push(ll.spans);
-    }
-    if (currentGroup.length > 0) groups.push(currentGroup);
-
-    if (groups.length <= 1) {
+    if (splitPoints.length === 0) {
       result.push(para);
       continue;
     }
 
-    for (const sg of groups) {
+    // Split the paragraph at detected split points
+    const subGroups: InputRect[][][] = [];
+    let startIdx = 0;
+    for (const sp of splitPoints) {
+      subGroups.push(lines.slice(startIdx, sp));
+      startIdx = sp;
+    }
+    subGroups.push(lines.slice(startIdx));
+
+    for (const sg of subGroups) {
       const sgSpans = sg.flatMap(l => l);
       if (sgSpans.length === 0) continue;
       result.push(makeParagraph(sgSpans, para.dominantFamily, para.dominantSize));
@@ -1332,12 +1280,7 @@ function applyColumnOrder(paras: Paragraph[], _cellSize: number): Paragraph[] {
 
   // --- Step 2: Cluster eligible paragraphs by pxLeft ---
   const sortedEligible = [...eligible].sort((a, b) => a.pxLeft - b.pxLeft);
-  // T3.5: the column-gap threshold now scales with page width. A fixed
-  // 50px merged two close columns on wide pages/scans while splitting
-  // tight justified text on narrow ones. The effective threshold is
-  // max(user setting, 4% of page width).
-  const pageWidth = (paras.reduce((m, p) => Math.max(m, p.pxRight), 0)) || 1000;
-  const COLUMN_GAP_THRESHOLD = Math.max(_columnGapThreshold, pageWidth * 0.04);
+  const COLUMN_GAP_THRESHOLD = _columnGapThreshold; // px — significant horizontal jump = new column
   const MIN_COLUMN_SIZE = 2;       // need ≥2 eligible paras to be a "real column"
 
   const rawClusters: Paragraph[][] = [[sortedEligible[0]]];
@@ -1428,16 +1371,8 @@ function applyColumnOrder(paras: Paragraph[], _cellSize: number): Paragraph[] {
   const colRegionBottom = colRegionBottoms.reduce((a, b) => Math.max(a, b), -Infinity) + TOLERANCE_PX;
 
   // --- Step 8: Classify paragraphs ---
-  // T-LD-F2: wide elements INSIDE the column region are no longer hoisted
-  // into the header. The old "cross-column spans go to beginning" rule
-  // pushed mid-page figure captions / wide tables ABOVE the column text
-  // that logically precedes them, corrupting reading order. A wide element
-  // now forms a full-width BAND at its own vertical position: the column
-  // flow is emitted up to the band's top, then the band, then the flow
-  // continues below it.
   const header: Paragraph[] = [];
   const footer: Paragraph[] = [];
-  const wideBands: Paragraph[] = [];
   const columnBuckets: Paragraph[][] = realColumns.map(() => []);
 
   for (const p of paras) {
@@ -1448,9 +1383,9 @@ function applyColumnOrder(paras: Paragraph[], _cellSize: number): Paragraph[] {
       // Below column region → footer (regardless of wide/narrow)
       footer.push(p);
     } else if (isWide(p)) {
-      // In column region, spans across columns → full-width band at its
-      // own vertical position (T-LD-F2).
-      wideBands.push(p);
+      // In column region but spans across columns → header
+      // (per user spec: cross-column spans go to beginning)
+      header.push(p);
     } else {
       // In column region, not wide → assign to column by pxLeft
       const colIdx = columnRanges.findIndex(c => p.pxLeft >= c.left && p.pxLeft <= c.right);
@@ -1472,36 +1407,8 @@ function applyColumnOrder(paras: Paragraph[], _cellSize: number): Paragraph[] {
     bucket.sort((a, b) => a.pxTop - b.pxTop || a.pxLeft - b.pxLeft);
   }
 
-  // Wide bands → by their vertical position
-  wideBands.sort((a, b) => a.pxTop - b.pxTop || a.pxLeft - b.pxLeft);
-
   // Footer → end (by pxTop, then pxLeft)
   footer.sort((a, b) => a.pxTop - b.pxTop || a.pxLeft - b.pxLeft);
 
-  // Interleave: header → (column flow above each band → band)* → remaining
-  // column flow → footer. Within a band segment, columns are emitted in
-  // left-to-right order, top-to-bottom inside each.
-  const result: Paragraph[] = [...header];
-  const emitted = new Set<Paragraph>();
-  for (const band of wideBands) {
-    for (const bucket of columnBuckets) {
-      for (const p of bucket) {
-        if (!emitted.has(p) && p.pxTop < band.pxTop) {
-          result.push(p);
-          emitted.add(p);
-        }
-      }
-    }
-    result.push(band);
-    emitted.add(band);
-  }
-  for (const bucket of columnBuckets) {
-    for (const p of bucket) {
-      if (!emitted.has(p)) {
-        result.push(p);
-        emitted.add(p);
-      }
-    }
-  }
-  return [...result, ...footer];
+  return [...header, ...columnBuckets.flat(), ...footer];
 }

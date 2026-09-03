@@ -14,9 +14,7 @@ import { SETTINGS_UI_CSS } from './settings-ui.css';
 // placeholders with real translations, merge-by-id-first can supersede each
 // entry instead of falling back to rect-overlap (which would resurrect
 // deleted placeholders on sparse pages).
-// T2.5: THE single construction site for saved overlay records (also stamps
-// the stable overlay id — generateOverlayId no longer needs direct import).
-import { makeOverlay } from './overlay-factory';
+import { generateOverlayId } from './overlay-id';
 
 // Modular classes
 import { TranslationStorage } from './storage';
@@ -337,18 +335,6 @@ export default class OpenRouterTranslatorPlugin extends Plugin {
                     if (this.overlay) {
                         this.overlay.resetStateForNewFile();
                     }
-                    // Bug fix: immediately re-attach marquee listeners if BBox
-                    // edit mode is ON. Don't wait for the debounced
-                    // setupPDFMonitoring (300ms) — the user might shift+drag
-                    // immediately after opening a PDF.
-                    if (this.settings.bboxEditMode && this.overlay) {
-                        try {
-                            this.overlay.detachMarqueeListeners();
-                            this.overlay.attachMarqueeListeners();
-                        } catch (e) {
-                            console.error('[active-leaf-change] marquee re-attach failed:', e);
-                        }
-                    }
                 }
 
                 // Phase 10: was `setTimeout(() => { ... }, 300)`. Replaced
@@ -574,10 +560,6 @@ export default class OpenRouterTranslatorPlugin extends Plugin {
                     await this.storage.updatePageOverlaysAndWrite(
                         file,
                         parsed.pageOverlays as Record<number, OverlayPositionData[]>,
-                        // T-FULLPAGE-OVERWRITE: the repair command re-writes the
-                        // FULL parsed content — replace so each page bucket
-                        // becomes exactly the (re-bucketed) parsed state.
-                        { replace: true },
                     );
                     new Notice(
                         `✓ Repaired "${file.basename}": ${totalPages} pages, ${totalOverlays} overlays. ` +
@@ -695,17 +677,28 @@ export default class OpenRouterTranslatorPlugin extends Plugin {
                 } catch (e) {
                     console.error('[toggle-bbox-edit-mode] marquee listener attach/detach failed:', e);
                 }
-                // Bug fix: BBox Edit Mode NO LONGER pauses the background queue.
-                // Previously this called pdfLayoutQueue.cancel() which permanently
-                // paused the queue until BBox mode was toggled off. But:
-                //   1. Interactive translation (addTextOverlay) doesn't use the queue
-                //      — it goes through processing.ts directly, so it was never blocked.
-                //   2. The queue.cancel() call made it look like BBox mode "blocked
-                //      translations" because background queue stayed stuck.
-                //   3. triggerProcessing() now auto-resumes on new enqueue, so even
-                //      if queue was cancelled, it would auto-resume. But the Notice
-                //      was misleading.
-                new Notice(`BBox Edit Mode ${this.settings.bboxEditMode ? 'enabled' : 'disabled'}.`);
+                // FIX (bbox race): pause/resume the background queue while the
+                // user is editing overlays. Without this, the worker could
+                // write a page mid-edit and clobber the user's manual changes
+                // via the read-modify-write merge in updatePageOverlaysAndWrite.
+                if (this.pdfLayoutQueue) {
+                    if (this.settings.bboxEditMode) {
+                        this.pdfLayoutQueue.cancel();
+                        new Notice(
+                            `BBox Edit Mode enabled. Background translation paused ` +
+                            `(running task will finish, no new tasks start).`,
+                            4000,
+                        );
+                    } else {
+                        this.pdfLayoutQueue.resume();
+                        new Notice(
+                            `BBox Edit Mode disabled. Background translation resumed.`,
+                            3000,
+                        );
+                    }
+                } else {
+                    new Notice(`BBox Edit Mode ${this.settings.bboxEditMode ? 'enabled' : 'disabled'}.`);
+                }
             }
         });
 
@@ -800,20 +793,45 @@ export default class OpenRouterTranslatorPlugin extends Plugin {
                 for (const p of result.paragraphs) {
                     const text = (p.text || '').trim();
                     if (!text) continue;  // skip empty paragraphs (Fix C4)
-                    try {
-                        // T2.5: single construction site (stable id stamped
-                        // inside; 'originals-only' sentinel engine here).
-                        overlays.push(makeOverlay({
-                            page: p.page,
-                            rect: p.relativeRect,
-                            text: p.text,
-                            translated: p.text, // placeholder until re-translated
-                            fontFamily: p.fontFamily,
-                            fontSize: p.fontSize,
-                            originalFontSizes: p.originalFontSizes,
-                            engine: 'originals-only',
-                        }));
-                    } catch { /* invalid rect — skip */ }
+                    overlays.push({
+                        selector: '',
+                        textContent: p.text,
+                        relativeRect: p.relativeRect,
+                        page: p.page,
+                        // Phase 15.3: use original text verbatim as the
+                        // placeholder translation. Previously this was
+                        // prefixed with `[ORIGINAL] ` — but that marker
+                        // leaked into user-visible overlay text and was
+                        // never stripped on real translation, so the first
+                        // page of a backdoor-translated file would show
+                        // "[ORIGINAL] Foo bar" instead of "Foo bar". The
+                        // `originals-only: true` frontmatter flag (set
+                        // further down) is the real signal to the worker
+                        // that these are placeholders, not a text prefix.
+                        translatedText: p.text,
+                        fontSize: p.fontSize,
+                        fontFamily: p.fontFamily,
+                        originalFontSizes: p.originalFontSizes,
+                        // Phase 7 (V4 Schema): stable id from page + rect@3dec + textContent.
+                        // The originals-only file thus has stable ids from creation; when
+                        // the worker later writes real translations for these paragraphs
+                        // (via pdf-layout-queue.ts buildOverlayData, which uses the same
+                        // generateOverlayId inputs), merge-by-id-first supersedes each
+                        // placeholder exactly — no orphaned placeholders survive.
+                        id: generateOverlayId(p.page, p.relativeRect, p.text || ''),
+                        // Phase 8 (V4 Schema): sentinel engine stamp. The
+                        // originals-only file contains placeholders (raw
+                        // source text), not translations — so the file-level
+                        // engine is `'originals-only'` rather than a real
+                        // provider/model. This sentinel is consumed by the
+                        // V4 parser (which propagates it back to SavedOverlay.engine)
+                        // and is visible in frontmatter. When the worker
+                        // re-translates the page (via pdf-layout-queue.ts
+                        // buildOverlayData), the new overlay's `engine` is
+                        // stamped with the live provider/model, replacing
+                        // the sentinel on a per-overlay basis.
+                        engine: 'originals-only',
+                    });
                 }
                 if (overlays.length > 0) {
                     pageOverlays[pageNum] = overlays;
@@ -860,10 +878,6 @@ export default class OpenRouterTranslatorPlugin extends Plugin {
         try {
             await this.storage.updatePageOverlaysAndWrite(file, pageOverlays, {
                 originalsOnly: true,
-                // T-FULLPAGE-OVERWRITE: regenerating the layout file rebuilds
-                // every page from scratch — don't merge with whatever the
-                // file contained before.
-                replace: true,
             });
         } catch (err: any) {
             new Notice(`Failed to write file: ${err?.message ?? err}`, 8000);
@@ -1025,22 +1039,11 @@ export default class OpenRouterTranslatorPlugin extends Plugin {
         // sets x to undefined, NOT to the default).  This happens when old
         // saved settings (pre-OCC v2) don't have the new OCC fields.
         const savedLayout = data.layoutSettings || {};
-        // T3.1: keep ONLY the live contour-pipeline keys. The old layout
-        // settings carried ~100 dead fields inherited from three retired
-        // detectors; they were saved, hashed and "tuned" by removed placebo
-        // code — and any change to a dead field invalidated every translated
-        // document via layoutSettingsHash. They are stripped here for good.
-        const liveKeys = new Set(Object.keys(defaultLayoutSettings));
         const cleanSavedLayout: Record<string, unknown> = {};
-        let strippedDeadKeys = 0;
         for (const [key, value] of Object.entries(savedLayout)) {
-            if (!liveKeys.has(key)) { strippedDeadKeys++; continue; }
             if (value !== undefined && value !== null && !(typeof value === 'number' && Number.isNaN(value))) {
                 cleanSavedLayout[key] = value;
             }
-        }
-        if (strippedDeadKeys > 0 && this.settings.debugMode) {
-            console.log(`[loadSettings] Stripped ${strippedDeadKeys} dead layoutSettings field(s) (T3.1).`);
         }
         this.layoutSettings = { ...defaultLayoutSettings, ...cleanSavedLayout };
 
@@ -1051,9 +1054,16 @@ export default class OpenRouterTranslatorPlugin extends Plugin {
         //   emptinessThresholdFactor=0 → gapThreshold=spanLength → need 100% empty
         //   maxHoleBins=0 → no morphological closing
         //   edgeMarginFraction=0 → no edge margin
-        // T3.1: validation covers exactly the live contour-pipeline fields.
         const occCriticalFields: Array<keyof typeof defaultLayoutSettings> = [
+            'textThresholdFactor', 'emptinessThresholdFactor', 'absoluteTextThreshold',
+            'crossingFactor', 'minGapSegmentPx', 'smoothRadius', 'emptinessRadius',
+            'maxRecursionDepth', 'minAdjacentContentFraction', 'mergeGapPx',
+            'maxVerticalGaps', 'maxHorizontalGaps', 'edgeMarginPx', 'edgeMarginFraction',
+            'maxHoleBins', 'paragraphLineGapMultiplier', 'paragraphLineAlignTol',
+            'minParagraphSpans', 'minVerticalGapPx', 'minHorizontalGapPx',
+            // Contour pipeline — must be > 0 or pipeline breaks
             'contourCellSize', 'contourIndentThreshold', 'contourFontSizeTolerance',
+            // Stage 2.2 (Q6): new exposed settings — validate on load.
             'columnGapThreshold', 'decorationThreshold', 'maxMergePasses',
         ];
         let occFixed = 0;

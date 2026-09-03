@@ -21,10 +21,13 @@ import { SavedOverlay, OverlayPositionData } from './types';
 // which throws `ReferenceError: require is not defined` on mobile (Obsidian's
 // mobile runtime has no CommonJS shim). The background watcher path runs on
 // mobile too, so this was crashing every auto-enqueued watcher job there.
-// T2.5: THE single construction site for saved overlay records.
-import { makeOverlay } from './overlay-factory';
-import { getCurrentEngine } from './overlay-id';
 import { compileRules, filterParagraphs } from './paragraph-filter';
+// Phase 7 (V4 Schema): stable per-overlay identifier generator. Stamped on
+// every headless-translated overlay so the saved result has an id matching
+// what the DOM-extraction and queue paths produce for the same source
+// paragraph — enables merge-by-id-first in updatePageOverlaysAndWrite and
+// exact lookup in the edit modal.
+import { generateOverlayId, getCurrentEngine } from './overlay-id';
 
 export interface HeadlessResult {
     ok: boolean;
@@ -43,12 +46,16 @@ export class HeadlessTranslator {
 
     cancel() {
         this.cancelled = true;
-        // T1.2: propagation into pdfLayoutQueue.cancel() was REMOVED.
-        // Cancellation now travels through the OWNED token passed to
-        // translateTextsWithChunking below; the old shared global flag is
-        // what let a python-engine cancel kill unrelated internal-queue
-        // work (and, via the old global probes in processing.ts, manual
-        // translations — see T1.1/T1.2).
+        // P1-1 (Phase 9): propagate to the shared layout queue so that
+        // performChunkedTranslation / performSequentialTranslation /
+        // translateTextsWithChunking — all of which gate on
+        // `pdfLayoutQueue.isCancelled()` between chunks — break out within
+        // ~one chunk of LLM latency instead of draining every remaining
+        // chunk for the in-flight page. Without this, headless Cancel had
+        // to wait for the entire current page (often 25-30s) before taking
+        // effect, since the per-page `this.cancelled` flag is only checked
+        // between page-level concurrency chunks, not between LLM chunks.
+        this.plugin.pdfLayoutQueue?.cancel?.();
     }
 
     /** Preconditions for headless mode (python engine + script + interpreter). */
@@ -181,24 +188,30 @@ export class HeadlessTranslator {
 
                 // If all paragraphs were filtered, skip LLM call entirely.
                 if (translatableUsable.length === 0) {
-                    const overlays: OverlayPositionData[] = [];
-                    for (const it of usable) {
-                        try {
-                            overlays.push(makeOverlay({
-                                page: pageNum,
-                                rect: { left: it.rect.l, top: it.rect.t, width: it.rect.w, height: it.rect.h },
-                                text: it.text,
-                                translated: it.text, // filter-skipped → original text
-                                fontFamily: it.fontFamily,
-                                fontSize: it.fontSize,
-                                originalFontSizes: it.originalFontSizes || [],
-                                engine: getCurrentEngine(this.plugin),
-                            }));
-                        } catch { /* invalid rect — skip */ }
-                    }
+                    const overlays: OverlayPositionData[] = usable.map((it: any) => ({
+                        selector: '',
+                        textContent: it.text,
+                        relativeRect: { left: it.rect.l, top: it.rect.t, width: it.rect.w, height: it.rect.h },
+                        page: pageNum,
+                        translatedText: it.text,
+                        fontSize: it.fontSize,
+                        fontFamily: it.fontFamily,
+                        originalFontSizes: it.originalFontSizes || [],
+                        // Phase 7 (V4 Schema): stable id from page + rect@3dec + textContent.
+                        id: generateOverlayId(pageNum,
+                            { left: it.rect.l, top: it.rect.t, width: it.rect.w, height: it.rect.h },
+                            it.text || ''),
+                        // Phase 8 (V4 Schema): engine stamp. Filter-skipped
+                        // paragraphs fall back to their original text (no LLM
+                        // call), but the file-level engine still reflects
+                        // "this file was processed by the current engine" —
+                        // and a per-overlay stamp lets future
+                        // stale-engine-detection distinguish "skipped by
+                        // filter" from "actually translated".
+                        engine: getCurrentEngine(this.plugin),
+                    }));
                     if (overlays.length > 0) {
-                        // T-FULLPAGE-OVERWRITE: complete page state → replace.
-                        await this.plugin.storage.updatePageOverlaysAndWrite(pdf, { [pageNum]: overlays }, { replace: true });
+                        await this.plugin.storage.updatePageOverlaysAndWrite(pdf, { [pageNum]: overlays });
                     }
                     return { pageNum, count: overlays.length };
                 }
@@ -221,11 +234,7 @@ export class HeadlessTranslator {
                 let failureReason = '';
                 try {
                     const translatableTexts = translatableUsable.map((u: any) => u.text);
-                    // T1.2: pass THIS translator's own cancellation token (was: implicit global
-                    // queue-flag probing inside processing.ts).
-                    translated = await this.plugin.processor.translateTextsWithChunking(translatableTexts, {
-                        isCancelled: () => this.cancelled,
-                    });
+                    translated = await this.plugin.processor.translateTextsWithChunking(translatableTexts);
                 } catch (e: any) {
                     // Fall back to originals for this page rather than aborting the file.
                     translationFailed = true;
@@ -272,26 +281,36 @@ export class HeadlessTranslator {
                         tr = (translated[transIdx] || '').trim();
                     }
 
-                    try {
-                        overlays.push(makeOverlay({
-                            page: pageNum,
-                            rect: { left: it.rect.l, top: it.rect.t, width: it.rect.w, height: it.rect.h },
-                            text: it.text,
-                            translated: tr || it.text,
-                            fontFamily: it.fontFamily,
-                            fontSize: it.fontSize,
-                            originalFontSizes: it.originalFontSizes || [],
-                            engine: getCurrentEngine(this.plugin),
-                        }));
-                    } catch { /* invalid rect — skip */ }
+                    overlays.push({
+                        selector: '',
+                        textContent: it.text,
+                        relativeRect: { left: it.rect.l, top: it.rect.t, width: it.rect.w, height: it.rect.h },
+                        page: pageNum,
+                        // Phase 15.5: no failure marker — store the translation
+                        // (or fall back to original text) as-is.
+                        translatedText: tr || it.text,
+                        fontSize: it.fontSize,
+                        fontFamily: it.fontFamily,
+                        originalFontSizes: it.originalFontSizes || [],
+                        // Phase 7 (V4 Schema): stable id from page + rect@3dec + textContent.
+                        // Matches the id produced by overlay.ts extractPositionDataFrom
+                        // and pdf-layout-queue.ts buildOverlayData for the same source
+                        // paragraph — enables merge-by-id-first in updatePageOverlaysAndWrite.
+                        id: generateOverlayId(pageNum,
+                            { left: it.rect.l, top: it.rect.t, width: it.rect.w, height: it.rect.h },
+                            it.text || ''),
+                        // Phase 8 (V4 Schema): engine stamp from current provider/model.
+                        // Headless path runs through the same TranslationEngine
+                        // as interactive translation, so current settings match.
+                        engine: getCurrentEngine(this.plugin),
+                    });
                 }
 
                 // FIX E1: incremental save via updatePageOverlaysAndWrite (read-modify-write).
                 // Previously: accumulated all pages and wrote once at end → crash = total loss.
                 // Now: each page is persisted immediately; crash only loses the in-flight page.
                 if (overlays.length > 0) {
-                    // T-FULLPAGE-OVERWRITE: complete page state → replace.
-                    await this.plugin.storage.updatePageOverlaysAndWrite(pdf, { [pageNum]: overlays }, { replace: true });
+                    await this.plugin.storage.updatePageOverlaysAndWrite(pdf, { [pageNum]: overlays });
                 }
 
                 return { pageNum, count: overlays.length };

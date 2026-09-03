@@ -6,10 +6,9 @@ import {
     buildRequest,
     extractResponseContent,
     getProvider,
+    isReasoningModel,
     getMaxOutputTokens,
 } from './providers';
-// T2.4: shared timeout helper (was duplicated in ocr-layout.ts).
-import { withTimeout } from './shared';
 
 // Neutral, domain-agnostic fallback template (used only if the editable
 // custom template is empty). Single source of truth lives in types.ts.
@@ -187,12 +186,7 @@ Do NOT translate the [#N] markers. Maintain the list structure. No extra comment
         } else {
             // Standard Mode
             let template = this.plugin.settings.singlePrompt;
-            // T1.9: accept BOTH documented placeholders — `{inputText}` and
-            // its `{TEXT}` alias — mirroring the batch branch (P2-34). A
-            // user template containing `{TEXT}` used to silently fall into
-            // the fallback concatenation, losing the user's chosen position
-            // of the text inside the prompt.
-            if (template.includes('{inputText}') || template.includes('{TEXT}')) {
+            if (template.includes('{inputText}')) {
                 finalSystemPrompt = this.applyTemplateVariables(template, text);
             } else {
                 finalSystemPrompt = this.applyTemplateVariables(template, '') + `\n\n${text}`;
@@ -204,6 +198,18 @@ Do NOT translate the [#N] markers. Maintain the list structure. No extra comment
     }
 
     // === Low-Level API Communication ===
+
+    // NOTE: getPropertyByPath and escapeJsonString moved to providers.ts
+    // (registry is now the single source of truth for response parsing
+    // and custom-body templating).
+
+    /**
+     * Check if a model supports reasoning/thinking mode, using the
+     * provider-aware registry instead of a global hardcoded list.
+     */
+    private supportsReasoning(providerId: string, modelId?: string): boolean {
+        return isReasoningModel(providerId, modelId);
+    }
 
     /**
      * Constructs the request URL, headers, and body.
@@ -271,7 +277,7 @@ Do NOT translate the [#N] markers. Maintain the list structure. No extra comment
 
         for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
             try {
-                const { url, options } = this.getRequestConfig(systemPrompt, originalText, textBakedIn, this.computeMaxTokens());
+                const { url, options } = this.getRequestConfig(systemPrompt, originalText, textBakedIn, this.computeMaxTokens(systemPrompt, originalText, isBatch, textBakedIn));
 
                 // requestUrl ignores AbortSignal, so we race it against a real timeout instead.
                 // Local servers (ollama) tend to be slower; cloud providers default to 45s.
@@ -279,7 +285,7 @@ Do NOT translate the [#N] markers. Maintain the list structure. No extra comment
                 const isGemini = def?.protocol === 'gemini';
                 const timeoutMs = isGemini ? 60000 : (isLocal ? 120000 : 45000);
 
-                const response = await withTimeout(requestUrl(options), timeoutMs);
+                const response = await this.withTimeout(requestUrl(options), timeoutMs);
 
                 // DIAGNOSTIC: Log the full response if debug mode is enabled
                 if (this.plugin.settings.debugMode) {
@@ -484,13 +490,81 @@ Do NOT translate the [#N] markers. Maintain the list structure. No extra comment
     /**
      * FIX: Simplified character-based maxTokens computation.
      *
-     * T6.1: signature reduced to the only caller-relevant input (the provider
-     * id) — the old (systemPrompt, originalText, isBatch, textBakedIn)
-     * parameters were all ignored.
+     * Previous approach used per-script token estimation (CJK 0.67, Arabic 0.5,
+     * Latin 0.33) which was inaccurate and caused problems with reasoning models
+     * (Gemini Flash Thinking, DeepSeek R1, etc.) that burn tokens unpredictably
+     * on internal reasoning.
+     *
+     * New approach: just use provider's maxOutputTokens cap, with a floor of 1024.
+     * Chunking is handled by `maxBatchChars` (character-based) in processing.ts —
+     * that's the right place for size control, not here.
+     *
+     * P1-5: previously this method had a separate `if (isReasoning)` branch that
+     * computed `Math.min(cap, Math.max(2048, cap))` — which is just `cap` (since
+     * `Math.min(cap, cap)` is `cap` whenever `cap >= 2048`, and the providers in
+     * the registry all set maxOutputTokens ≥ 4096). The branch was dead code
+     * dressed up as a reasoning-model override. Removed.
      */
-    private computeMaxTokens(): number {
+    private computeMaxTokens(
+        systemPrompt: string,
+        originalText: string,
+        isBatch: boolean = false,
+        textBakedIn: boolean = false
+    ): number {
         const cap = getMaxOutputTokens(this.plugin.settings.apiProvider);
         return Math.max(1024, cap);
     }
 
+    /**
+     * FIX: detect if the current model is a reasoning-capable model that burns
+     * output tokens on internal reasoning before producing visible output.
+     * Checks both the provider's reasoningModelPatterns AND the user's
+     * enableReasoning setting.
+     */
+    private isReasoningModel(def: any, settings: any): boolean {
+        if (!def) return false;
+        // User explicitly enabled reasoning
+        const providerSettings = settings.providerSettings?.[settings.apiProvider];
+        if (providerSettings?.enableReasoning) return true;
+        // Model name matches reasoning patterns
+        const model = providerSettings?.model || def.defaultModel || '';
+        if (def.reasoningModelPatterns) {
+            for (const pattern of def.reasoningModelPatterns) {
+                if (pattern.test(model)) return true;
+            }
+        }
+        // Check model's static reasoning flag
+        if (def.staticModels) {
+            for (const m of def.staticModels) {
+                if (m.id === model && m.reasoning) return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Reject after `ms` if the wrapped promise hasn't settled.
+     *
+     * FIX H5: requestUrl does NOT support AbortSignal (confirmed by Obsidian API
+     * and code comment at line 259). The underlying HTTP request continues to
+     * completion even after timeout — we just ignore the result. This means
+     * timed-out requests still consume API quota/GPU. To actually cancel HTTP,
+     * would need fetch() with AbortController, but fetch() doesn't support
+     * Obsidian's auth/cert handling. Accept this limitation.
+     *
+     * The timer IS properly cleared via clearTimeout in both success and error
+     * paths — no timer leak.
+     */
+    private withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
+        return new Promise<T>((resolve, reject) => {
+            const id = setTimeout(
+                () => reject(Object.assign(new Error('Request timed out'), { name: 'TimeoutError' })),
+                ms,
+            );
+            p.then(
+                (v) => { clearTimeout(id); resolve(v); },
+                (e) => { clearTimeout(id); reject(e); },
+            );
+        });
+    }
 }

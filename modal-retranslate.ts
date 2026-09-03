@@ -251,13 +251,7 @@ export class RetranslateUsingOverlaysModal extends SingletonModal<RetranslateUsi
       let translated: string[] = [];
       try {
         if (this.plugin.settings.useBatchTranslation && texts.length > 1) {
-          // T1.7 (P1-2 fix): number segments as [#N] — the ONLY format the
-          // strict parser (extractNumberedLinesRobust, post FIX C3) accepts
-          // and the format the batch prompt itself demands. The old `1. ``
-          // numbering made models mirror the dot-format back, the parser
-          // found zero markers, and EVERY segment silently fell back to its
-          // original text.
-          const numbered = texts.map((t, idx) => `[#${idx + 1}] ${t}`).join('\n');
+          const numbered = texts.map((t, idx) => `${idx + 1}. ${t}`).join('\n');
           const maxChars = this.plugin.settings.maxBatchChars;
           if (numbered.length > maxChars) {
             translated = [];
@@ -266,6 +260,11 @@ export class RetranslateUsingOverlaysModal extends SingletonModal<RetranslateUsi
             }
           } else {
             const raw = await this.plugin.translation.translateBatch(numbered, texts.length);
+            // Fix: extractNumberedLines is async (returns Promise<string[]>).
+            // Without `await`, `translated` is the Promise object, and
+            // `translated[i]` is undefined — every translated entry would
+            // fall back to the original text, silently defeating the
+            // batch path.
             translated = await this.plugin.processor.extractNumberedLines(raw, texts.length, texts);
           }
         } else {
@@ -310,17 +309,31 @@ export class RetranslateUsingOverlaysModal extends SingletonModal<RetranslateUsi
       return;
     }
 
-    // T1.7 (P1-3 fix): write ONLY the pages this run actually touched.
-    // The old code serialized the ENTIRE pre-run snapshot with replace:true —
-    // any page the background queue had translated WHILE this modal was
-    // running got rolled back to its pre-modal state (lost update at page
-    // granularity).
-    const touchedPages = new Set(jobs.map(j => j.page));
+    // P0-8: previously called `this.app.vault.modify(translationFile, newMd)`
+    // directly — bypassing `storage.updatePageOverlaysAndWrite`. Consequences:
+    //   1. No `markSelfWrite()` — the metadataCache 'changed' event fired,
+    //      `isSelfWrite` returned false, `debouncedBuildMap` rebuilt the
+    //      entire `pdfToMdMap` (noticeable lag on large vaults).
+    //   2. `overlay.cachedOverlayData` was NOT updated in-place — only the
+    //      current page was refreshed via `refreshPageOverlayFromSaved`;
+    //      other cached pages became stale until next navigation.
+    //   3. No per-file write lock — race with background `PdfLayoutQueue`
+    //      worker that could be writing the same file simultaneously.
+    // Going through `updatePageOverlaysAndWrite` fixes all three. We must
+    // convert the keys from string (YAML-style) to number to match the
+    // expected `Record<number, OverlayPositionData[]>` signature.
+    //
+    // Phase 4 (P0-9): pass `replace: true` so retranslated pages REPLACE
+    // the existing page arrays directly (no merge-by-rect-overlap). The
+    // `saved` object was built by selectively replacing items the user
+    // chose to retranslate — the resulting per-page array is the
+    // authoritative new state and any items it omits must be considered
+    // intentionally removed.
     const overlaysByPage: Record<number, OverlayPositionData[]> = {};
-    for (const p of touchedPages) {
-      const v = saved.pageOverlays[String(p)];
-      if (Array.isArray(v)) {
-        overlaysByPage[p] = v as OverlayPositionData[];
+    for (const [k, v] of Object.entries(saved.pageOverlays)) {
+      const pageNum = Number(k);
+      if (Number.isFinite(pageNum)) {
+        overlaysByPage[pageNum] = v as OverlayPositionData[];
       }
     }
     await this.plugin.storage.updatePageOverlaysAndWrite(this.file, overlaysByPage, { replace: true });
@@ -368,15 +381,16 @@ export class RetranslateUsingOverlaysModal extends SingletonModal<RetranslateUsi
     }
   }
 
-  // T4.1: leaf-scoped page lookup through the PdfViewerAdapter. The old
-  // global document.querySelector grabbed the first matching page across ALL
-  // open PDF leaves — in split-view the retranslated overlay was rendered
-  // onto the WRONG file's page.
+  // Use overlay helper if present; otherwise use a local query
   private getPageElementByNumber(pageNumber: number): HTMLElement | null {
-    return this.plugin.pdfDom.getPageElement(
-      pageNumber,
-      this.plugin.pdfDom.getActivePdfLeaf(),
-    );
+    // Prefer plugin.overlay.getPageElementByNumber if available
+    const anyOverlay: any = this.plugin.overlay as any;
+    if (typeof anyOverlay.getPageElementByNumber === 'function') {
+      return anyOverlay.getPageElementByNumber(pageNumber);
+    }
+    const viewer = document.querySelector('.pdfViewer, #viewer');
+    if (!viewer) return null;
+    return viewer.querySelector(`.page[data-page-number="${pageNumber}"]`) as HTMLElement | null;
   }
 
   private async confirm(title: string, message: string): Promise<boolean> {

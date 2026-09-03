@@ -40,7 +40,7 @@
 
 import { TFile, Notice } from 'obsidian';
 import type OpenRouterTranslatorPlugin from './main';
-import { buildOccupancyMap, lineGroupingTolerance, groupSpansIntoLines } from './OccupancyMap';
+import { buildOccupancyMap } from './OccupancyMap';
 import { buildParagraphs } from './IslandBuilder';
 
 // `require` is available globally in Obsidian (Electron CommonJS context).
@@ -715,20 +715,6 @@ export class PdfTextExtractor {
         });
         if (debug) console.log(`${LOG_PREFIX} [p${pageNum}] Pipeline: ${rects.length} rects → ${paragraphs.length} paragraphs in ${Date.now() - t4}ms`);
 
-        // T-LD-F4: coverage self-check — every input rect must land in
-        // exactly one paragraph (sweep-up guarantees it; warn loudly if not).
-        {
-          const totalChars = rects.reduce((n, r) => n + (r.text?.length ?? 0), 0);
-          const gotChars = paragraphs.reduce(
-            (n, p) => n + p.spans.reduce((m, s) => m + (s.text?.length ?? 0), 0), 0);
-          if (totalChars !== gotChars) {
-            console.warn(
-              `${LOG_PREFIX} [p${pageNum}] COVERAGE: ${gotChars}/${totalChars} chars — ` +
-              `${totalChars - gotChars} chars would be LOST.`
-            );
-          }
-        }
-
         const normalized = paragraphs.map(p => this.normalizeParagraph(p, pageWidth, pageHeight, pageNum));
         const totalMs = Date.now() - t0;
         if (debug) console.log(`${LOG_PREFIX} [p${pageNum}] Total: ${normalized.length} paragraphs in ${totalMs}ms`);
@@ -984,14 +970,6 @@ export class PdfTextExtractor {
     /**
      * Normalize a Paragraph (pixel-space, spans reference InputRects) into
      * the page-relative transport format consumed by the queue.
-     *
-     * T5.3 (table support): the paragraph text used to join ALL spans with
-     * a single space, destroying line structure — so table blocks detected
-     * fine by the layout pipeline lost their row boundaries the moment they
-     * were serialized, and the table-aware `<br>` policy downstream never
-     * triggered in the background path. The text now preserves visual lines
-     * ('\n' between lines); the shared isTableLikeText() policy decides per
-     * paragraph whether those breaks must survive translation.
      */
     private normalizeParagraph(p: Paragraph, pageWidth: number, pageHeight: number, pageNum: number): NormalizedParagraph {
         const spans: NormalizedSpan[] = p.spans.map(s => ({
@@ -1004,18 +982,6 @@ export class PdfTextExtractor {
             text: typeof s.text === 'string' ? s.text : '',
         }));
 
-        // Group spans into visual lines (shared, font-scale-aware grouping),
-        // sort each line left-to-right, join lines with '\n'.
-        const lines = groupSpansIntoLines(p.spans, lineGroupingTolerance(p.spans));
-        const text = lines
-            .map(line => [...line]
-                .sort((a, b) => a.left - b.left)
-                .map(s => (typeof s.text === 'string' ? s.text : '').trim())
-                .filter(t => t.length > 0)
-                .join(' '))
-            .filter(t => t.length > 0)
-            .join('\n');
-
         return {
             relativeRect: {
                 left: p.pxLeft / pageWidth,
@@ -1024,7 +990,7 @@ export class PdfTextExtractor {
                 height: (p.pxBottom - p.pxTop) / pageHeight,
             },
             page: pageNum,
-            text,
+            text: p.spans.map(s => typeof s.text === 'string' ? s.text : '').join(' '),
             fontSize: p.dominantSize,
             fontFamily: p.dominantFamily,
             originalFontSizes: [...new Set(
