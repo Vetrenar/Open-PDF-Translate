@@ -1,4 +1,4 @@
-# OpenRouter PDF Translator
+# Open PDF Translate
 
 Translate PDF documents in Obsidian using OpenRouter, OpenAI, Anthropic, Gemini, Ollama, and other LLM providers. Features overlay rendering, OCR for scanned documents, batch translation with background queue, and a BBox edit mode for manual overlay adjustments.
 
