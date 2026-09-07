@@ -223,7 +223,7 @@ export class PdfViewerAdapter {
         if (!targetLeaf) return null;
 
         const deadline = Date.now() + timeoutMs;
-        // eslint-disable-next-line no-constant-condition
+        // Polling loop, bounded by the explicit deadline check inside the body.
         while (true) {
             const tl = this.getTextLayer(pageNumber, targetLeaf);
             if (tl) return tl;

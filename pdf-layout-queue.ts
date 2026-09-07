@@ -745,7 +745,7 @@ export class PdfLayoutQueue {
     const concurrency = Math.max(1, Math.min(8,
       this.plugin.settings.backgroundTranslationConcurrency ?? 3
     ));
-    if (debug) console.log(`${LOG_PREFIX} processQueue starting (concurrency=${concurrency})`);
+    if (debug) console.debug(`${LOG_PREFIX} processQueue starting (concurrency=${concurrency})`);
 
     // P1-22 (Phase 10): high-watermark backpressure for the translation
     // queue. Without this, a fast extractor (e.g. 1000-page PDF) pushes
@@ -827,7 +827,7 @@ export class PdfLayoutQueue {
             }
 
             if (debug) {
-              console.log(`${LOG_PREFIX} [p${jobTask.pageNum}] Translated ${translatedTexts.length} segment(s) in ${translateMs}ms (worker ${workerId}).`);
+              console.debug(`${LOG_PREFIX} [p${jobTask.pageNum}] Translated ${translatedTexts.length} segment(s) in ${translateMs}ms (worker ${workerId}).`);
             }
 
             const overlayData = this.buildOverlayData(paragraphs, translatedTexts);
@@ -929,7 +929,7 @@ export class PdfLayoutQueue {
         this.notifyChange();
 
         const batchPageNums = pendingTasks.map(p => p.pageNum);
-        if (debug) console.log(`${LOG_PREFIX} [${shortName}] Batch extracting ${batchPageNums.length} page(s): ${batchPageNums.join(',')}`);
+        if (debug) console.debug(`${LOG_PREFIX} [${shortName}] Batch extracting ${batchPageNums.length} page(s): ${batchPageNums.join(',')}`);
         new Notice(`📖 [${shortName}] extracting ${batchPageNums.length} page(s)...`, 2000);
 
         const extractStart = Date.now();
@@ -958,7 +958,7 @@ export class PdfLayoutQueue {
           continue;
         }
         const extractMs = Date.now() - extractStart;
-        if (debug) console.log(`${LOG_PREFIX} [${shortName}] Batch extraction done in ${extractMs}ms (${results.size} results).`);
+        if (debug) console.debug(`${LOG_PREFIX} [${shortName}] Batch extraction done in ${extractMs}ms (${results.size} results).`);
 
         // Distribute per-page results and push to translationQueue with
         // P1-22 (Phase 10) backpressure.
@@ -997,7 +997,7 @@ export class PdfLayoutQueue {
           }
 
           if (debug) {
-            console.log(`${LOG_PREFIX} [p${pageNum}] Extracted ${result.paragraphs.length} paragraph(s).`);
+            console.debug(`${LOG_PREFIX} [p${pageNum}] Extracted ${result.paragraphs.length} paragraph(s).`);
           }
 
           // P1-22 (Phase 10): high-watermark backpressure. Wait for the
@@ -1133,7 +1133,7 @@ export class PdfLayoutQueue {
     const result: string[] = new Array(paragraphs.length).fill('');
 
     if (translatableTexts.length === 0) {
-      if (debug) console.log(`${LOG_PREFIX} [p${pageNum}] No translatable text on page.`);
+      if (debug) console.debug(`${LOG_PREFIX} [p${pageNum}] No translatable text on page.`);
       return result;
     }
 
@@ -1157,7 +1157,7 @@ export class PdfLayoutQueue {
             skippedByFilter.add(translatableIndices[localIdx]);
           }
           if (debug) {
-            console.log(`${LOG_PREFIX} [p${pageNum}] ParagraphFilter: ${skipped.size}/${translatableTexts.length} paragraphs filtered (not sent to LLM)`);
+            console.debug(`${LOG_PREFIX} [p${pageNum}] ParagraphFilter: ${skipped.size}/${translatableTexts.length} paragraphs filtered (not sent to LLM)`);
           }
         }
       }

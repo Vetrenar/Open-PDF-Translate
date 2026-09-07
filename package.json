@@ -3,11 +3,14 @@
   "version": "0.4.0",
   "description": "Translate PDFs in Obsidian via OpenRouter and other LLM providers (standard Obsidian esbuild build, bundled pdf.js, no CDN)",
   "main": "main.js",
+  "type": "module",
   "scripts": {
     "dev": "node scripts/patch-pdfjs.mjs && node esbuild.mjs",
     "build": "node scripts/patch-pdfjs.mjs && node esbuild.mjs production && node scripts/verify-bundle.mjs",
     "verify": "node scripts/verify-bundle.mjs",
-    "test": "node scripts/patch-pdfjs.mjs && node build-runtime-tests.mjs && node test-runtime-bundle.js && node test-e2e-bundle.js",
+    "lint": "eslint .",
+    "test": "node scripts/patch-pdfjs.mjs && node build-runtime-tests.mjs && node test-runtime-bundle.cjs && node test-e2e-bundle.cjs",
+    "version": "node version-bump.mjs && git add manifest.json versions.json",
     "postinstall": "node scripts/patch-pdfjs.mjs"
   },
   "keywords": [
@@ -19,12 +22,15 @@
   "author": "",
   "license": "MIT",
   "devDependencies": {
+    "@eslint/js": "^10.0.1",
     "@types/node": "^22.10.2",
-    "builtin-modules": "3.3.0",
     "esbuild": "0.24.2",
+    "eslint": "^10.10.0",
+    "eslint-plugin-obsidianmd": "^0.4.2",
     "obsidian": "latest",
     "tslib": "2.6.3",
-    "typescript": "5.6.3"
+    "typescript": "5.6.3",
+    "typescript-eslint": "^8.69.0"
   },
   "dependencies": {
     "dompurify": "^3.1.6",

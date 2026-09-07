@@ -165,8 +165,7 @@ export class LayoutParserDebugModule {
         ghost.className = GHOST_CLASS;
         ghost.style.left = `${event.clientX}px`;
         ghost.style.top = `${event.clientY}px`;
-        ghost.style.width = '0px';
-        ghost.style.height = '0px';
+        ghost.setCssStyles({ width: '0px', height: '0px' });
         document.body.appendChild(ghost);
         this.ghostBox = ghost;
     };
@@ -246,7 +245,6 @@ export class LayoutParserDebugModule {
 
     constructor(plugin: OpenRouterTranslatorPlugin) {
         this.plugin = plugin;
-        this.ensureStyles();
         this.enabled = !!this.plugin.settings.layoutDebugMode;
         if (this.enabled) {
             this.bindListeners();
@@ -444,13 +442,22 @@ export class LayoutParserDebugModule {
 
         const legend = document.createElement('div');
         legend.className = LEGEND_CLASS;
-        legend.innerHTML = [
-            '<span class="i p"></span> parser bboxes',
-            '<span class="i c"></span> columns',
-            '<span class="i g"></span> gap strips',
-            '<span class="i v"></span> vertical gaps',
-            '<span class="i m"></span> manual bboxes'
-        ].join('<br>');
+        // Built with DOM helpers instead of innerHTML — no-unsanitized
+        // (obsidianmd recommended config).
+        const legendItems: Array<[string, string]> = [
+            ['i p', 'parser bboxes'],
+            ['i c', 'columns'],
+            ['i g', 'gap strips'],
+            ['i v', 'vertical gaps'],
+            ['i m', 'manual bboxes'],
+        ];
+        legendItems.forEach(([cls, label], idx) => {
+            const swatch = document.createElement('span');
+            swatch.className = cls;
+            legend.appendChild(swatch);
+            legend.appendChild(document.createTextNode(' ' + label));
+            if (idx < legendItems.length - 1) legend.appendChild(document.createElement('br'));
+        });
         layer.appendChild(legend);
     }
 
@@ -487,86 +494,6 @@ export class LayoutParserDebugModule {
         return layer;
     }
 
-    private ensureStyles(): void {
-        if (document.getElementById(STYLE_ID)) return;
-        const style = document.createElement('style');
-        style.id = STYLE_ID;
-        style.textContent = `
-            .${LAYER_CLASS} {
-                position: absolute;
-                left: 0;
-                top: 0;
-                width: 100%;
-                height: 100%;
-                pointer-events: none;
-                z-index: 220;
-            }
-            .${BOX_PARAGRAPH_CLASS} {
-                position: absolute;
-                box-sizing: border-box;
-                border: 1px solid rgba(37, 190, 122, 0.98);
-                background: rgba(37, 190, 122, 0.10);
-            }
-            .${BOX_COLUMN_CLASS} {
-                position: absolute;
-                box-sizing: border-box;
-                border: 1px solid rgba(53, 130, 246, 0.96);
-                background: rgba(53, 130, 246, 0.07);
-            }
-            .${BOX_GAP_CLASS} {
-                position: absolute;
-                box-sizing: border-box;
-                border: 1px dashed rgba(255, 78, 78, 0.98);
-                background: rgba(255, 78, 78, 0.12);
-            }
-            .${LINE_VERTICAL_GAP_CLASS} {
-                position: absolute;
-                top: 0;
-                width: 0;
-                height: 100%;
-                border-left: 2px solid rgba(255, 177, 31, 0.96);
-            }
-            .${BOX_MANUAL_CLASS} {
-                position: absolute;
-                box-sizing: border-box;
-                border: 2px solid rgba(255, 221, 87, 0.98);
-                background: rgba(255, 221, 87, 0.15);
-            }
-            .${LEGEND_CLASS} {
-                position: absolute;
-                left: 8px;
-                top: 8px;
-                padding: 6px 8px;
-                background: rgba(0, 0, 0, 0.74);
-                color: #ffffff;
-                font-size: 11px;
-                line-height: 1.35;
-                border-radius: 4px;
-                font-family: Menlo, Consolas, monospace;
-            }
-            .${LEGEND_CLASS} .i {
-                display: inline-block;
-                width: 10px;
-                height: 10px;
-                margin-right: 6px;
-                vertical-align: -1px;
-            }
-            .${LEGEND_CLASS} .i.p { background: rgba(37, 190, 122, 0.9); }
-            .${LEGEND_CLASS} .i.c { background: rgba(53, 130, 246, 0.9); }
-            .${LEGEND_CLASS} .i.g { background: rgba(255, 78, 78, 0.9); }
-            .${LEGEND_CLASS} .i.v { background: rgba(255, 177, 31, 0.9); }
-            .${LEGEND_CLASS} .i.m { background: rgba(255, 221, 87, 0.9); }
-            .${GHOST_CLASS} {
-                position: fixed;
-                box-sizing: border-box;
-                pointer-events: none;
-                z-index: 100000;
-                border: 2px dashed rgba(255, 221, 87, 0.98);
-                background: rgba(255, 221, 87, 0.14);
-            }
-        `;
-        document.head.appendChild(style);
-    }
 
     private buildDetectionSnapshot(
         pageElement: HTMLElement,
@@ -817,7 +744,9 @@ export class LayoutParserDebugModule {
             if (!existing) {
                 try {
                     await this.plugin.app.vault.createFolder(current);
-                } catch {}
+                } catch {
+                    // folder may already exist (created concurrently) — safe to ignore
+                }
             }
         }
     }

@@ -69,7 +69,7 @@ export class RegionReprocessor {
     private async run(): Promise<void> {
         const { app, settings } = this.plugin;
         if (this.debug) {
-            console.log('[RegionReprocessor] Starting – waiting for Shift+drag...');
+            console.debug('[RegionReprocessor] Starting – waiting for Shift+drag...');
         }
         if (!settings.enableTranslation) {
             new Notice('PDF translation is disabled in settings.');
@@ -461,7 +461,7 @@ export class RegionReprocessor {
         // against disk state and could keep stale duplicates when rects drift slightly.
         await this.plugin.storage.updatePageOverlaysAndWrite(file, { [modifiedPage]: items }, { replace: true });
         if (this.debug) {
-            console.log(`[RegionReprocessor] Saved page ${modifiedPage} for ${file.path}`);
+            console.debug(`[RegionReprocessor] Saved page ${modifiedPage} for ${file.path}`);
         }
     }
 

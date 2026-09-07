@@ -1,0 +1,14 @@
+# top-most EditorConfig file
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+
+# Deviation from obsidian-sample-plugin (which uses tabs): this codebase is
+# written with 2-space indentation, so the editor default matches the code.
+indent_style = space
+indent_size = 2
+tab_width = 2

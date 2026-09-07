@@ -2287,7 +2287,7 @@ export class OverlayRenderer {
         if (typeof this.plugin.logDebug === 'function') {
             this.plugin.logDebug(prefixed, ...args);
         } else if (this.plugin.settings?.debugMode) {
-            console.log(prefixed, ...args);
+            console.debug(prefixed, ...args);
         }
     }
 }

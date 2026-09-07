@@ -68,8 +68,7 @@ export class EditSpecificTranslationModal extends SingletonModal<EditSpecificTra
         titleEl.setText(t('modal.edit.title'));
 
         // 2. Container for Original Text (Read Only)
-        contentEl.createEl('h6', { text: t('modal.edit.original') }).style.cssText =
-            'margin: 0 0 5px 0; color: var(--text-muted);';
+        contentEl.createEl('h6', { text: t('modal.edit.original') }).setCssStyles({ margin: '0 0 5px 0', color: 'var(--text-muted)' });
 
         const originalContainer = contentEl.createDiv({ cls: 'ort-original-container' });
         const originalTextArea = new TextAreaComponent(originalContainer);
@@ -79,22 +78,16 @@ export class EditSpecificTranslationModal extends SingletonModal<EditSpecificTra
             .setDisabled(true); // Read-only but copyable
 
         // Style the original text area
-        originalTextArea.inputEl.style.width = '100%';
-        originalTextArea.inputEl.style.height = '150px';
-        originalTextArea.inputEl.style.resize = 'vertical';
-        originalTextArea.inputEl.style.background = 'var(--background-secondary)';
-        originalTextArea.inputEl.style.color = 'var(--text-muted)';
-        originalTextArea.inputEl.style.fontFamily = 'var(--font-monospace)';
-        originalTextArea.inputEl.style.fontSize = '0.9em';
+        originalTextArea.inputEl.setCssStyles({ width: '100%', height: '150px', resize: 'vertical', background: 'var(--background-secondary)', color: 'var(--text-muted)', fontFamily: 'var(--font-monospace)', fontSize: '0.9em' });
 
         // Spacer (Phase 17: avoid `style` prop on createDiv — DomElementInfo
         // doesn't declare it, so TS strict-mode complains. Set cssText after.)
         const spacer = contentEl.createDiv();
-        spacer.style.cssText = 'height: 15px;';
+        spacer.setCssStyles({ height: '15px' });
 
         // 3. Container for Translation (Editable)
         const translationHeader = contentEl.createEl('h6', { text: t('modal.edit.translated') });
-        translationHeader.style.cssText = 'margin: 0 0 5px 0; color: var(--text-accent);';
+        translationHeader.setCssStyles({ margin: '0 0 5px 0', color: 'var(--text-accent)' });
 
         const translationContainer = contentEl.createDiv({ cls: 'ort-translation-container' });
         const translationTextArea = new TextAreaComponent(translationContainer);
@@ -110,10 +103,7 @@ export class EditSpecificTranslationModal extends SingletonModal<EditSpecificTra
             });
 
         // Style the editing text area
-        translationTextArea.inputEl.style.width = '100%';
-        translationTextArea.inputEl.style.height = '200px'; // Taller for editing
-        translationTextArea.inputEl.style.resize = 'vertical';
-        translationTextArea.inputEl.style.fontFamily = 'var(--font-text)';
+        translationTextArea.inputEl.setCssStyles({ width: '100%', height: '200px', resize: 'vertical', fontFamily: 'var(--font-text)' }) // Taller for editing;
 
         // Focus the editor immediately
         setTimeout(() => translationTextArea.inputEl.focus(), 50);

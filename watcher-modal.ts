@@ -52,10 +52,10 @@ export class WatcherQueueModal extends SingletonModal<WatcherQueueModal> {
 
         // ── Action buttons — flex-wrap to prevent overflow ──
         const btnContainer = this.contentEl.createDiv();
-        btnContainer.style.cssText = 'display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0;';
+        btnContainer.setCssStyles({ display: 'flex', flexWrap: 'wrap', gap: '6px', margin: '8px 0' });
 
         const scanBtn = btnContainer.createEl('button', { text: t('watcher.queue.btn.scan') });
-        scanBtn.style.cssText = 'padding: 4px 10px; font-size: 0.85em;';
+        scanBtn.setCssStyles({ padding: '4px 10px', fontSize: '0.85em' });
         scanBtn.onclick = async () => {
             const n = await watcher.scanExisting();
             this.render();
@@ -63,7 +63,7 @@ export class WatcherQueueModal extends SingletonModal<WatcherQueueModal> {
         };
 
         const scanAllBtn = btnContainer.createEl('button', { text: t('modal.watcher.scanAll') });
-        scanAllBtn.style.cssText = 'padding: 4px 10px; font-size: 0.85em;';
+        scanAllBtn.setCssStyles({ padding: '4px 10px', fontSize: '0.85em' });
         scanAllBtn.onclick = async () => {
             const n = await watcher.scanAllUntranslated();
             this.render();
@@ -71,13 +71,13 @@ export class WatcherQueueModal extends SingletonModal<WatcherQueueModal> {
         };
 
         const runAllBtn = btnContainer.createEl('button', { text: t('modal.watcher.btn.runall') });
-        runAllBtn.style.cssText = 'padding: 4px 10px; font-size: 0.85em; font-weight: bold;';
+        runAllBtn.setCssStyles({ padding: '4px 10px', fontSize: '0.85em', fontWeight: 'bold' });
         runAllBtn.onclick = async () => {
             await watcher.runAllPending();
         };
 
         const clearBtn = btnContainer.createEl('button', { text: t('modal.watcher.clearFinished') });
-        clearBtn.style.cssText = 'padding: 4px 10px; font-size: 0.85em;';
+        clearBtn.setCssStyles({ padding: '4px 10px', fontSize: '0.85em' });
         clearBtn.onclick = () => {
             let cleared = 0;
             for (const item of this.plugin.watcher.getQueue()) {
@@ -103,9 +103,10 @@ export class WatcherQueueModal extends SingletonModal<WatcherQueueModal> {
 
         // Hint
         const hint = this.contentEl.createDiv();
-        hint.style.cssText =
-            'font-size: 0.8em; color: var(--text-muted); margin: 6px 0; ' +
-            'padding: 4px 8px; border-left: 2px solid var(--background-modifier-border);';
+        hint.setCssStyles({
+            fontSize: '0.8em', color: 'var(--text-muted)', margin: '6px 0',
+            padding: '4px 8px', borderLeft: '2px solid var(--background-modifier-border)',
+        });
         hint.setText(t('modal.watcher.hint'));
 
         // File list container — render() fills it with Active + Available sections
@@ -151,39 +152,43 @@ export class WatcherQueueModal extends SingletonModal<WatcherQueueModal> {
         // ── ACTIVE TRANSLATIONS section (scrollable, limited height) ──
         if (activeItems.length > 0) {
             const activeSection = el.createDiv();
-            activeSection.style.cssText = 'margin-bottom: 16px;';
+            activeSection.setCssStyles({ marginBottom: '16px' });
 
             const activeHeader = activeSection.createDiv();
-            activeHeader.style.cssText =
-                'font-weight: 600; font-size: 0.8em; text-transform: uppercase; ' +
-                'letter-spacing: 1px; color: var(--interactive-accent); margin-bottom: 8px;';
+            activeHeader.setCssStyles({
+                fontWeight: '600', fontSize: '0.8em', textTransform: 'uppercase',
+                letterSpacing: '1px', color: 'var(--interactive-accent)', marginBottom: '8px',
+            });
             activeHeader.setText(`▸ ${t('modal.watcher.activeTranslations')} (${activeItems.length})`);
 
             // Scrollable container with limited height
             const activeList = activeSection.createDiv();
-            activeList.style.cssText =
-                'max-height: 200px; overflow-y: auto; ' +
-                'border: 1px solid var(--interactive-accent); border-radius: 8px; ' +
-                'padding: 10px; ' +
-                'background: color-mix(in srgb, var(--interactive-accent) 5%, transparent);';
+            activeList.setCssStyles({
+                maxHeight: '200px', overflowY: 'auto',
+                border: '1px solid var(--interactive-accent)', borderRadius: '8px',
+                padding: '10px',
+                background: 'color-mix(in srgb, var(--interactive-accent) 5%, transparent)',
+            });
 
             for (const item of activeItems) {
                 const file = this.plugin.app.vault.getAbstractFileByPath(item.path);
                 const card = activeList.createDiv();
-                card.style.cssText = 'margin-bottom: 10px; padding-bottom: 10px; ' +
-                    (activeItems.indexOf(item) < activeItems.length - 1
-                        ? 'border-bottom: 1px solid var(--background-modifier-border);'
-                        : '');
+                card.setCssStyles({
+                    marginBottom: '10px', paddingBottom: '10px',
+                    borderBottom: activeItems.indexOf(item) < activeItems.length - 1
+                        ? '1px solid var(--background-modifier-border)'
+                        : 'none',
+                });
 
                 // Title row
                 const titleRow = card.createDiv();
-                titleRow.style.cssText = 'display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;';
+                titleRow.setCssStyles({ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '4px' });
                 titleRow.createEl('span', {
                     text: item.name,
                     attr: { style: 'font-weight: 600; font-size: 0.9em;' }
                 });
                 const cancelBtn = titleRow.createEl('button', { text: t('modal.watcher.btn.cancel') });
-                cancelBtn.style.cssText = 'font-size: 0.8em; padding: 2px 10px;';
+                cancelBtn.setCssStyles({ fontSize: '0.8em', padding: '2px 10px' });
                 cancelBtn.onclick = () => {
                     this.plugin.watcher.cancelRunning();
                     new Notice(t('modal.watcher.cancelling'), 3000);
@@ -206,14 +211,16 @@ export class WatcherQueueModal extends SingletonModal<WatcherQueueModal> {
             const availSection = el.createDiv();
 
             const availHeader = availSection.createDiv();
-            availHeader.style.cssText =
-                'font-weight: 600; font-size: 0.8em; text-transform: uppercase; ' +
-                'letter-spacing: 1px; color: var(--text-muted); margin-bottom: 8px;';
+            availHeader.setCssStyles({
+                fontWeight: '600', fontSize: '0.8em', textTransform: 'uppercase',
+                letterSpacing: '1px', color: 'var(--text-muted)', marginBottom: '8px',
+            });
             availHeader.setText(`▸ ${t('modal.watcher.availableFiles')} (${availableItems.length})`);
 
             const availList = availSection.createDiv();
-            availList.style.cssText =
-                'border: 1px solid var(--background-modifier-border); border-radius: 8px; padding: 4px;';
+            availList.setCssStyles({
+                border: '1px solid var(--background-modifier-border)', borderRadius: '8px', padding: '4px',
+            });
 
             for (const item of availableItems) {
                 const file = this.plugin.app.vault.getAbstractFileByPath(item.path);
@@ -227,18 +234,19 @@ export class WatcherQueueModal extends SingletonModal<WatcherQueueModal> {
                 }
 
                 const row = availList.createDiv();
-                row.style.cssText =
-                    'display: flex; justify-content: space-between; align-items: center; ' +
-                    'padding: 6px 8px; font-size: 0.85em; ' +
-                    'border-bottom: 1px solid var(--background-modifier-border);';
+                row.setCssStyles({
+                    display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+                    padding: '6px 8px', fontSize: '0.85em',
+                    borderBottom: '1px solid var(--background-modifier-border)',
+                });
                 // Remove border on last item
                 if (availableItems.indexOf(item) === availableItems.length - 1) {
-                    row.style.borderBottom = 'none';
+                    row.setCssStyles({ borderBottom: 'none' });
                 }
 
                 // Left: name + status (wrap instead of truncate)
                 const leftDiv = row.createDiv();
-                leftDiv.style.cssText = 'flex: 1; min-width: 0; margin-right: 8px;';
+                leftDiv.setCssStyles({ flex: '1', minWidth: '0', marginRight: '8px' });
                 leftDiv.createEl('span', {
                     text: item.name,
                     attr: { style: 'font-weight: 500; word-break: break-word;' }
@@ -250,11 +258,11 @@ export class WatcherQueueModal extends SingletonModal<WatcherQueueModal> {
 
                 // Right: action buttons
                 const rightDiv = row.createDiv();
-                rightDiv.style.cssText = 'display: flex; gap: 4px; flex-shrink: 0; margin-left: 8px;';
+                rightDiv.setCssStyles({ display: 'flex', gap: '4px', flexShrink: '0', marginLeft: '8px' });
 
                 if (item.status === 'done' || item.status === 'skipped') {
                     const btn = rightDiv.createEl('button', { text: t('modal.watcher.btn.retranslate') });
-                    btn.style.cssText = 'font-size: 0.85em; padding: 2px 8px;';
+                    btn.setCssStyles({ fontSize: '0.85em', padding: '2px 8px' });
                     btn.onclick = async () => {
                         if (file instanceof TFile) {
                             new Notice(t('modal.watcher.retranslating', { name: item.name }), 3000);
@@ -264,7 +272,7 @@ export class WatcherQueueModal extends SingletonModal<WatcherQueueModal> {
                 } else {
                     // pending / error
                     const btn = rightDiv.createEl('button', { text: t('modal.watcher.btn.translate') });
-                    btn.style.cssText = 'font-size: 0.85em; padding: 2px 8px; font-weight: bold;';
+                    btn.setCssStyles({ fontSize: '0.85em', padding: '2px 8px', fontWeight: 'bold' });
                     btn.onclick = async () => {
                         if (file instanceof TFile) {
                             new Notice(t('modal.watcher.translating', { name: item.name }), 3000);
@@ -275,7 +283,7 @@ export class WatcherQueueModal extends SingletonModal<WatcherQueueModal> {
 
                 // Trash button
                 const trashBtn = rightDiv.createEl('button', { text: '🗑' });
-                trashBtn.style.cssText = 'font-size: 0.85em; padding: 2px 6px; cursor: pointer;';
+                trashBtn.setCssStyles({ fontSize: '0.85em', padding: '2px 6px', cursor: 'pointer' });
                 trashBtn.title = t('modal.watcher.btn.remove');
                 trashBtn.onclick = () => {
                     this.plugin.watcher.remove(item.path);
@@ -294,14 +302,16 @@ export class WatcherQueueModal extends SingletonModal<WatcherQueueModal> {
         const pct = Math.max(0, Math.min(100, (done / total) * 100));
 
         const barContainer = container.createDiv();
-        barContainer.style.cssText =
-            'height: 8px; background: var(--background-modifier-border); ' +
-            'border-radius: 4px; overflow: hidden;';
+        barContainer.setCssStyles({
+            height: '8px', background: 'var(--background-modifier-border)',
+            borderRadius: '4px', overflow: 'hidden',
+        });
         const barFill = barContainer.createDiv();
-        barFill.style.cssText =
-            `height: 100%; width: ${pct.toFixed(1)}%; ` +
-            'background: var(--interactive-accent); transition: width 0.3s ease; ' +
-            'border-radius: 4px;';
+        barFill.setCssStyles({
+            height: '100%', width: `${pct.toFixed(1)}%`,
+            background: 'var(--interactive-accent)', transition: 'width 0.3s ease',
+            borderRadius: '4px',
+        });
     }
 
     private sortItems(items: any[]): any[] {

@@ -20,7 +20,7 @@ import { TranslationStorage } from './storage';
 
 let failures = 0;
 function check(name: string, cond: boolean): void {
-    console.log(`${cond ? '  PASS' : '  FAIL'}  ${name}`);
+    console.debug(`${cond ? '  PASS' : '  FAIL'}  ${name}`);
     if (!cond) failures++;
 }
 
@@ -33,7 +33,7 @@ function makeUnits(): any[] {
 }
 
 async function testStaleCancel(): Promise<void> {
-    console.log('\n── FIX 1: stale queue cancel flag ─────────────────────────');
+    console.debug('\n── FIX 1: stale queue cancel flag ─────────────────────────');
 
     const fakePlugin: any = {
         settings: {
@@ -92,7 +92,7 @@ async function testStaleCancel(): Promise<void> {
 }
 
 async function testAtomicWrite(): Promise<void> {
-    console.log('\n── FIX 2: atomicWrite case split ──────────────────────────');
+    console.debug('\n── FIX 2: atomicWrite case split ──────────────────────────');
 
     const calls: string[] = [];
     const warns: string[] = [];
@@ -153,10 +153,10 @@ async function testAtomicWrite(): Promise<void> {
 }
 
 async function main(): Promise<void> {
-    console.log('── runtime-fixes regression tests (Electron-renderer simulation) ──');
+    console.debug('── runtime-fixes regression tests (Electron-renderer simulation) ──');
     await testStaleCancel();
     await testAtomicWrite();
-    console.log(`\nRESULT: ${failures === 0 ? 'ALL PASSED' : `${failures} FAILURE(S)`}`);
+    console.debug(`\nRESULT: ${failures === 0 ? 'ALL PASSED' : `${failures} FAILURE(S)`}`);
     if (failures > 0) process.exit(1);
 }
 

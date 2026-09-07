@@ -260,17 +260,17 @@ export class PdfTextExtractor {
 
         try {
             // ── Library: legacy CJS build (LITERAL specifier — esbuild bundles) ──
-            if (debug) console.log(`${LOG_PREFIX} import('pdfjs-dist/legacy/build/pdf.js')...`);
+            if (debug) console.debug(`${LOG_PREFIX} import('pdfjs-dist/legacy/build/pdf.js')...`);
             // STATIC string literal — esbuild MUST see this to bundle at build time.
             // Do NOT change to a variable or template literal.
             const mod: any = await import('pdfjs-dist/legacy/build/pdf.js');
             this.pdfjsLib = mod.default ?? mod;
-            if (debug) console.log(`${LOG_PREFIX} Loaded pdfjs-dist (legacy CJS). Version: ${this.pdfjsLib.version || 'unknown'}`);
+            if (debug) console.debug(`${LOG_PREFIX} Loaded pdfjs-dist (legacy CJS). Version: ${this.pdfjsLib.version || 'unknown'}`);
 
             // ── Worker: register the bundled module on globalThis.pdfjsWorker ──
             // Activates pdf.js worker-resolution PATH A (see docstring above):
             // no Web Worker spawn, no loadScript(), fully offline.
-            if (debug) console.log(`${LOG_PREFIX} import('pdfjs-dist/legacy/build/pdf.worker.js')...`);
+            if (debug) console.debug(`${LOG_PREFIX} import('pdfjs-dist/legacy/build/pdf.worker.js')...`);
             // @ts-ignore — pdfjs-dist 3.x ships no pdf.worker.d.ts; the module is
             // consumed as an opaque { WorkerMessageHandler } object (typed any).
             const workerMod: any = await import('pdfjs-dist/legacy/build/pdf.worker.js');
@@ -284,7 +284,7 @@ export class PdfTextExtractor {
                 if (!(globalThis as any).pdfjsWorker) {
                     (globalThis as any).pdfjsWorker = workerExports;
                 }
-                if (debug) console.log(`${LOG_PREFIX} Registered bundled pdf.js worker (globalThis.pdfjsWorker).`);
+                if (debug) console.debug(`${LOG_PREFIX} Registered bundled pdf.js worker (globalThis.pdfjsWorker).`);
             } else {
                 // Not fatal by itself, but PATH C would then be required — log loudly.
                 console.warn(`${LOG_PREFIX} Bundled pdf.worker.js did not export WorkerMessageHandler; pdf.js may fall back to loadScript().`);
@@ -310,7 +310,7 @@ export class PdfTextExtractor {
         try {
             if (this.pdfjsLib.GlobalWorkerOptions) {
                 this.pdfjsLib.GlobalWorkerOptions.workerSrc = '';
-                if (debug) console.log(`${LOG_PREFIX} pdfjs fake-worker mode enabled (workerSrc = '').`);
+                if (debug) console.debug(`${LOG_PREFIX} pdfjs fake-worker mode enabled (workerSrc = '').`);
             } else {
                 console.warn(`${LOG_PREFIX} pdfjsLib.GlobalWorkerOptions not found — worker may spawn unexpectedly.`);
             }
@@ -375,10 +375,10 @@ export class PdfTextExtractor {
 
         const debug = !!this.plugin.settings?.debugMode;
         const t0 = Date.now();
-        if (debug) console.log(`${LOG_PREFIX} extractPage("${file.path}", p${pageNum}) starting...`);
+        if (debug) console.debug(`${LOG_PREFIX} extractPage("${file.path}", p${pageNum}) starting...`);
 
         const pdfBytes = await this.readPdfBytes(file);
-        if (debug) console.log(`${LOG_PREFIX} [p${pageNum}] PDF bytes: ${(pdfBytes.byteLength / 1024).toFixed(1)}KB (cached=${this.pdfBytesCache.has(file.path)})`);
+        if (debug) console.debug(`${LOG_PREFIX} [p${pageNum}] PDF bytes: ${(pdfBytes.byteLength / 1024).toFixed(1)}KB (cached=${this.pdfBytesCache.has(file.path)})`);
 
         // Lazily load pdfjs-dist on first use (async — literal dynamic import
         // of the bundled module; no network, no <script> tag).
@@ -423,7 +423,7 @@ export class PdfTextExtractor {
             }
             throw err;
         }
-        if (debug) console.log(`${LOG_PREFIX} [p${pageNum}] Document loaded in ${Date.now() - t1}ms`);
+        if (debug) console.debug(`${LOG_PREFIX} [p${pageNum}] Document loaded in ${Date.now() - t1}ms`);
 
         try {
             const page = await pdf.getPage(pageNum);
@@ -491,10 +491,10 @@ export class PdfTextExtractor {
         const pageNumsPreview = pageNums.length <= 8
             ? `[${pageNums.join(',')}]`
             : `[${pageNums.slice(0, 8).join(',')}+${pageNums.length - 8} more]`;
-        if (debug) console.log(`${LOG_PREFIX} extractPagesBatch("${file.path}", ${pageNumsPreview}) starting...`);
+        if (debug) console.debug(`${LOG_PREFIX} extractPagesBatch("${file.path}", ${pageNumsPreview}) starting...`);
 
         const pdfBytes = await this.readPdfBytes(file);
-        if (debug) console.log(`${LOG_PREFIX} PDF bytes: ${(pdfBytes.byteLength / 1024).toFixed(1)}KB (cached=${this.pdfBytesCache.has(file.path)})`);
+        if (debug) console.debug(`${LOG_PREFIX} PDF bytes: ${(pdfBytes.byteLength / 1024).toFixed(1)}KB (cached=${this.pdfBytesCache.has(file.path)})`);
 
         const pdfjsLib = await this.ensurePdfjs();
 
@@ -530,7 +530,7 @@ export class PdfTextExtractor {
             }
             throw err;
         }
-        if (debug) console.log(`${LOG_PREFIX} Document loaded in ${Date.now() - t1}ms (reused for ${pageNums.length} page(s))`);
+        if (debug) console.debug(`${LOG_PREFIX} Document loaded in ${Date.now() - t1}ms (reused for ${pageNums.length} page(s))`);
 
         try {
             for (const pageNum of pageNums) {
@@ -561,7 +561,7 @@ export class PdfTextExtractor {
             if (debug) {
                 const okCount = [...results.values()].filter(r => !('error' in r)).length;
                 const errCount = results.size - okCount;
-                console.log(`${LOG_PREFIX} Batch done in ${Date.now() - t0}ms (${okCount} ok, ${errCount} failed).`);
+                console.debug(`${LOG_PREFIX} Batch done in ${Date.now() - t0}ms (${okCount} ok, ${errCount} failed).`);
             }
         }
     }
@@ -599,7 +599,7 @@ export class PdfTextExtractor {
         // xMin or yMin are non-zero, `item.transform[4]/[5]` (PDF
         // user-space from MediaBox origin) needs CropBox-offset
         // compensation — see `buildInputRects` below.
-        if (debug) console.log(`${LOG_PREFIX} [p${pageNum}] Page size: ${pageWidth.toFixed(0)}×${pageHeight.toFixed(0)}`, {
+        if (debug) console.debug(`${LOG_PREFIX} [p${pageNum}] Page size: ${pageWidth.toFixed(0)}×${pageHeight.toFixed(0)}`, {
             view: page.view,
             offsetX: viewport.offsetX,
             offsetY: viewport.offsetY,
@@ -608,7 +608,7 @@ export class PdfTextExtractor {
 
         const t2 = Date.now();
         const textContent = await page.getTextContent();
-        if (debug) console.log(`${LOG_PREFIX} [p${pageNum}] getTextContent: ${textContent.items.length} items in ${Date.now() - t2}ms`);
+        if (debug) console.debug(`${LOG_PREFIX} [p${pageNum}] getTextContent: ${textContent.items.length} items in ${Date.now() - t2}ms`);
 
         // CRITICAL: font objects in page.commonObjs are NOT populated by
         // getTextContent() alone. They are registered lazily as the page
@@ -616,10 +616,10 @@ export class PdfTextExtractor {
         // throws "Requesting object that isn't resolved yet".
         const t3 = Date.now();
         await page.getOperatorList();
-        if (debug) console.log(`${LOG_PREFIX} [p${pageNum}] getOperatorList: ${Date.now() - t3}ms (font loading)`);
+        if (debug) console.debug(`${LOG_PREFIX} [p${pageNum}] getOperatorList: ${Date.now() - t3}ms (font loading)`);
 
         const fontNames = this.resolveFontNames(textContent.items, page);
-        if (debug) console.log(`${LOG_PREFIX} [p${pageNum}] Resolved ${fontNames.size} font(s)`);
+        if (debug) console.debug(`${LOG_PREFIX} [p${pageNum}] Resolved ${fontNames.size} font(s)`);
 
         // P0-11: pass `viewport` (not just `pageHeight`) so that
         // `buildInputRects` can use `viewport.convertToViewportPoint()`.
@@ -633,7 +633,7 @@ export class PdfTextExtractor {
         // pixels (top-left origin), which we then normalise to 0-1 by
         // dividing by viewport.width / viewport.height.
         const rects = this.buildInputRects(textContent.items, fontNames, viewport);
-        if (debug) console.log(`${LOG_PREFIX} [p${pageNum}] Built ${rects.length} input rects`);
+        if (debug) console.debug(`${LOG_PREFIX} [p${pageNum}] Built ${rects.length} input rects`);
 
         // P2-2 (Phase 17): cellSize and tuning knobs now come from
         // `plugin.layoutSettings` so user-tuned values apply symmetrically
@@ -665,11 +665,11 @@ export class PdfTextExtractor {
             columnGapThreshold: typeof ls?.columnGapThreshold === 'number' ? ls.columnGapThreshold : 50,
             decorationThreshold: typeof ls?.decorationThreshold === 'number' ? ls.decorationThreshold : 0.7,
         });
-        if (debug) console.log(`${LOG_PREFIX} [p${pageNum}] Pipeline: ${rects.length} rects → ${paragraphs.length} paragraphs in ${Date.now() - t4}ms`);
+        if (debug) console.debug(`${LOG_PREFIX} [p${pageNum}] Pipeline: ${rects.length} rects → ${paragraphs.length} paragraphs in ${Date.now() - t4}ms`);
 
         const normalized = paragraphs.map(p => this.normalizeParagraph(p, pageWidth, pageHeight, pageNum));
         const totalMs = Date.now() - t0;
-        if (debug) console.log(`${LOG_PREFIX} [p${pageNum}] Total: ${normalized.length} paragraphs in ${totalMs}ms`);
+        if (debug) console.debug(`${LOG_PREFIX} [p${pageNum}] Total: ${normalized.length} paragraphs in ${totalMs}ms`);
         return { paragraphs: normalized, pageWidth, pageHeight, pageNum };
     }
 

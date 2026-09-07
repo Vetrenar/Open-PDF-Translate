@@ -117,3 +117,341 @@
         transition: none;
     }
 }
+/* ═════════════════════════════════════════════════════════════════
+   MIGRATED RUNTIME-INJECTED CSS (2026-09)
+   These rules were previously appended to <head> as <style> elements
+   at runtime by main.ts (settings-ui.css.ts), overlay-ui.ts
+   (ensureGlobalStyles), layout-parser-debug.ts (ensureStyles) and
+   modal-retranslate.ts. Per Obsidian plugin guidelines, static CSS
+   belongs in styles.css, which Obsidian loads automatically.
+   ═════════════════════════════════════════════════════════════════ */
+
+/* ── Progressive Disclosure settings UI (was settings-ui.css.ts) ── */
+
+/* ═══ Progressive Disclosure: Level Cards ═══ */
+.pdf-translate-level-cards {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 10px;
+  margin-bottom: 20px;
+}
+
+.pdf-translate-level-card {
+  background: var(--background-secondary);
+  border: 2px solid var(--background-modifier-border);
+  border-radius: 8px;
+  padding: 14px 16px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  user-select: none;
+}
+
+.pdf-translate-level-card:hover {
+  border-color: var(--text-muted);
+  background: var(--background-secondary-alt);
+}
+
+.pdf-translate-level-card.active {
+  border-color: var(--interactive-accent);
+  background: var(--interactive-accent-hover);
+}
+
+.pdf-translate-level-card .pdf-translate-level-name {
+  font-size: 14px;
+  font-weight: 600;
+  margin-bottom: 4px;
+  color: var(--text-normal);
+}
+
+.pdf-translate-level-card.active .pdf-translate-level-name {
+  /* FIX (v5): use --text-on-accent (text color that sits on top of accent
+     backgrounds) instead of --interactive-accent (which is the SAME color
+     as the active background → invisible text). Falls back to --text-normal
+     for older Obsidian versions that don't define --text-on-accent. */
+  color: var(--text-on-accent, var(--text-normal));
+}
+
+.pdf-translate-level-card.active .pdf-translate-level-desc,
+.pdf-translate-level-card.active .pdf-translate-level-count {
+  /* Same fix for description and count text on active cards */
+  color: var(--text-on-accent, var(--text-muted));
+}
+
+.pdf-translate-level-card .pdf-translate-level-desc {
+  font-size: 12px;
+  color: var(--text-muted);
+  line-height: 1.4;
+}
+
+.pdf-translate-level-card .pdf-translate-level-count {
+  font-size: 11px;
+  color: var(--text-faint);
+  margin-top: 8px;
+}
+
+/* ═══ Section Headings (grouped cards) ═══ */
+.pdf-translate-section-group {
+  background: var(--background-secondary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  padding: 4px 20px;
+  margin-bottom: 16px;
+}
+
+.pdf-translate-section-group .pdf-translate-group-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  padding: 14px 0 6px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border-bottom: 1px solid var(--background-modifier-border);
+  margin-bottom: 4px;
+}
+
+.pdf-translate-section-group .pdf-translate-group-title .pdf-translate-group-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--interactive-accent);
+  flex-shrink: 0;
+}
+
+/* ═══ Warning Box (for Prompts section) ═══ */
+.pdf-translate-warning-box {
+  padding: 12px 16px;
+  background: var(--background-modifier-warning, rgba(250, 166, 26, 0.1));
+  border-left: 3px solid var(--text-warning, #faa61a);
+  border-radius: 0 6px 6px 0;
+  font-size: 12px;
+  color: var(--text-normal);
+  margin: 12px 0 16px;
+  line-height: 1.5;
+}
+
+.pdf-translate-warning-box strong {
+  color: var(--text-warning, #faa61a);
+  font-weight: 600;
+}
+
+.pdf-translate-warning-box code {
+  background: var(--background-primary);
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-family: var(--font-monospace, 'SF Mono', 'Fira Code', monospace);
+  font-size: 11px;
+  border: 1px solid var(--background-modifier-border);
+}
+
+/* ═══ Level badge (shown next to advanced-only settings) ═══ */
+.pdf-translate-level-badge {
+  display: inline-block;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+  padding: 1px 6px;
+  border-radius: 8px;
+  background: var(--background-modifier-border);
+  color: var(--text-muted);
+  margin-left: 6px;
+  vertical-align: middle;
+}
+
+.pdf-translate-level-badge.advanced {
+  background: var(--text-warning-bg, rgba(250, 166, 26, 0.15));
+  color: var(--text-warning, #faa61a);
+}
+
+/* ═══ Page header for settings tab ═══ */
+.pdf-translate-settings-header {
+  margin-bottom: 20px;
+}
+
+.pdf-translate-settings-header h2 {
+  font-size: 20px;
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+
+.pdf-translate-settings-header p {
+  font-size: 13px;
+  color: var(--text-muted);
+}
+
+/* ═══ Collapsible <details> (Phase 5 N7: Advanced OCR section) ═══ */
+/* Native <details>/<summary> styling tweaked to match the surrounding
+   .setting-item cards inside a .pdf-translate-section-group. */
+.pdf-translate-section-group details {
+  margin: 12px 0 4px;
+  padding: 0;
+  border-top: 1px solid var(--background-modifier-border);
+}
+
+.pdf-translate-section-group details > summary {
+  cursor: pointer;
+  padding: 10px 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  user-select: none;
+  list-style: none;
+  /* Hide the default disclosure triangle; we draw our own via ::marker
+     fallback so the visual stays consistent across Obsidian themes. */
+}
+
+.pdf-translate-section-group details > summary::-webkit-details-marker {
+  display: none;
+}
+
+.pdf-translate-section-group details > summary::before {
+  content: '▸';
+  display: inline-block;
+  margin-right: 6px;
+  font-size: 11px;
+  color: var(--text-muted);
+  transition: transform 0.15s ease;
+}
+
+.pdf-translate-section-group details[open] > summary::before {
+  transform: rotate(90deg);
+}
+
+.pdf-translate-section-group details > summary:hover {
+  color: var(--text-normal);
+}
+
+/* ── Reflow overlay rules (was overlay-ui.ts::ensureGlobalStyles) ── */
+
+.pdf-text-overlay-reflow {
+    transition: box-shadow 0.2s ease, transform 0.1s ease, width 0.1s ease, height 0.1s ease;
+    -webkit-overflow-scrolling: touch;
+
+    /* FIX: flex-start instead of center — center causes downward shift when line-height > 1.0 */
+    display: flex;
+    flex-direction: column;
+    justify-content: flex-start;
+    align-items: flex-start;
+
+    /* Hide scrollbars (merged — was split into two rules before) */
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+}
+
+.pdf-text-overlay-reflow::-webkit-scrollbar {
+    display: none;
+}
+
+/* Short phrases / headings: top-align so the first line is never clipped */
+.pdf-text-overlay-reflow.force-top-align {
+    justify-content: flex-start !important;
+}
+
+/* Scrollable fallback: switch to block so overflow:auto works correctly */
+.pdf-text-overlay-reflow.is-scrollable {
+    justify-content: flex-start !important;
+    display: block !important;
+    overflow: auto !important;
+}
+
+/* Hover: raise z-index and allow auto-scroll — NOT overflow:visible,
+   which would bleed text over neighbouring overlays. */
+.pdf-text-overlay-reflow:hover {
+    box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06) !important;
+    z-index: 1000 !important;
+    overflow: auto !important;
+}
+
+.pdf-text-overlay-reflow.bbox-selected {
+    /* Phase 17 (C19): use Obsidian interactive-accent CSS
+       variable so the selection outline respects the user
+       theme (light/dark/custom) instead of hardcoding the
+       old #1d7afc blue. The box-shadow uses color-mix to
+       produce a 25%-opacity accent halo, equivalent to the
+       old rgba(29,122,252,0.25) but theme-aware. */
+    outline: 2px solid var(--interactive-accent) !important;
+    outline-offset: -1px;
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--interactive-accent) 25%, transparent) !important;
+}
+
+/* ── Layout parser debug visualization (was layout-parser-debug.ts::ensureStyles) ── */
+
+.pdf-layout-parser-debug-layer {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 100%;
+    height: 100%;
+    pointer-events: none;
+    z-index: 220;
+}
+.pdf-layout-parser-debug-paragraph {
+    position: absolute;
+    box-sizing: border-box;
+    border: 1px solid rgba(37, 190, 122, 0.98);
+    background: rgba(37, 190, 122, 0.10);
+}
+.pdf-layout-parser-debug-column {
+    position: absolute;
+    box-sizing: border-box;
+    border: 1px solid rgba(53, 130, 246, 0.96);
+    background: rgba(53, 130, 246, 0.07);
+}
+.pdf-layout-parser-debug-gap {
+    position: absolute;
+    box-sizing: border-box;
+    border: 1px dashed rgba(255, 78, 78, 0.98);
+    background: rgba(255, 78, 78, 0.12);
+}
+.pdf-layout-parser-debug-vgap-line {
+    position: absolute;
+    top: 0;
+    width: 0;
+    height: 100%;
+    border-left: 2px solid rgba(255, 177, 31, 0.96);
+}
+.pdf-layout-parser-debug-manual {
+    position: absolute;
+    box-sizing: border-box;
+    border: 2px solid rgba(255, 221, 87, 0.98);
+    background: rgba(255, 221, 87, 0.15);
+}
+.pdf-layout-parser-debug-legend {
+    position: absolute;
+    left: 8px;
+    top: 8px;
+    padding: 6px 8px;
+    background: rgba(0, 0, 0, 0.74);
+    color: #ffffff;
+    font-size: 11px;
+    line-height: 1.35;
+    border-radius: 4px;
+    font-family: Menlo, Consolas, monospace;
+}
+.pdf-layout-parser-debug-legend .i {
+    display: inline-block;
+    width: 10px;
+    height: 10px;
+    margin-right: 6px;
+    vertical-align: -1px;
+}
+.pdf-layout-parser-debug-legend .i.p { background: rgba(37, 190, 122, 0.9); }
+.pdf-layout-parser-debug-legend .i.c { background: rgba(53, 130, 246, 0.9); }
+.pdf-layout-parser-debug-legend .i.g { background: rgba(255, 78, 78, 0.9); }
+.pdf-layout-parser-debug-legend .i.v { background: rgba(255, 177, 31, 0.9); }
+.pdf-layout-parser-debug-legend .i.m { background: rgba(255, 221, 87, 0.9); }
+.pdf-layout-parser-debug-ghost {
+    position: fixed;
+    box-sizing: border-box;
+    pointer-events: none;
+    z-index: 100000;
+    border: 2px dashed rgba(255, 221, 87, 0.98);
+    background: rgba(255, 221, 87, 0.14);
+}
+
+/* ── Retranslate modal helper (was modal-retranslate.ts) ── */
+
+.is-hidden { display: none !important; }
+.modal .setting-item.is-hidden { display: none !important; }
+

@@ -25,12 +25,12 @@ const ROOT = __dirname;
 
 let failures = 0;
 function check(name: string, cond: boolean): void {
-    console.log(`${cond ? '  PASS' : '  FAIL'}  ${name}`);
+    console.debug(`${cond ? '  PASS' : '  FAIL'}  ${name}`);
     if (!cond) failures++;
 }
 
 async function main(): Promise<void> {
-    console.log('\n── E2E: bundled pdf.js extraction pipeline ───────────────');
+    console.debug('\n── E2E: bundled pdf.js extraction pipeline ───────────────');
 
     const pdfPath = path.join(ROOT, 'test.pdf');
     if (!fs.existsSync(pdfPath)) {
@@ -81,7 +81,7 @@ async function main(): Promise<void> {
         !!rel && rel.left >= 0 && rel.left <= 1 && rel.top >= 0 && rel.top <= 1 &&
         rel.width > 0 && rel.width <= 1 && rel.height > 0 && rel.height <= 1);
 
-    console.log(failures === 0 ? '\nRESULT: E2E PASSED' : `\nRESULT: E2E FAILED (${failures} check(s))`);
+    console.debug(failures === 0 ? '\nRESULT: E2E PASSED' : `\nRESULT: E2E FAILED (${failures} check(s))`);
     process.exit(failures === 0 ? 0 : 1);
 }
 

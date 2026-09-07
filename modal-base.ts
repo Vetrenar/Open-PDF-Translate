@@ -61,7 +61,7 @@ export abstract class SingletonModal<T extends SingletonModal<T>> extends Modal 
                 // approximation. If the existing instance is closing,
                 // we fall through and open the new one.
                 try {
-                    existing.modalEl.style.zIndex = '101';
+                    existing.modalEl.setCssStyles({ zIndex: '101' });
                     return;
                 } catch {
                     // fall through — existing instance is in a bad state,

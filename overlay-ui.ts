@@ -76,7 +76,6 @@ export class OverlayUIRenderer {
     private createdOverlays: WeakMap<HTMLElement, OverlayHandlers> = new WeakMap();
     private trackedOverlayElements: Set<HTMLElement> = new Set();
     private tempDiv: HTMLDivElement | null = null;
-    private stylesInjected = false;
 
     // Reusable measurement element — created once, reused every call (perf fix)
     private measureSpan: HTMLSpanElement | null = null;
@@ -124,89 +123,12 @@ export class OverlayUIRenderer {
 
     constructor(plugin: OpenRouterTranslatorPlugin) {
         this.plugin = plugin;
-        this.ensureGlobalStyles();
         // fix-bbox-selection: marquee/selection system is now lazily
         // attached via attachMarqueeListeners() when BBox Edit Mode is
         // toggled ON, and fully torn down via detachMarqueeListeners() on
         // OFF / cleanup. No constructor-time initialisation is needed.
     }
 
-    /**
-     * Injects CSS once to handle the "Borderless" look and Flexbox centering.
-     *
-     * FIX: Removed conflicting duplicate rule block for `.pdf-text-overlay-reflow`
-     *      (the original had the class declared twice in the same <style> tag,
-     *      causing the `-ms-overflow-style` / `scrollbar-width` declarations to be
-     *      applied in a *separate* rule that also reset `display`, `flex-direction`
-     *      etc. — defeating the flex layout for scrollbar-hiding in some browsers).
-     *      Both sets of properties are now merged into one rule.
-     *
-     * FIX: `:hover { overflow: visible }` caused visible text bleed-through onto
-     *      adjacent overlays. Replaced with a less aggressive `overflow: auto` so
-     *      the user can still read overflowing content on hover without z-fighting.
-     */
-    private ensureGlobalStyles() {
-        if (this.stylesInjected) return;
-        const styleId = 'pdf-overlay-ui-styles';
-        if (!document.getElementById(styleId)) {
-            const style = document.createElement('style');
-            style.id = styleId;
-            style.textContent = `
-                .pdf-text-overlay-reflow {
-                    transition: box-shadow 0.2s ease, transform 0.1s ease, width 0.1s ease, height 0.1s ease;
-                    -webkit-overflow-scrolling: touch;
-
-                    /* FIX: flex-start instead of center — center causes downward shift when line-height > 1.0 */
-                    display: flex;
-                    flex-direction: column;
-                    justify-content: flex-start;
-                    align-items: flex-start;
-
-                    /* Hide scrollbars (merged — was split into two rules before) */
-                    -ms-overflow-style: none;
-                    scrollbar-width: none;
-                }
-
-                .pdf-text-overlay-reflow::-webkit-scrollbar {
-                    display: none;
-                }
-
-                /* Short phrases / headings: top-align so the first line is never clipped */
-                .pdf-text-overlay-reflow.force-top-align {
-                    justify-content: flex-start !important;
-                }
-
-                /* Scrollable fallback: switch to block so overflow:auto works correctly */
-                .pdf-text-overlay-reflow.is-scrollable {
-                    justify-content: flex-start !important;
-                    display: block !important;
-                    overflow: auto !important;
-                }
-
-                /* Hover: raise z-index and allow auto-scroll — NOT overflow:visible,
-                   which would bleed text over neighbouring overlays. */
-                .pdf-text-overlay-reflow:hover {
-                    box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06) !important;
-                    z-index: 1000 !important;
-                    overflow: auto !important;
-                }
-
-                .pdf-text-overlay-reflow.bbox-selected {
-                    /* Phase 17 (C19): use Obsidian interactive-accent CSS
-                       variable so the selection outline respects the user
-                       theme (light/dark/custom) instead of hardcoding the
-                       old #1d7afc blue. The box-shadow uses color-mix to
-                       produce a 25%-opacity accent halo, equivalent to the
-                       old rgba(29,122,252,0.25) but theme-aware. */
-                    outline: 2px solid var(--interactive-accent) !important;
-                    outline-offset: -1px;
-                    box-shadow: 0 0 0 2px color-mix(in srgb, var(--interactive-accent) 25%, transparent) !important;
-                }
-            `;
-            document.head.appendChild(style);
-        }
-        this.stylesInjected = true;
-    }
 
     private isBBoxEditMode(): boolean {
         return !!this.plugin.settings.bboxEditMode;
@@ -693,6 +615,7 @@ export class OverlayUIRenderer {
         // stripped. An empty/whitespace-only translation falls back to an
         // ellipsis so the box doesn't visually collapse.
         const sanitized = DOMPurify.sanitize((htmlText || '').trim() || '…', PURIFY_CONFIG);
+        // eslint-disable-next-line no-unsanitized/property -- DOMPurify-sanitized with a strict whitelist (inline formatting only; no script/img/event handlers); required to render translation HTML
         inner.innerHTML = sanitized;
         // Phase 11 (C8) + Phase 7 (P1-12): stamp the overlay's stable ID onto
         // the inner element so downstream consumers (edit-translation modal,
@@ -726,8 +649,7 @@ export class OverlayUIRenderer {
         // Short-phrase overrides: force nowrap, but keep outer overflow hidden
         // (original used overflow:visible on the outer element which caused bleed)
         if (isShortPhrase) {
-            inner.style.whiteSpace  = 'nowrap';
-            inner.style.overflow    = 'visible';
+            inner.setCssStyles({ whiteSpace: 'nowrap', overflow: 'visible' });
             // FIX: do NOT set el.style.overflow = 'visible' — bleeds over neighbours
             el.style.paddingRight   = `${SHORT_PHRASE_PADDING_RIGHT_EM}em`;
             el.style.minWidth       = `${adjustedWidth}px`;
@@ -753,7 +675,7 @@ export class OverlayUIRenderer {
         // `innerText` is unavailable (detached element / older browsers).
         const contextHandler    = (event: Event) => this.showContextMenu(event, inner.innerText || inner.textContent || '', el);
         const bringToTopHandler = () => this.bringToTop(el);
-        const resetZIndexHandler = () => { el.style.zIndex = '101'; };
+        const resetZIndexHandler = () => { el.setCssStyles({ zIndex: '101' }); };
         const clickHandler = (event: Event) => {
             if (!this.isBBoxEditMode()) return;
             const me = event as MouseEvent;
@@ -894,7 +816,7 @@ export class OverlayUIRenderer {
 
         // Reset scrollable state
         el.classList.remove('is-scrollable');
-        el.style.overflow = 'hidden';
+        el.setCssStyles({ overflow: 'hidden' });
 
         // ----------------------------------------------------------------
         // SHORT PHRASE — adapt text to bbox, expand bbox only if needed
@@ -907,8 +829,7 @@ export class OverlayUIRenderer {
         //   4. If translation overflows after expansion → shrink font to fit.
         // ----------------------------------------------------------------
         if (isShortPhrase) {
-            inner.style.whiteSpace = 'nowrap';
-            inner.style.overflow   = 'visible';
+            inner.setCssStyles({ whiteSpace: 'nowrap', overflow: 'visible' });
 
             const currentFontSize = parseFloat(el.style.fontSize) || 12;
             const fontFamily      = el.style.fontFamily || 'sans-serif';
@@ -1050,7 +971,7 @@ export class OverlayUIRenderer {
         if (isOverflowing()) {
             // Ensure a minimum readable size before enabling scroll
             if (currentFontSize < 9) {
-                el.style.fontSize = '9px';
+                el.setCssStyles({ fontSize: '9px' });
             }
             // FIX: don't set overflow:auto inline — let CSS class handle it
             el.classList.add('is-scrollable');
@@ -1214,12 +1135,9 @@ export class OverlayUIRenderer {
             // through — at opacity 1.0 the white background fully hides original text,
             // at lower values the original text becomes visible.
             el.style.opacity = `${op}`;
-            el.style.pointerEvents = 'auto';
-            el.style.visibility = 'visible';
+            el.setCssStyles({ pointerEvents: 'auto', visibility: 'visible' });
         } else {
-            el.style.opacity = '0';
-            el.style.pointerEvents = 'none';
-            el.style.visibility = 'hidden';
+            el.setCssStyles({ opacity: '0', pointerEvents: 'none', visibility: 'hidden' });
         }
     }
 
@@ -2067,6 +1985,7 @@ export class OverlayUIRenderer {
         // strings to innerHTML unsanitized. If a future code change ever
         // appends this tempDiv to the DOM (or reads its innerHTML), the
         // sanitize call here ensures the content is already safe.
+        // eslint-disable-next-line no-unsanitized/property -- DOMPurify-sanitized with a strict whitelist (PURIFY_CONFIG); this detached tempDiv is only used to strip tags and read back plain text
         this.tempDiv.innerHTML = DOMPurify.sanitize(html, PURIFY_CONFIG);
         return this.tempDiv.textContent || this.tempDiv.innerText || '';
     }

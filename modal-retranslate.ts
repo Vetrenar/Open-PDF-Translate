@@ -149,13 +149,6 @@ export class RetranslateUsingOverlaysModal extends SingletonModal<RetranslateUsi
           });
       });
 
-    // Small helper style
-    const style = document.createElement('style');
-    style.textContent = `
-      .is-hidden { display: none !important; }
-      .modal .setting-item.is-hidden { display: none !important; }
-    `;
-    contentEl.appendChild(style);
   }
 
   onClose(): void {

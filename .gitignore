@@ -1,0 +1,26 @@
+# vscode
+.vscode
+
+# Intellij
+*.iml
+.idea
+
+# npm
+node_modules
+
+# Build artifacts.
+# NOTE (deviation from obsidian-sample-plugin): main.js is intentionally NOT
+# ignored — this repo is developed directly inside the vault and has no
+# GitHub Releases flow, so the built main.js stays part of the repo.
+*.map
+test-runtime-bundle.cjs
+test-e2e-bundle.cjs
+
+# logs
+*.log
+
+# obsidian — plugin settings are not source
+data.json
+
+# macOS
+.DS_Store

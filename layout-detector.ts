@@ -181,8 +181,7 @@ export class LayoutDetector {
 
     if (settings.debugValidation) {
       const elapsed = (typeof performance !== 'undefined' ? performance.now() : Date.now()) - start;
-      // eslint-disable-next-line no-console
-      console.log('[LayoutDetector Pipeline]', {
+      console.debug('[LayoutDetector Pipeline]', {
         spans: spans.length,
         paragraphs: result.length,
         cellSize,

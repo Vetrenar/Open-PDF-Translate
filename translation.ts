@@ -289,10 +289,10 @@ Do NOT translate the [#N] markers. Maintain the list structure. No extra comment
 
                 // DIAGNOSTIC: Log the full response if debug mode is enabled
                 if (this.plugin.settings.debugMode) {
-                    console.log('=== API RESPONSE DEBUG ===');
-                    console.log('Status:', response.status);
-                    console.log('Response:', JSON.stringify(response.json, null, 2));
-                    console.log('==========================');
+                    console.debug('=== API RESPONSE DEBUG ===');
+                    console.debug('Status:', response.status);
+                    console.debug('Response:', JSON.stringify(response.json, null, 2));
+                    console.debug('==========================');
                 }
 
                 if (response.status === 200) {
@@ -411,7 +411,7 @@ Do NOT translate the [#N] markers. Maintain the list structure. No extra comment
                         delay = BASE_DELAY * Math.pow(2, attempt - 1) + Math.random() * 500;
                     }
                     delay = Math.min(delay, 300000); // Cap at 5 min (P2-31)
-                    console.log(`Rate limit hit. Retrying in ${delay}ms...`);
+                    console.debug(`Rate limit hit. Retrying in ${delay}ms...`);
                     await this.sleep(delay);
                     continue;
                 }
@@ -475,7 +475,7 @@ Do NOT translate the [#N] markers. Maintain the list structure. No extra comment
                 // FIX H6: add jitter (0-500ms) to prevent retry storms when multiple
                 // requests fail simultaneously (e.g., network blip affecting 10 pages).
                 const delay = BASE_DELAY * Math.pow(2, attempt - 1) + Math.random() * 500;
-                console.log(`Attempt ${attempt} failed, retrying in ${delay}ms...`, err);
+                console.debug(`Attempt ${attempt} failed, retrying in ${delay}ms...`, err);
                 await this.sleep(delay);
             }
         }

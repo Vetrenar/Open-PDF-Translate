@@ -327,7 +327,7 @@ export class PdfExportService {
         commitBlock();
 
         const total = Object.values(exportData).reduce((n, a) => n + a.length, 0);
-        console.log(`[PDF Export] Parsed ${total} overlay(s) across ${Object.keys(exportData).length} page(s).`);
+        console.debug(`[PDF Export] Parsed ${total} overlay(s) across ${Object.keys(exportData).length} page(s).`);
 
         return exportData;
     }
@@ -369,7 +369,7 @@ export class PdfExportService {
                 return reject(new Error(`Failed to write temp JSON: ${err.message}`));
             }
 
-            console.log(`[PDF Export] Spawning: ${pythonCmd} "${this.scriptPath}"`);
+            console.debug(`[PDF Export] Spawning: ${pythonCmd} "${this.scriptPath}"`);
 
             // Phase 4 (C1): `process.env` is a Node-only global — on non-
             // desktop / sandboxed renderer contexts it may be undefined.
@@ -398,7 +398,7 @@ export class PdfExportService {
             child.on('close', (code: number) => {
                 this.tryDeleteTemp(tempFile);
 
-                if (stdout) console.log('[PDF Export] stdout:\n' + stdout);
+                if (stdout) console.debug('[PDF Export] stdout:\n' + stdout);
                 if (stderr) console.warn('[PDF Export] stderr:\n' + stderr);
 
                 if (code === 0) {

@@ -171,19 +171,19 @@ export class PdfWatcher {
         if (queueItem) {
             this.queue.delete(pdfPath);
             this.notifyChange();
-            console.log(`[PdfWatcher] Removed deleted PDF from queue: ${pdfPath}`);
+            console.debug(`[PdfWatcher] Removed deleted PDF from queue: ${pdfPath}`);
         }
 
         // Clear pdfToMdMap entry
         if (this.plugin.pdfToMdMap.has(pdfPath)) {
             this.plugin.pdfToMdMap.delete(pdfPath);
-            console.log(`[PdfWatcher] Cleared pdfToMdMap entry for deleted PDF: ${pdfPath}`);
+            console.debug(`[PdfWatcher] Cleared pdfToMdMap entry for deleted PDF: ${pdfPath}`);
         }
 
         // Cancel in-flight headless translation if it's for this file
         if (this.current && this.currentFilePath === pdfPath) {
             this.current.cancel();
-            console.log(`[PdfWatcher] Cancelled in-flight translation for deleted PDF: ${pdfPath}`);
+            console.debug(`[PdfWatcher] Cancelled in-flight translation for deleted PDF: ${pdfPath}`);
         }
 
         // P2-22 (Phase 11): clear PdfLayoutQueue state for the deleted file so
@@ -578,7 +578,7 @@ export class PdfWatcher {
             // full 1-hour timeout. After cancel, the watcher item should be
             // marked as done (or error) by the caller.
             if (queue.isCancelled()) {
-                console.log(`[PdfWatcher] waitForQueueCompletion: queue cancelled, stopping wait for "${file.path}".`);
+                console.debug(`[PdfWatcher] waitForQueueCompletion: queue cancelled, stopping wait for "${file.path}".`);
                 return;
             }
 
@@ -595,7 +595,7 @@ export class PdfWatcher {
                 const elapsed = Math.round((Date.now() - start) / 1000);
                 const progressMsg = `[PdfWatcher] "${file.basename}" still processing: ${done}/${total} done, ${pending} pending (${elapsed}s elapsed)`;
                 if (elapsed % 30 === 0 && progressMsg !== lastProgressMsg) {
-                    console.log(progressMsg);
+                    console.debug(progressMsg);
                     lastProgressMsg = progressMsg;
                 }
             }

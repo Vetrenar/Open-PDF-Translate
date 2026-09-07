@@ -56,7 +56,7 @@ export class FolderSuggest extends TextComponent {
         super(containerEl);
         this.app = app;
         this.setPlaceholder(t('settings.folderSuggest.placeholder'));
-        this.inputEl.style.width = '100%';
+        this.inputEl.setCssStyles({ width: '100%' });
         this.inputEl.addEventListener('input', () => { this.fireChange(); this.renderSuggestions(); });
         this.inputEl.addEventListener('focus', () => this.renderSuggestions());
         this.inputEl.addEventListener('blur', () => this.scheduleClose());
@@ -98,9 +98,9 @@ export class FolderSuggest extends TextComponent {
 
         for (const path of matches) {
             const item = drop.createDiv({ text: path });
-            item.style.cssText = 'padding:6px 10px;cursor:pointer;white-space:nowrap';
-            item.addEventListener('mouseenter', () => item.style.background = 'var(--background-modifier-hover)');
-            item.addEventListener('mouseleave', () => item.style.background = '');
+            item.setCssStyles({ padding: '6px 10px', cursor: 'pointer', whiteSpace: 'nowrap' });
+            item.addEventListener('mouseenter', () => item.setCssStyles({ background: 'var(--background-modifier-hover)' }));
+            item.addEventListener('mouseleave', () => item.setCssStyles({ background: '' }));
             // mousedown (not click) so it fires before the input's blur closes the list.
             item.addEventListener('mousedown', (e) => {
                 e.preventDefault();
@@ -248,14 +248,26 @@ export default class OpenRouterSettingsTab extends PluginSettingTab {
      */
     private renderPromptsWarning(containerEl: HTMLElement): void {
         const box = containerEl.createDiv({ cls: 'pdf-translate-warning-box' });
-        box.createEl('p', { text: t('prompts.warning.title') }).style.fontWeight = '600';
+        box.createEl('p', { text: t('prompts.warning.title') }).setCssStyles({ fontWeight: '600' });
         box.createEl('p', { text: t('prompts.warning.body') });
 
         const list = box.createEl('ul');
-        list.style.margin = '6px 0 6px 20px';
-        list.createEl('li').innerHTML = `<code>{sourceLang}</code>, <code>{targetLang}</code>, <code>{lineCount}</code>, <code>{inputText}</code> — ${t('prompts.warning.placeholders')}`;
-        list.createEl('li').innerHTML = `<code>[#N]</code> — ${t('prompts.warning.numbering')}`;
-        list.createEl('li').innerHTML = `<code>N. Translated text</code> — ${t('prompts.warning.format')}`;
+        list.setCssStyles({ margin: '6px 0 6px 20px' });
+        // Built with DOM helpers instead of innerHTML — no-unsanitized
+        // (obsidianmd recommended config) and typesafe.
+        const placeholders = ['{sourceLang}', '{targetLang}', '{lineCount}', '{inputText}'];
+        const placeholdersLi = list.createEl('li');
+        placeholders.forEach((ph, i) => {
+            placeholdersLi.createEl('code', { text: ph });
+            placeholdersLi.appendText(i < placeholders.length - 1 ? ', ' : ' — ');
+        });
+        placeholdersLi.appendText(t('prompts.warning.placeholders'));
+        const numberingLi = list.createEl('li');
+        numberingLi.createEl('code', { text: '[#N]' });
+        numberingLi.appendText(` — ${t('prompts.warning.numbering')}`);
+        const formatLi = list.createEl('li');
+        formatLi.createEl('code', { text: 'N. Translated text' });
+        formatLi.appendText(` — ${t('prompts.warning.format')}`);
 
         const consequence = box.createEl('p');
         consequence.createEl('strong', { text: t('prompts.warning.consequence') });
@@ -270,9 +282,10 @@ export default class OpenRouterSettingsTab extends PluginSettingTab {
         containerEl.empty();
 
         // ─── Page header ───
+        // (Setting().setHeading() instead of a manual <h2> — obsidianmd
+        // settings-tab/no-manual-html-headings.)
         const header = containerEl.createDiv({ cls: 'pdf-translate-settings-header' });
-        header.createEl('h2', { text: t('settings.page.title') });
-        header.createEl('p', { text: t('settings.page.desc') });
+        new Setting(header).setName(t('settings.page.title')).setDesc(t('settings.page.desc')).setHeading();
 
         // ─── Level cards (Quick / Standard / Advanced) ───
         this.renderLevelCards(containerEl);
@@ -438,7 +451,7 @@ export default class OpenRouterSettingsTab extends PluginSettingTab {
                     .setName(t('general.storage.label'))
                     .setDesc(t('general.storage.desc'))
                     .then(setting => {
-                        setting.controlEl.style.position = 'relative';
+                        setting.controlEl.setCssStyles({ position: 'relative' });
                         const folderSuggest = new FolderSuggest(this.app, setting.controlEl);
                         folderSuggest.setValue(this.plugin.settings.storageLocation);
                         folderSuggest.onChange(async (value) => {
@@ -489,54 +502,50 @@ export default class OpenRouterSettingsTab extends PluginSettingTab {
                         .setName(t('prompts.special.template.label'))
                         .setDesc(t('prompts.special.template.desc'))
                         .then(setting => {
-                            setting.controlEl.style.flexDirection = 'column';
-                            setting.controlEl.style.alignItems = 'flex-end';
+                            setting.controlEl.setCssStyles({ flexDirection: 'column', alignItems: 'flex-end' });
                             const textarea = new TextAreaComponent(setting.controlEl)
                                 .setValue(this.plugin.settings.customTemplate || DEFAULT_CUSTOM_TEMPLATE)
                                 .onChange(async v => { this.plugin.settings.customTemplate = v; await this.plugin.saveSettings(); });
-                            textarea.inputEl.style.width = '100%';
+                            textarea.inputEl.setCssStyles({ width: '100%' });
                             textarea.inputEl.rows = 8;
-                            textarea.inputEl.style.fontFamily = 'monospace';
-                            textarea.inputEl.style.fontSize = '12px';
+                            textarea.inputEl.setCssStyles({ fontFamily: 'monospace', fontSize: '12px' });
                             new ButtonComponent(setting.controlEl).setButtonText(t('prompts.restore')).onClick(async () => {
                                 this.plugin.settings.customTemplate = DEFAULT_CUSTOM_TEMPLATE;
                                 await this.plugin.saveSettings();
                                 textarea.setValue(DEFAULT_CUSTOM_TEMPLATE);
-                            }).buttonEl.style.marginTop = '8px';
+                            }).buttonEl.setCssStyles({ marginTop: '8px' });
                         });
                 } else {
                     new Setting(group)
                         .setName(t('prompts.batch.label'))
                         .setDesc(t('prompts.batch.desc'))
                         .then(setting => {
-                            setting.controlEl.style.flexDirection = 'column';
-                            setting.controlEl.style.alignItems = 'flex-end';
+                            setting.controlEl.setCssStyles({ flexDirection: 'column', alignItems: 'flex-end' });
                             const textarea = new TextAreaComponent(setting.controlEl)
                                 .setValue(this.plugin.settings.batchPrompt).onChange(async v => { this.plugin.settings.batchPrompt = v; await this.plugin.saveSettings(); });
-                            textarea.inputEl.style.width = '100%';
+                            textarea.inputEl.setCssStyles({ width: '100%' });
                             textarea.inputEl.rows = 8;
                             new ButtonComponent(setting.controlEl).setButtonText(t('prompts.restore')).onClick(async () => {
                                 this.plugin.settings.batchPrompt = DEFAULT_SETTINGS.batchPrompt;
                                 await this.plugin.saveSettings();
                                 textarea.setValue(DEFAULT_SETTINGS.batchPrompt);
-                            }).buttonEl.style.marginTop = '8px';
+                            }).buttonEl.setCssStyles({ marginTop: '8px' });
                         });
 
                     new Setting(group)
                         .setName(t('prompts.single.label'))
                         .setDesc(t('prompts.single.desc'))
                         .then(setting => {
-                            setting.controlEl.style.flexDirection = 'column';
-                            setting.controlEl.style.alignItems = 'flex-end';
+                            setting.controlEl.setCssStyles({ flexDirection: 'column', alignItems: 'flex-end' });
                             const textarea = new TextAreaComponent(setting.controlEl)
                                 .setValue(this.plugin.settings.singlePrompt).onChange(async v => { this.plugin.settings.singlePrompt = v; await this.plugin.saveSettings(); });
-                            textarea.inputEl.style.width = '100%';
+                            textarea.inputEl.setCssStyles({ width: '100%' });
                             textarea.inputEl.rows = 4;
                             new ButtonComponent(setting.controlEl).setButtonText(t('prompts.restore')).onClick(async () => {
                                 this.plugin.settings.singlePrompt = DEFAULT_SETTINGS.singlePrompt;
                                 await this.plugin.saveSettings();
                                 textarea.setValue(DEFAULT_SETTINGS.singlePrompt);
-                            }).buttonEl.style.marginTop = '8px';
+                            }).buttonEl.setCssStyles({ marginTop: '8px' });
                         });
                 }
             }
@@ -623,11 +632,10 @@ export default class OpenRouterSettingsTab extends PluginSettingTab {
                 // Stage 2.2 (Q6): 6 layout settings for the contour pipeline.
                 // Advanced-only — these are tuning parameters for power users.
                 if (this.shouldShow('advanced')) {
-                    group.createEl('h4', { text: t('settings.layout.advanced.heading') });
-                    group.createEl('p', {
-                        text: t('settings.layout.advanced.intro'),
-                        cls: 'setting-item-description',
-                    });
+                    // (Setting().setHeading() instead of a manual <h4> — obsidianmd
+                    // settings-tab/no-manual-html-headings.)
+                    new Setting(group).setName(t('settings.layout.advanced.heading'))
+                        .setDesc(t('settings.layout.advanced.intro')).setHeading();
 
                     const ls = this.plugin.layoutSettings;
 
@@ -734,7 +742,7 @@ export default class OpenRouterSettingsTab extends PluginSettingTab {
                     .setName(t('watcher.folder.label'))
                     .setDesc(t('watcher.folder.desc'))
                     .then(setting => {
-                        setting.controlEl.style.position = 'relative';
+                        setting.controlEl.setCssStyles({ position: 'relative' });
                         const fs = new FolderSuggest(this.app, setting.controlEl);
                         fs.setValue(this.plugin.settings.watcherFolder || '');
                         fs.onChange(async (value) => {
@@ -851,7 +859,7 @@ export default class OpenRouterSettingsTab extends PluginSettingTab {
                     .setName(t('ocr.output.folder.label'))
                     .setDesc(t('ocr.output.folder.desc'))
                     .then(setting => {
-                        setting.controlEl.style.position = 'relative';
+                        setting.controlEl.setCssStyles({ position: 'relative' });
                         const fs = new FolderSuggest(this.app, setting.controlEl);
                         fs.setValue(ocrSettings.ocrOutputFolder || '');
                         fs.onChange(async (value) => { ocrSettings.ocrOutputFolder = value.trim(); await this.plugin.saveSettings(); });
@@ -918,9 +926,7 @@ export default class OpenRouterSettingsTab extends PluginSettingTab {
                         ta.setValue(ocrSettings.ocrPromptTemplate || '')
                           .onChange(async v => { ocrSettings.ocrPromptTemplate = v; await this.plugin.saveSettings(); });
                         ta.inputEl.rows = 6;
-                        ta.inputEl.style.width = '100%';
-                        ta.inputEl.style.fontFamily = 'monospace';
-                        ta.inputEl.style.fontSize = '11px';
+                        ta.inputEl.setCssStyles({ width: '100%', fontFamily: 'monospace', fontSize: '11px' });
                     });
 
                 // ocrTextPromptTemplate textarea — transcription-only prompt (no JSON/bboxes)
@@ -931,9 +937,7 @@ export default class OpenRouterSettingsTab extends PluginSettingTab {
                         ta.setValue(ocrSettings.ocrTextPromptTemplate || '')
                           .onChange(async v => { ocrSettings.ocrTextPromptTemplate = v; await this.plugin.saveSettings(); });
                         ta.inputEl.rows = 6;
-                        ta.inputEl.style.width = '100%';
-                        ta.inputEl.style.fontFamily = 'monospace';
-                        ta.inputEl.style.fontSize = '11px';
+                        ta.inputEl.setCssStyles({ width: '100%', fontFamily: 'monospace', fontSize: '11px' });
                     });
 
                 // responseFormatInstruction textarea — extra JSON formatting hints
@@ -944,9 +948,7 @@ export default class OpenRouterSettingsTab extends PluginSettingTab {
                         ta.setValue(ocrSettings.responseFormatInstruction || '')
                           .onChange(async v => { ocrSettings.responseFormatInstruction = v; await this.plugin.saveSettings(); });
                         ta.inputEl.rows = 4;
-                        ta.inputEl.style.width = '100%';
-                        ta.inputEl.style.fontFamily = 'monospace';
-                        ta.inputEl.style.fontSize = '11px';
+                        ta.inputEl.setCssStyles({ width: '100%', fontFamily: 'monospace', fontSize: '11px' });
                     });
 
                 // ocrOutputFilenamePattern text — template for output filename
@@ -1014,7 +1016,7 @@ export default class OpenRouterSettingsTab extends PluginSettingTab {
                                 await this.plugin.saveSettings();
                             });
                             ta.inputEl.rows = 2;
-                            ta.inputEl.style.width = '100%';
+                            ta.inputEl.setCssStyles({ width: '100%' });
                         });
                 };
                 createFormatSetting(t('export.formats.callout'), 'calloutFormat');
@@ -1085,14 +1087,12 @@ export default class OpenRouterSettingsTab extends PluginSettingTab {
                     .setName(t('settings.paragraphFilter.bulkEdit.name'))
                     .setDesc(t('settings.paragraphFilter.bulkEdit.desc'))
                     .then(setting => {
-                        setting.controlEl.style.flexDirection = 'column';
-                        setting.controlEl.style.alignItems = 'flex-end';
+                        setting.controlEl.setCssStyles({ flexDirection: 'column', alignItems: 'flex-end' });
                         const ta = new TextAreaComponent(setting.controlEl);
                         ta.setValue(JSON.stringify(this.plugin.settings.paragraphFilterRules, null, 2));
-                        ta.inputEl.style.width = '100%';
+                        ta.inputEl.setCssStyles({ width: '100%' });
                         ta.inputEl.rows = 6;
-                        ta.inputEl.style.fontFamily = 'monospace';
-                        ta.inputEl.style.fontSize = '11px';
+                        ta.inputEl.setCssStyles({ fontFamily: 'monospace', fontSize: '11px' });
                         ta.onChange(async v => {
                             try {
                                 const parsed = JSON.parse(v);
@@ -1156,7 +1156,7 @@ export default class OpenRouterSettingsTab extends PluginSettingTab {
                 if (models.length > 0) {
                     ps.model = models[0].id;
                     await this.plugin.saveSettings();
-                    console.info(`vLLM: auto-selected model "${ps.model}" from ${endpoint}/models`);
+                    console.debug(`vLLM: auto-selected model "${ps.model}" from ${endpoint}/models`);
                 }
             } catch (e) {
                 console.warn('Failed to auto-fetch vLLM models:', e);

@@ -336,7 +336,7 @@ export class TextProcessor {
       this.clearLayoutDebugOverlay(pageElement);
     }
     if (this.plugin.settings.debugMode) {
-      console.log(`PDF Translator: DOM pipeline → ${result.paragraphs.length} paragraph(s).`);
+      console.debug(`PDF Translator: DOM pipeline → ${result.paragraphs.length} paragraph(s).`);
     }
     this.clearCaches();
 
@@ -446,7 +446,7 @@ export class TextProcessor {
           skippedIndices = skipped;
           translatableUnits = translatable.map(i => units[i]);
           if (this.plugin.settings.debugMode) {
-            console.log(`[ParagraphFilter] ${skipped.size}/${units.length} paragraphs filtered (not sent to LLM):`,
+            console.debug(`[ParagraphFilter] ${skipped.size}/${units.length} paragraphs filtered (not sent to LLM):`,
               [...skipped.entries()].map(([i, name]) => `#${i + 1} (${name}): "${units[i].text.substring(0, 30)}"`));
           }
         }
@@ -480,8 +480,8 @@ export class TextProcessor {
       } else if (useBatch && translatableUnits.length > 1) {
         const raw = await this.plugin.translation.translateBatch(fullText, translatableUnits.length);
         if (this.plugin.settings.debugMode) {
-          console.log(`[Batch Input]:\n${fullText}`);
-          console.log(`[Batch Raw Output]:\n${raw}`);
+          console.debug(`[Batch Input]:\n${fullText}`);
+          console.debug(`[Batch Raw Output]:\n${raw}`);
         }
         translatedLines = await this.extractNumberedLinesRobust(raw, translatableUnits.length, translatableUnits.map(u => u.text));
       } else {
@@ -708,11 +708,11 @@ export class TextProcessor {
       try {
         const chunkText = chunk.map((t, j) => `[#${j + 1}] ${t}`).join('\n');
         if (this.plugin.settings.debugMode) {
-          console.log(`[Chunk ${i + 1}/${finalChunks.length} Input]:\n${chunkText.substring(0, 200)}...`);
+          console.debug(`[Chunk ${i + 1}/${finalChunks.length} Input]:\n${chunkText.substring(0, 200)}...`);
         }
         const raw = await this.plugin.translation.translateBatch(chunkText, chunk.length);
         if (this.plugin.settings.debugMode) {
-          console.log(`[Chunk ${i + 1}/${finalChunks.length} Raw Output]:\n${raw?.substring(0, 200) || '(empty)'}`);
+          console.debug(`[Chunk ${i + 1}/${finalChunks.length} Raw Output]:\n${raw?.substring(0, 200) || '(empty)'}`);
         }
         const lines = await this.extractNumberedLinesRobust(raw, chunk.length, chunk);
         allTranslated.push(...lines);
@@ -1018,8 +1018,8 @@ export class TextProcessor {
         .trim();
       const orig = units[i]?.text || '';
       // Preserve leading numbering/bullets that may have been stripped
-      const origLead = orig.match(/^\s*(\d+[\.\)]\s*|[-•*]\s*|#\s*)/);
-      if (origLead && !cleaned.match(/^\s*(\d+[\.\)]\s*|[-•*]\s*|#\s*)/)) {
+      const origLead = orig.match(/^\s*(\d+[.)]\s*|[-•*]\s*|#\s*)/);
+      if (origLead && !cleaned.match(/^\s*(\d+[.)]\s*|[-•*]\s*|#\s*)/)) {
         return origLead[1] + cleaned;
       }
       return cleaned;

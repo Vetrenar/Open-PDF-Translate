@@ -86431,7 +86431,7 @@ var _SingletonModal = class _SingletonModal extends import_obsidian2.Modal {
     if (existing && existing !== this) {
       if (this.reopenBehavior() === "focus") {
         try {
-          existing.modalEl.style.zIndex = "101";
+          existing.modalEl.setCssStyles({ zIndex: "101" });
           return;
         } catch (e) {
         }
@@ -86492,9 +86492,9 @@ var WatcherQueueModal = class extends SingletonModal {
       });
     });
     const btnContainer = this.contentEl.createDiv();
-    btnContainer.style.cssText = "display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0;";
+    btnContainer.setCssStyles({ display: "flex", flexWrap: "wrap", gap: "6px", margin: "8px 0" });
     const scanBtn = btnContainer.createEl("button", { text: t("watcher.queue.btn.scan") });
-    scanBtn.style.cssText = "padding: 4px 10px; font-size: 0.85em;";
+    scanBtn.setCssStyles({ padding: "4px 10px", fontSize: "0.85em" });
     scanBtn.onclick = async () => {
       const n = await watcher.scanExisting();
       this.render();
@@ -86502,19 +86502,19 @@ var WatcherQueueModal = class extends SingletonModal {
         this.flash(t("modal.watcher.scan.none"));
     };
     const scanAllBtn = btnContainer.createEl("button", { text: t("modal.watcher.scanAll") });
-    scanAllBtn.style.cssText = "padding: 4px 10px; font-size: 0.85em;";
+    scanAllBtn.setCssStyles({ padding: "4px 10px", fontSize: "0.85em" });
     scanAllBtn.onclick = async () => {
       const n = await watcher.scanAllUntranslated();
       this.render();
       new import_obsidian3.Notice(n > 0 ? t("modal.watcher.scan.found", { n: String(n) }) : t("modal.watcher.scan.none"), 4e3);
     };
     const runAllBtn = btnContainer.createEl("button", { text: t("modal.watcher.btn.runall") });
-    runAllBtn.style.cssText = "padding: 4px 10px; font-size: 0.85em; font-weight: bold;";
+    runAllBtn.setCssStyles({ padding: "4px 10px", fontSize: "0.85em", fontWeight: "bold" });
     runAllBtn.onclick = async () => {
       await watcher.runAllPending();
     };
     const clearBtn = btnContainer.createEl("button", { text: t("modal.watcher.clearFinished") });
-    clearBtn.style.cssText = "padding: 4px 10px; font-size: 0.85em;";
+    clearBtn.setCssStyles({ padding: "4px 10px", fontSize: "0.85em" });
     clearBtn.onclick = () => {
       let cleared = 0;
       for (const item of this.plugin.watcher.getQueue()) {
@@ -86534,7 +86534,13 @@ var WatcherQueueModal = class extends SingletonModal {
       }
     });
     const hint = this.contentEl.createDiv();
-    hint.style.cssText = "font-size: 0.8em; color: var(--text-muted); margin: 6px 0; padding: 4px 8px; border-left: 2px solid var(--background-modifier-border);";
+    hint.setCssStyles({
+      fontSize: "0.8em",
+      color: "var(--text-muted)",
+      margin: "6px 0",
+      padding: "4px 8px",
+      borderLeft: "2px solid var(--background-modifier-border)"
+    });
     hint.setText(t("modal.watcher.hint"));
     this.listEl = this.contentEl.createDiv();
     watcher.setOnChange(() => this.render());
@@ -86568,24 +86574,42 @@ var WatcherQueueModal = class extends SingletonModal {
     const availableItems = items.filter((i) => i.status !== "running");
     if (activeItems.length > 0) {
       const activeSection = el.createDiv();
-      activeSection.style.cssText = "margin-bottom: 16px;";
+      activeSection.setCssStyles({ marginBottom: "16px" });
       const activeHeader = activeSection.createDiv();
-      activeHeader.style.cssText = "font-weight: 600; font-size: 0.8em; text-transform: uppercase; letter-spacing: 1px; color: var(--interactive-accent); margin-bottom: 8px;";
+      activeHeader.setCssStyles({
+        fontWeight: "600",
+        fontSize: "0.8em",
+        textTransform: "uppercase",
+        letterSpacing: "1px",
+        color: "var(--interactive-accent)",
+        marginBottom: "8px"
+      });
       activeHeader.setText(`\u25B8 ${t("modal.watcher.activeTranslations")} (${activeItems.length})`);
       const activeList = activeSection.createDiv();
-      activeList.style.cssText = "max-height: 200px; overflow-y: auto; border: 1px solid var(--interactive-accent); border-radius: 8px; padding: 10px; background: color-mix(in srgb, var(--interactive-accent) 5%, transparent);";
+      activeList.setCssStyles({
+        maxHeight: "200px",
+        overflowY: "auto",
+        border: "1px solid var(--interactive-accent)",
+        borderRadius: "8px",
+        padding: "10px",
+        background: "color-mix(in srgb, var(--interactive-accent) 5%, transparent)"
+      });
       for (const item of activeItems) {
         const file = this.plugin.app.vault.getAbstractFileByPath(item.path);
         const card = activeList.createDiv();
-        card.style.cssText = "margin-bottom: 10px; padding-bottom: 10px; " + (activeItems.indexOf(item) < activeItems.length - 1 ? "border-bottom: 1px solid var(--background-modifier-border);" : "");
+        card.setCssStyles({
+          marginBottom: "10px",
+          paddingBottom: "10px",
+          borderBottom: activeItems.indexOf(item) < activeItems.length - 1 ? "1px solid var(--background-modifier-border)" : "none"
+        });
         const titleRow = card.createDiv();
-        titleRow.style.cssText = "display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;";
+        titleRow.setCssStyles({ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "4px" });
         titleRow.createEl("span", {
           text: item.name,
           attr: { style: "font-weight: 600; font-size: 0.9em;" }
         });
         const cancelBtn = titleRow.createEl("button", { text: t("modal.watcher.btn.cancel") });
-        cancelBtn.style.cssText = "font-size: 0.8em; padding: 2px 10px;";
+        cancelBtn.setCssStyles({ fontSize: "0.8em", padding: "2px 10px" });
         cancelBtn.onclick = () => {
           this.plugin.watcher.cancelRunning();
           new import_obsidian3.Notice(t("modal.watcher.cancelling"), 3e3);
@@ -86601,10 +86625,21 @@ var WatcherQueueModal = class extends SingletonModal {
     if (availableItems.length > 0) {
       const availSection = el.createDiv();
       const availHeader = availSection.createDiv();
-      availHeader.style.cssText = "font-weight: 600; font-size: 0.8em; text-transform: uppercase; letter-spacing: 1px; color: var(--text-muted); margin-bottom: 8px;";
+      availHeader.setCssStyles({
+        fontWeight: "600",
+        fontSize: "0.8em",
+        textTransform: "uppercase",
+        letterSpacing: "1px",
+        color: "var(--text-muted)",
+        marginBottom: "8px"
+      });
       availHeader.setText(`\u25B8 ${t("modal.watcher.availableFiles")} (${availableItems.length})`);
       const availList = availSection.createDiv();
-      availList.style.cssText = "border: 1px solid var(--background-modifier-border); border-radius: 8px; padding: 4px;";
+      availList.setCssStyles({
+        border: "1px solid var(--background-modifier-border)",
+        borderRadius: "8px",
+        padding: "4px"
+      });
       for (const item of availableItems) {
         const file = this.plugin.app.vault.getAbstractFileByPath(item.path);
         let fileInfo = "";
@@ -86614,12 +86649,19 @@ var WatcherQueueModal = class extends SingletonModal {
           fileInfo = ` \xB7 ${sizeStr}`;
         }
         const row = availList.createDiv();
-        row.style.cssText = "display: flex; justify-content: space-between; align-items: center; padding: 6px 8px; font-size: 0.85em; border-bottom: 1px solid var(--background-modifier-border);";
+        row.setCssStyles({
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "center",
+          padding: "6px 8px",
+          fontSize: "0.85em",
+          borderBottom: "1px solid var(--background-modifier-border)"
+        });
         if (availableItems.indexOf(item) === availableItems.length - 1) {
-          row.style.borderBottom = "none";
+          row.setCssStyles({ borderBottom: "none" });
         }
         const leftDiv = row.createDiv();
-        leftDiv.style.cssText = "flex: 1; min-width: 0; margin-right: 8px;";
+        leftDiv.setCssStyles({ flex: "1", minWidth: "0", marginRight: "8px" });
         leftDiv.createEl("span", {
           text: item.name,
           attr: { style: "font-weight: 500; word-break: break-word;" }
@@ -86629,10 +86671,10 @@ var WatcherQueueModal = class extends SingletonModal {
           attr: { style: "color: var(--text-muted); font-size: 0.9em; word-break: break-word;" }
         });
         const rightDiv = row.createDiv();
-        rightDiv.style.cssText = "display: flex; gap: 4px; flex-shrink: 0; margin-left: 8px;";
+        rightDiv.setCssStyles({ display: "flex", gap: "4px", flexShrink: "0", marginLeft: "8px" });
         if (item.status === "done" || item.status === "skipped") {
           const btn = rightDiv.createEl("button", { text: t("modal.watcher.btn.retranslate") });
-          btn.style.cssText = "font-size: 0.85em; padding: 2px 8px;";
+          btn.setCssStyles({ fontSize: "0.85em", padding: "2px 8px" });
           btn.onclick = async () => {
             if (file instanceof import_obsidian4.TFile) {
               new import_obsidian3.Notice(t("modal.watcher.retranslating", { name: item.name }), 3e3);
@@ -86641,7 +86683,7 @@ var WatcherQueueModal = class extends SingletonModal {
           };
         } else {
           const btn = rightDiv.createEl("button", { text: t("modal.watcher.btn.translate") });
-          btn.style.cssText = "font-size: 0.85em; padding: 2px 8px; font-weight: bold;";
+          btn.setCssStyles({ fontSize: "0.85em", padding: "2px 8px", fontWeight: "bold" });
           btn.onclick = async () => {
             if (file instanceof import_obsidian4.TFile) {
               new import_obsidian3.Notice(t("modal.watcher.translating", { name: item.name }), 3e3);
@@ -86650,7 +86692,7 @@ var WatcherQueueModal = class extends SingletonModal {
           };
         }
         const trashBtn = rightDiv.createEl("button", { text: "\u{1F5D1}" });
-        trashBtn.style.cssText = "font-size: 0.85em; padding: 2px 6px; cursor: pointer;";
+        trashBtn.setCssStyles({ fontSize: "0.85em", padding: "2px 6px", cursor: "pointer" });
         trashBtn.title = t("modal.watcher.btn.remove");
         trashBtn.onclick = () => {
           this.plugin.watcher.remove(item.path);
@@ -86670,9 +86712,20 @@ var WatcherQueueModal = class extends SingletonModal {
       return;
     const pct = Math.max(0, Math.min(100, done / total * 100));
     const barContainer = container.createDiv();
-    barContainer.style.cssText = "height: 8px; background: var(--background-modifier-border); border-radius: 4px; overflow: hidden;";
+    barContainer.setCssStyles({
+      height: "8px",
+      background: "var(--background-modifier-border)",
+      borderRadius: "4px",
+      overflow: "hidden"
+    });
     const barFill = barContainer.createDiv();
-    barFill.style.cssText = `height: 100%; width: ${pct.toFixed(1)}%; background: var(--interactive-accent); transition: width 0.3s ease; border-radius: 4px;`;
+    barFill.setCssStyles({
+      height: "100%",
+      width: `${pct.toFixed(1)}%`,
+      background: "var(--interactive-accent)",
+      transition: "width 0.3s ease",
+      borderRadius: "4px"
+    });
   }
   sortItems(items) {
     const sorted = [...items];
@@ -87771,7 +87824,7 @@ var FolderSuggest = class extends import_obsidian6.TextComponent {
     this.dropdownEl = null;
     this.app = app;
     this.setPlaceholder(t("settings.folderSuggest.placeholder"));
-    this.inputEl.style.width = "100%";
+    this.inputEl.setCssStyles({ width: "100%" });
     this.inputEl.addEventListener("input", () => {
       this.fireChange();
       this.renderSuggestions();
@@ -87812,9 +87865,9 @@ var FolderSuggest = class extends import_obsidian6.TextComponent {
     ].join(";");
     for (const path of matches) {
       const item = drop.createDiv({ text: path });
-      item.style.cssText = "padding:6px 10px;cursor:pointer;white-space:nowrap";
-      item.addEventListener("mouseenter", () => item.style.background = "var(--background-modifier-hover)");
-      item.addEventListener("mouseleave", () => item.style.background = "");
+      item.setCssStyles({ padding: "6px 10px", cursor: "pointer", whiteSpace: "nowrap" });
+      item.addEventListener("mouseenter", () => item.setCssStyles({ background: "var(--background-modifier-hover)" }));
+      item.addEventListener("mouseleave", () => item.setCssStyles({ background: "" }));
       item.addEventListener("mousedown", (e) => {
         e.preventDefault();
         this.setValue(path);
@@ -87921,13 +87974,23 @@ var _OpenRouterSettingsTab = class _OpenRouterSettingsTab extends import_obsidia
    */
   renderPromptsWarning(containerEl) {
     const box = containerEl.createDiv({ cls: "pdf-translate-warning-box" });
-    box.createEl("p", { text: t("prompts.warning.title") }).style.fontWeight = "600";
+    box.createEl("p", { text: t("prompts.warning.title") }).setCssStyles({ fontWeight: "600" });
     box.createEl("p", { text: t("prompts.warning.body") });
     const list = box.createEl("ul");
-    list.style.margin = "6px 0 6px 20px";
-    list.createEl("li").innerHTML = `<code>{sourceLang}</code>, <code>{targetLang}</code>, <code>{lineCount}</code>, <code>{inputText}</code> \u2014 ${t("prompts.warning.placeholders")}`;
-    list.createEl("li").innerHTML = `<code>[#N]</code> \u2014 ${t("prompts.warning.numbering")}`;
-    list.createEl("li").innerHTML = `<code>N. Translated text</code> \u2014 ${t("prompts.warning.format")}`;
+    list.setCssStyles({ margin: "6px 0 6px 20px" });
+    const placeholders = ["{sourceLang}", "{targetLang}", "{lineCount}", "{inputText}"];
+    const placeholdersLi = list.createEl("li");
+    placeholders.forEach((ph, i) => {
+      placeholdersLi.createEl("code", { text: ph });
+      placeholdersLi.appendText(i < placeholders.length - 1 ? ", " : " \u2014 ");
+    });
+    placeholdersLi.appendText(t("prompts.warning.placeholders"));
+    const numberingLi = list.createEl("li");
+    numberingLi.createEl("code", { text: "[#N]" });
+    numberingLi.appendText(` \u2014 ${t("prompts.warning.numbering")}`);
+    const formatLi = list.createEl("li");
+    formatLi.createEl("code", { text: "N. Translated text" });
+    formatLi.appendText(` \u2014 ${t("prompts.warning.format")}`);
     const consequence = box.createEl("p");
     consequence.createEl("strong", { text: t("prompts.warning.consequence") });
   }
@@ -87938,8 +88001,7 @@ var _OpenRouterSettingsTab = class _OpenRouterSettingsTab extends import_obsidia
     const { containerEl } = this;
     containerEl.empty();
     const header = containerEl.createDiv({ cls: "pdf-translate-settings-header" });
-    header.createEl("h2", { text: t("settings.page.title") });
-    header.createEl("p", { text: t("settings.page.desc") });
+    new import_obsidian6.Setting(header).setName(t("settings.page.title")).setDesc(t("settings.page.desc")).setHeading();
     this.renderLevelCards(containerEl);
     {
       const group = this.sectionGroup(containerEl, "section.provider", "quick");
@@ -88034,7 +88096,7 @@ var _OpenRouterSettingsTab = class _OpenRouterSettingsTab extends import_obsidia
       const group = this.sectionGroup(containerEl, "section.storage", "standard");
       if (group) {
         new import_obsidian6.Setting(group).setName(t("general.storage.label")).setDesc(t("general.storage.desc")).then((setting) => {
-          setting.controlEl.style.position = "relative";
+          setting.controlEl.setCssStyles({ position: "relative" });
           const folderSuggest = new FolderSuggest(this.app, setting.controlEl);
           folderSuggest.setValue(this.plugin.settings.storageLocation);
           folderSuggest.onChange(async (value) => {
@@ -88059,52 +88121,48 @@ var _OpenRouterSettingsTab = class _OpenRouterSettingsTab extends import_obsidia
         }));
         if (this.plugin.settings.useGemmaPrompt) {
           new import_obsidian6.Setting(group).setName(t("prompts.special.template.label")).setDesc(t("prompts.special.template.desc")).then((setting) => {
-            setting.controlEl.style.flexDirection = "column";
-            setting.controlEl.style.alignItems = "flex-end";
+            setting.controlEl.setCssStyles({ flexDirection: "column", alignItems: "flex-end" });
             const textarea = new import_obsidian6.TextAreaComponent(setting.controlEl).setValue(this.plugin.settings.customTemplate || DEFAULT_CUSTOM_TEMPLATE).onChange(async (v) => {
               this.plugin.settings.customTemplate = v;
               await this.plugin.saveSettings();
             });
-            textarea.inputEl.style.width = "100%";
+            textarea.inputEl.setCssStyles({ width: "100%" });
             textarea.inputEl.rows = 8;
-            textarea.inputEl.style.fontFamily = "monospace";
-            textarea.inputEl.style.fontSize = "12px";
+            textarea.inputEl.setCssStyles({ fontFamily: "monospace", fontSize: "12px" });
             new import_obsidian6.ButtonComponent(setting.controlEl).setButtonText(t("prompts.restore")).onClick(async () => {
               this.plugin.settings.customTemplate = DEFAULT_CUSTOM_TEMPLATE;
               await this.plugin.saveSettings();
               textarea.setValue(DEFAULT_CUSTOM_TEMPLATE);
-            }).buttonEl.style.marginTop = "8px";
+            }).buttonEl.setCssStyles({ marginTop: "8px" });
           });
         } else {
           new import_obsidian6.Setting(group).setName(t("prompts.batch.label")).setDesc(t("prompts.batch.desc")).then((setting) => {
-            setting.controlEl.style.flexDirection = "column";
-            setting.controlEl.style.alignItems = "flex-end";
+            setting.controlEl.setCssStyles({ flexDirection: "column", alignItems: "flex-end" });
             const textarea = new import_obsidian6.TextAreaComponent(setting.controlEl).setValue(this.plugin.settings.batchPrompt).onChange(async (v) => {
               this.plugin.settings.batchPrompt = v;
               await this.plugin.saveSettings();
             });
-            textarea.inputEl.style.width = "100%";
+            textarea.inputEl.setCssStyles({ width: "100%" });
             textarea.inputEl.rows = 8;
             new import_obsidian6.ButtonComponent(setting.controlEl).setButtonText(t("prompts.restore")).onClick(async () => {
               this.plugin.settings.batchPrompt = DEFAULT_SETTINGS.batchPrompt;
               await this.plugin.saveSettings();
               textarea.setValue(DEFAULT_SETTINGS.batchPrompt);
-            }).buttonEl.style.marginTop = "8px";
+            }).buttonEl.setCssStyles({ marginTop: "8px" });
           });
           new import_obsidian6.Setting(group).setName(t("prompts.single.label")).setDesc(t("prompts.single.desc")).then((setting) => {
-            setting.controlEl.style.flexDirection = "column";
-            setting.controlEl.style.alignItems = "flex-end";
+            setting.controlEl.setCssStyles({ flexDirection: "column", alignItems: "flex-end" });
             const textarea = new import_obsidian6.TextAreaComponent(setting.controlEl).setValue(this.plugin.settings.singlePrompt).onChange(async (v) => {
               this.plugin.settings.singlePrompt = v;
               await this.plugin.saveSettings();
             });
-            textarea.inputEl.style.width = "100%";
+            textarea.inputEl.setCssStyles({ width: "100%" });
             textarea.inputEl.rows = 4;
             new import_obsidian6.ButtonComponent(setting.controlEl).setButtonText(t("prompts.restore")).onClick(async () => {
               this.plugin.settings.singlePrompt = DEFAULT_SETTINGS.singlePrompt;
               await this.plugin.saveSettings();
               textarea.setValue(DEFAULT_SETTINGS.singlePrompt);
-            }).buttonEl.style.marginTop = "8px";
+            }).buttonEl.setCssStyles({ marginTop: "8px" });
           });
         }
       }
@@ -88172,11 +88230,7 @@ var _OpenRouterSettingsTab = class _OpenRouterSettingsTab extends import_obsidia
           }
         }
         if (this.shouldShow("advanced")) {
-          group.createEl("h4", { text: t("settings.layout.advanced.heading") });
-          group.createEl("p", {
-            text: t("settings.layout.advanced.intro"),
-            cls: "setting-item-description"
-          });
+          new import_obsidian6.Setting(group).setName(t("settings.layout.advanced.heading")).setDesc(t("settings.layout.advanced.intro")).setHeading();
           const ls = this.plugin.layoutSettings;
           new import_obsidian6.Setting(group).setName(t("settings.layout.cellSize.name")).setDesc(t("settings.layout.cellSize.desc")).addText((text2) => text2.setPlaceholder(t("settings.layout.cellSize.placeholder")).setValue(String(ls.contourCellSize)).onChange(async (v) => {
             const n = parseInt(v, 10);
@@ -88235,7 +88289,7 @@ var _OpenRouterSettingsTab = class _OpenRouterSettingsTab extends import_obsidia
             this.plugin.watcher.stop();
         }));
         new import_obsidian6.Setting(group).setName(t("watcher.folder.label")).setDesc(t("watcher.folder.desc")).then((setting) => {
-          setting.controlEl.style.position = "relative";
+          setting.controlEl.setCssStyles({ position: "relative" });
           const fs = new FolderSuggest(this.app, setting.controlEl);
           fs.setValue(this.plugin.settings.watcherFolder || "");
           fs.onChange(async (value) => {
@@ -88366,7 +88420,7 @@ var _OpenRouterSettingsTab = class _OpenRouterSettingsTab extends import_obsidia
           });
         });
         new import_obsidian6.Setting(ocrGroup).setName(t("ocr.output.folder.label")).setDesc(t("ocr.output.folder.desc")).then((setting) => {
-          setting.controlEl.style.position = "relative";
+          setting.controlEl.setCssStyles({ position: "relative" });
           const fs = new FolderSuggest(this.app, setting.controlEl);
           fs.setValue(ocrSettings.ocrOutputFolder || "");
           fs.onChange(async (value) => {
@@ -88406,9 +88460,7 @@ var _OpenRouterSettingsTab = class _OpenRouterSettingsTab extends import_obsidia
             await this.plugin.saveSettings();
           });
           ta.inputEl.rows = 6;
-          ta.inputEl.style.width = "100%";
-          ta.inputEl.style.fontFamily = "monospace";
-          ta.inputEl.style.fontSize = "11px";
+          ta.inputEl.setCssStyles({ width: "100%", fontFamily: "monospace", fontSize: "11px" });
         });
         new import_obsidian6.Setting(advancedOcrDetails).setName(t("settings.ocr.advanced.ocrTextPromptTemplate.name")).setDesc(t("settings.ocr.advanced.ocrTextPromptTemplate.desc")).addTextArea((ta) => {
           ta.setValue(ocrSettings.ocrTextPromptTemplate || "").onChange(async (v) => {
@@ -88416,9 +88468,7 @@ var _OpenRouterSettingsTab = class _OpenRouterSettingsTab extends import_obsidia
             await this.plugin.saveSettings();
           });
           ta.inputEl.rows = 6;
-          ta.inputEl.style.width = "100%";
-          ta.inputEl.style.fontFamily = "monospace";
-          ta.inputEl.style.fontSize = "11px";
+          ta.inputEl.setCssStyles({ width: "100%", fontFamily: "monospace", fontSize: "11px" });
         });
         new import_obsidian6.Setting(advancedOcrDetails).setName(t("settings.ocr.advanced.responseFormatInstruction.name")).setDesc(t("settings.ocr.advanced.responseFormatInstruction.desc")).addTextArea((ta) => {
           ta.setValue(ocrSettings.responseFormatInstruction || "").onChange(async (v) => {
@@ -88426,9 +88476,7 @@ var _OpenRouterSettingsTab = class _OpenRouterSettingsTab extends import_obsidia
             await this.plugin.saveSettings();
           });
           ta.inputEl.rows = 4;
-          ta.inputEl.style.width = "100%";
-          ta.inputEl.style.fontFamily = "monospace";
-          ta.inputEl.style.fontSize = "11px";
+          ta.inputEl.setCssStyles({ width: "100%", fontFamily: "monospace", fontSize: "11px" });
         });
         new import_obsidian6.Setting(advancedOcrDetails).setName(t("settings.ocr.advanced.ocrOutputFilenamePattern.name")).setDesc(t("settings.ocr.advanced.ocrOutputFilenamePattern.desc")).addText((text2) => {
           text2.setPlaceholder("{pdfname}.translated").setValue(ocrSettings.ocrOutputFilenamePattern || "").onChange(async (v) => {
@@ -88470,7 +88518,7 @@ var _OpenRouterSettingsTab = class _OpenRouterSettingsTab extends import_obsidia
               await this.plugin.saveSettings();
             });
             ta.inputEl.rows = 2;
-            ta.inputEl.style.width = "100%";
+            ta.inputEl.setCssStyles({ width: "100%" });
           });
         };
         createFormatSetting(t("export.formats.callout"), "calloutFormat");
@@ -88511,14 +88559,12 @@ var _OpenRouterSettingsTab = class _OpenRouterSettingsTab extends import_obsidia
           this.requestDisplay();
         }));
         new import_obsidian6.Setting(group).setName(t("settings.paragraphFilter.bulkEdit.name")).setDesc(t("settings.paragraphFilter.bulkEdit.desc")).then((setting) => {
-          setting.controlEl.style.flexDirection = "column";
-          setting.controlEl.style.alignItems = "flex-end";
+          setting.controlEl.setCssStyles({ flexDirection: "column", alignItems: "flex-end" });
           const ta = new import_obsidian6.TextAreaComponent(setting.controlEl);
           ta.setValue(JSON.stringify(this.plugin.settings.paragraphFilterRules, null, 2));
-          ta.inputEl.style.width = "100%";
+          ta.inputEl.setCssStyles({ width: "100%" });
           ta.inputEl.rows = 6;
-          ta.inputEl.style.fontFamily = "monospace";
-          ta.inputEl.style.fontSize = "11px";
+          ta.inputEl.setCssStyles({ fontFamily: "monospace", fontSize: "11px" });
           ta.onChange(async (v) => {
             try {
               const parsed = JSON.parse(v);
@@ -88571,7 +88617,7 @@ var _OpenRouterSettingsTab = class _OpenRouterSettingsTab extends import_obsidia
         if (models2.length > 0) {
           ps.model = models2[0].id;
           await this.plugin.saveSettings();
-          console.info(`vLLM: auto-selected model "${ps.model}" from ${endpoint}/models`);
+          console.debug(`vLLM: auto-selected model "${ps.model}" from ${endpoint}/models`);
         }
       } catch (e) {
         console.warn("Failed to auto-fetch vLLM models:", e);
@@ -89911,203 +89957,6 @@ function initI18n(locale = "en") {
     registerStrings(RU);
   }
 }
-
-// settings-ui.css.ts
-var SETTINGS_UI_CSS = `
-/* \u2550\u2550\u2550 Progressive Disclosure: Level Cards \u2550\u2550\u2550 */
-.pdf-translate-level-cards {
-  display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  gap: 10px;
-  margin-bottom: 20px;
-}
-
-.pdf-translate-level-card {
-  background: var(--background-secondary);
-  border: 2px solid var(--background-modifier-border);
-  border-radius: 8px;
-  padding: 14px 16px;
-  cursor: pointer;
-  transition: all 0.15s ease;
-  user-select: none;
-}
-
-.pdf-translate-level-card:hover {
-  border-color: var(--text-muted);
-  background: var(--background-secondary-alt);
-}
-
-.pdf-translate-level-card.active {
-  border-color: var(--interactive-accent);
-  background: var(--interactive-accent-hover);
-}
-
-.pdf-translate-level-card .pdf-translate-level-name {
-  font-size: 14px;
-  font-weight: 600;
-  margin-bottom: 4px;
-  color: var(--text-normal);
-}
-
-.pdf-translate-level-card.active .pdf-translate-level-name {
-  /* FIX (v5): use --text-on-accent (text color that sits on top of accent
-     backgrounds) instead of --interactive-accent (which is the SAME color
-     as the active background \u2192 invisible text). Falls back to --text-normal
-     for older Obsidian versions that don't define --text-on-accent. */
-  color: var(--text-on-accent, var(--text-normal));
-}
-
-.pdf-translate-level-card.active .pdf-translate-level-desc,
-.pdf-translate-level-card.active .pdf-translate-level-count {
-  /* Same fix for description and count text on active cards */
-  color: var(--text-on-accent, var(--text-muted));
-}
-
-.pdf-translate-level-card .pdf-translate-level-desc {
-  font-size: 12px;
-  color: var(--text-muted);
-  line-height: 1.4;
-}
-
-.pdf-translate-level-card .pdf-translate-level-count {
-  font-size: 11px;
-  color: var(--text-faint);
-  margin-top: 8px;
-}
-
-/* \u2550\u2550\u2550 Section Headings (grouped cards) \u2550\u2550\u2550 */
-.pdf-translate-section-group {
-  background: var(--background-secondary);
-  border: 1px solid var(--background-modifier-border);
-  border-radius: 8px;
-  padding: 4px 20px;
-  margin-bottom: 16px;
-}
-
-.pdf-translate-section-group .pdf-translate-group-title {
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--text-secondary);
-  padding: 14px 0 6px;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  border-bottom: 1px solid var(--background-modifier-border);
-  margin-bottom: 4px;
-}
-
-.pdf-translate-section-group .pdf-translate-group-title .pdf-translate-group-dot {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: var(--interactive-accent);
-  flex-shrink: 0;
-}
-
-/* \u2550\u2550\u2550 Warning Box (for Prompts section) \u2550\u2550\u2550 */
-.pdf-translate-warning-box {
-  padding: 12px 16px;
-  background: var(--background-modifier-warning, rgba(250, 166, 26, 0.1));
-  border-left: 3px solid var(--text-warning, #faa61a);
-  border-radius: 0 6px 6px 0;
-  font-size: 12px;
-  color: var(--text-normal);
-  margin: 12px 0 16px;
-  line-height: 1.5;
-}
-
-.pdf-translate-warning-box strong {
-  color: var(--text-warning, #faa61a);
-  font-weight: 600;
-}
-
-.pdf-translate-warning-box code {
-  background: var(--background-primary);
-  padding: 1px 5px;
-  border-radius: 3px;
-  font-family: var(--font-monospace, 'SF Mono', 'Fira Code', monospace);
-  font-size: 11px;
-  border: 1px solid var(--background-modifier-border);
-}
-
-/* \u2550\u2550\u2550 Level badge (shown next to advanced-only settings) \u2550\u2550\u2550 */
-.pdf-translate-level-badge {
-  display: inline-block;
-  font-size: 10px;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.3px;
-  padding: 1px 6px;
-  border-radius: 8px;
-  background: var(--background-modifier-border);
-  color: var(--text-muted);
-  margin-left: 6px;
-  vertical-align: middle;
-}
-
-.pdf-translate-level-badge.advanced {
-  background: var(--text-warning-bg, rgba(250, 166, 26, 0.15));
-  color: var(--text-warning, #faa61a);
-}
-
-/* \u2550\u2550\u2550 Page header for settings tab \u2550\u2550\u2550 */
-.pdf-translate-settings-header {
-  margin-bottom: 20px;
-}
-
-.pdf-translate-settings-header h2 {
-  font-size: 20px;
-  font-weight: 600;
-  margin-bottom: 4px;
-}
-
-.pdf-translate-settings-header p {
-  font-size: 13px;
-  color: var(--text-muted);
-}
-
-/* \u2550\u2550\u2550 Collapsible <details> (Phase 5 N7: Advanced OCR section) \u2550\u2550\u2550 */
-/* Native <details>/<summary> styling tweaked to match the surrounding
-   .setting-item cards inside a .pdf-translate-section-group. */
-.pdf-translate-section-group details {
-  margin: 12px 0 4px;
-  padding: 0;
-  border-top: 1px solid var(--background-modifier-border);
-}
-
-.pdf-translate-section-group details > summary {
-  cursor: pointer;
-  padding: 10px 0;
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--text-secondary);
-  user-select: none;
-  list-style: none;
-  /* Hide the default disclosure triangle; we draw our own via ::marker
-     fallback so the visual stays consistent across Obsidian themes. */
-}
-
-.pdf-translate-section-group details > summary::-webkit-details-marker {
-  display: none;
-}
-
-.pdf-translate-section-group details > summary::before {
-  content: '\u25B8';
-  display: inline-block;
-  margin-right: 6px;
-  font-size: 11px;
-  color: var(--text-muted);
-  transition: transform 0.15s ease;
-}
-
-.pdf-translate-section-group details[open] > summary::before {
-  transform: rotate(90deg);
-}
-
-.pdf-translate-section-group details > summary:hover {
-  color: var(--text-normal);
-}
-`;
 
 // overlay-id.ts
 function hash32(str, seed = 0) {
@@ -92671,12 +92520,6 @@ var RetranslateUsingOverlaysModal = class extends SingletonModal {
         this.close();
       });
     });
-    const style = document.createElement("style");
-    style.textContent = `
-      .is-hidden { display: none !important; }
-      .modal .setting-item.is-hidden { display: none !important; }
-    `;
-    contentEl.appendChild(style);
   }
   onClose() {
     this.cancelled = true;
@@ -93301,31 +93144,22 @@ var EditSpecificTranslationModal = class extends SingletonModal {
     const { contentEl, titleEl, modalEl } = this;
     modalEl.addClass("ort-translation-modal");
     titleEl.setText(t("modal.edit.title"));
-    contentEl.createEl("h6", { text: t("modal.edit.original") }).style.cssText = "margin: 0 0 5px 0; color: var(--text-muted);";
+    contentEl.createEl("h6", { text: t("modal.edit.original") }).setCssStyles({ margin: "0 0 5px 0", color: "var(--text-muted)" });
     const originalContainer = contentEl.createDiv({ cls: "ort-original-container" });
     const originalTextArea = new import_obsidian11.TextAreaComponent(originalContainer);
     originalTextArea.setValue(this.originalText).setDisabled(true);
-    originalTextArea.inputEl.style.width = "100%";
-    originalTextArea.inputEl.style.height = "150px";
-    originalTextArea.inputEl.style.resize = "vertical";
-    originalTextArea.inputEl.style.background = "var(--background-secondary)";
-    originalTextArea.inputEl.style.color = "var(--text-muted)";
-    originalTextArea.inputEl.style.fontFamily = "var(--font-monospace)";
-    originalTextArea.inputEl.style.fontSize = "0.9em";
+    originalTextArea.inputEl.setCssStyles({ width: "100%", height: "150px", resize: "vertical", background: "var(--background-secondary)", color: "var(--text-muted)", fontFamily: "var(--font-monospace)", fontSize: "0.9em" });
     const spacer = contentEl.createDiv();
-    spacer.style.cssText = "height: 15px;";
+    spacer.setCssStyles({ height: "15px" });
     const translationHeader = contentEl.createEl("h6", { text: t("modal.edit.translated") });
-    translationHeader.style.cssText = "margin: 0 0 5px 0; color: var(--text-accent);";
+    translationHeader.setCssStyles({ margin: "0 0 5px 0", color: "var(--text-accent)" });
     const translationContainer = contentEl.createDiv({ cls: "ort-translation-container" });
     const translationTextArea = new import_obsidian11.TextAreaComponent(translationContainer);
     translationTextArea.setValue(this.currentTranslation).setPlaceholder(t("modal.edit.placeholder")).onChange((value) => {
       this.newTranslation = value;
       this.isDirty = true;
     });
-    translationTextArea.inputEl.style.width = "100%";
-    translationTextArea.inputEl.style.height = "200px";
-    translationTextArea.inputEl.style.resize = "vertical";
-    translationTextArea.inputEl.style.fontFamily = "var(--font-text)";
+    translationTextArea.inputEl.setCssStyles({ width: "100%", height: "200px", resize: "vertical", fontFamily: "var(--font-text)" });
     setTimeout(() => translationTextArea.inputEl.focus(), 50);
     const buttonContainer = contentEl.createDiv({ cls: "modal-button-container" });
     this.cancelBtn = new import_obsidian11.ButtonComponent(buttonContainer).setButtonText(t("modal.edit.cancel")).onClick(() => this.close());
@@ -93518,7 +93352,6 @@ var _OverlayUIRenderer = class _OverlayUIRenderer {
     this.createdOverlays = /* @__PURE__ */ new WeakMap();
     this.trackedOverlayElements = /* @__PURE__ */ new Set();
     this.tempDiv = null;
-    this.stylesInjected = false;
     // Reusable measurement element — created once, reused every call (perf fix)
     this.measureSpan = null;
     this.selectedOverlays = /* @__PURE__ */ new Set();
@@ -93673,84 +93506,6 @@ var _OverlayUIRenderer = class _OverlayUIRenderer {
       }
     };
     this.plugin = plugin;
-    this.ensureGlobalStyles();
-  }
-  /**
-   * Injects CSS once to handle the "Borderless" look and Flexbox centering.
-   *
-   * FIX: Removed conflicting duplicate rule block for `.pdf-text-overlay-reflow`
-   *      (the original had the class declared twice in the same <style> tag,
-   *      causing the `-ms-overflow-style` / `scrollbar-width` declarations to be
-   *      applied in a *separate* rule that also reset `display`, `flex-direction`
-   *      etc. — defeating the flex layout for scrollbar-hiding in some browsers).
-   *      Both sets of properties are now merged into one rule.
-   *
-   * FIX: `:hover { overflow: visible }` caused visible text bleed-through onto
-   *      adjacent overlays. Replaced with a less aggressive `overflow: auto` so
-   *      the user can still read overflowing content on hover without z-fighting.
-   */
-  ensureGlobalStyles() {
-    if (this.stylesInjected)
-      return;
-    const styleId = "pdf-overlay-ui-styles";
-    if (!document.getElementById(styleId)) {
-      const style = document.createElement("style");
-      style.id = styleId;
-      style.textContent = `
-                .pdf-text-overlay-reflow {
-                    transition: box-shadow 0.2s ease, transform 0.1s ease, width 0.1s ease, height 0.1s ease;
-                    -webkit-overflow-scrolling: touch;
-
-                    /* FIX: flex-start instead of center \u2014 center causes downward shift when line-height > 1.0 */
-                    display: flex;
-                    flex-direction: column;
-                    justify-content: flex-start;
-                    align-items: flex-start;
-
-                    /* Hide scrollbars (merged \u2014 was split into two rules before) */
-                    -ms-overflow-style: none;
-                    scrollbar-width: none;
-                }
-
-                .pdf-text-overlay-reflow::-webkit-scrollbar {
-                    display: none;
-                }
-
-                /* Short phrases / headings: top-align so the first line is never clipped */
-                .pdf-text-overlay-reflow.force-top-align {
-                    justify-content: flex-start !important;
-                }
-
-                /* Scrollable fallback: switch to block so overflow:auto works correctly */
-                .pdf-text-overlay-reflow.is-scrollable {
-                    justify-content: flex-start !important;
-                    display: block !important;
-                    overflow: auto !important;
-                }
-
-                /* Hover: raise z-index and allow auto-scroll \u2014 NOT overflow:visible,
-                   which would bleed text over neighbouring overlays. */
-                .pdf-text-overlay-reflow:hover {
-                    box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06) !important;
-                    z-index: 1000 !important;
-                    overflow: auto !important;
-                }
-
-                .pdf-text-overlay-reflow.bbox-selected {
-                    /* Phase 17 (C19): use Obsidian interactive-accent CSS
-                       variable so the selection outline respects the user
-                       theme (light/dark/custom) instead of hardcoding the
-                       old #1d7afc blue. The box-shadow uses color-mix to
-                       produce a 25%-opacity accent halo, equivalent to the
-                       old rgba(29,122,252,0.25) but theme-aware. */
-                    outline: 2px solid var(--interactive-accent) !important;
-                    outline-offset: -1px;
-                    box-shadow: 0 0 0 2px color-mix(in srgb, var(--interactive-accent) 25%, transparent) !important;
-                }
-            `;
-      document.head.appendChild(style);
-    }
-    this.stylesInjected = true;
   }
   isBBoxEditMode() {
     return !!this.plugin.settings.bboxEditMode;
@@ -94026,8 +93781,7 @@ var _OverlayUIRenderer = class _OverlayUIRenderer {
     }
     el.appendChild(inner);
     if (isShortPhrase) {
-      inner.style.whiteSpace = "nowrap";
-      inner.style.overflow = "visible";
+      inner.setCssStyles({ whiteSpace: "nowrap", overflow: "visible" });
       el.style.paddingRight = `${SHORT_PHRASE_PADDING_RIGHT_EM}em`;
       el.style.minWidth = `${adjustedWidth}px`;
     }
@@ -94039,7 +93793,7 @@ var _OverlayUIRenderer = class _OverlayUIRenderer {
     const contextHandler = (event) => this.showContextMenu(event, inner.innerText || inner.textContent || "", el);
     const bringToTopHandler = () => this.bringToTop(el);
     const resetZIndexHandler = () => {
-      el.style.zIndex = "101";
+      el.setCssStyles({ zIndex: "101" });
     };
     const clickHandler = (event) => {
       if (!this.isBBoxEditMode())
@@ -94140,10 +93894,9 @@ var _OverlayUIRenderer = class _OverlayUIRenderer {
       return;
     const isShortPhrase = el.getAttribute("data-is-short-phrase") === "true";
     el.classList.remove("is-scrollable");
-    el.style.overflow = "hidden";
+    el.setCssStyles({ overflow: "hidden" });
     if (isShortPhrase) {
-      inner.style.whiteSpace = "nowrap";
-      inner.style.overflow = "visible";
+      inner.setCssStyles({ whiteSpace: "nowrap", overflow: "visible" });
       const currentFontSize2 = parseFloat(el.style.fontSize) || 12;
       const fontFamily = el.style.fontFamily || "sans-serif";
       const plainText = inner.textContent || "";
@@ -94236,7 +93989,7 @@ var _OverlayUIRenderer = class _OverlayUIRenderer {
     }
     if (isOverflowing()) {
       if (currentFontSize < 9) {
-        el.style.fontSize = "9px";
+        el.setCssStyles({ fontSize: "9px" });
       }
       el.classList.add("is-scrollable");
       if (this.plugin.settings.debugMode) {
@@ -94369,12 +94122,9 @@ var _OverlayUIRenderer = class _OverlayUIRenderer {
         op = op / 100;
       op = Math.max(0, Math.min(1, op));
       el.style.opacity = `${op}`;
-      el.style.pointerEvents = "auto";
-      el.style.visibility = "visible";
+      el.setCssStyles({ pointerEvents: "auto", visibility: "visible" });
     } else {
-      el.style.opacity = "0";
-      el.style.pointerEvents = "none";
-      el.style.visibility = "hidden";
+      el.setCssStyles({ opacity: "0", pointerEvents: "none", visibility: "hidden" });
     }
   }
   bringToTop(el) {
@@ -96702,7 +96452,7 @@ var _OverlayRenderer = class _OverlayRenderer {
     if (typeof this.plugin.logDebug === "function") {
       this.plugin.logDebug(prefixed, ...args);
     } else if ((_a = this.plugin.settings) == null ? void 0 : _a.debugMode) {
-      console.log(prefixed, ...args);
+      console.debug(prefixed, ...args);
     }
   }
 };
@@ -96928,10 +96678,10 @@ ${text2}`;
         const timeoutMs = isGemini ? 6e4 : isLocal ? 12e4 : 45e3;
         const response = await this.withTimeout((0, import_obsidian14.requestUrl)(options), timeoutMs);
         if (this.plugin.settings.debugMode) {
-          console.log("=== API RESPONSE DEBUG ===");
-          console.log("Status:", response.status);
-          console.log("Response:", JSON.stringify(response.json, null, 2));
-          console.log("==========================");
+          console.debug("=== API RESPONSE DEBUG ===");
+          console.debug("Status:", response.status);
+          console.debug("Response:", JSON.stringify(response.json, null, 2));
+          console.debug("==========================");
         }
         if (response.status === 200) {
           const customPath = (def == null ? void 0 : def.protocol) === "custom" ? providerSettings.responsePath : void 0;
@@ -96995,7 +96745,7 @@ ${text2}`;
             delay = BASE_DELAY * Math.pow(2, attempt - 1) + Math.random() * 500;
           }
           delay = Math.min(delay, 3e5);
-          console.log(`Rate limit hit. Retrying in ${delay}ms...`);
+          console.debug(`Rate limit hit. Retrying in ${delay}ms...`);
           await this.sleep(delay);
           continue;
         }
@@ -97039,7 +96789,7 @@ ${text2}`;
           throw err;
         }
         const delay = BASE_DELAY * Math.pow(2, attempt - 1) + Math.random() * 500;
-        console.log(`Attempt ${attempt} failed, retrying in ${delay}ms...`, err);
+        console.debug(`Attempt ${attempt} failed, retrying in ${delay}ms...`, err);
         await this.sleep(delay);
       }
     }
@@ -98320,7 +98070,7 @@ var LayoutDetector = class {
     }));
     if (settings.debugValidation) {
       const elapsed = (typeof performance !== "undefined" ? performance.now() : Date.now()) - start;
-      console.log("[LayoutDetector Pipeline]", {
+      console.debug("[LayoutDetector Pipeline]", {
         spans: spans.length,
         paragraphs: result.length,
         cellSize,
@@ -98523,7 +98273,7 @@ var ExternalLayoutService = class {
             return;
           }
           this.layoutCache.set(filePath, result);
-          console.log(`External Layout Cached for ${filePath}`);
+          console.debug(`External Layout Cached for ${filePath}`);
           resolve(result);
         } catch (e) {
           console.error("Failed to parse Python output.");
@@ -98838,7 +98588,7 @@ var TextProcessor = class {
       this.clearLayoutDebugOverlay(pageElement);
     }
     if (this.plugin.settings.debugMode) {
-      console.log(`PDF Translator: DOM pipeline \u2192 ${result.paragraphs.length} paragraph(s).`);
+      console.debug(`PDF Translator: DOM pipeline \u2192 ${result.paragraphs.length} paragraph(s).`);
     }
     this.clearCaches();
     const { maxBatchChars } = this.plugin.settings;
@@ -98912,7 +98662,7 @@ var TextProcessor = class {
           skippedIndices = skipped;
           translatableUnits = translatable.map((i) => units[i]);
           if (this.plugin.settings.debugMode) {
-            console.log(
+            console.debug(
               `[ParagraphFilter] ${skipped.size}/${units.length} paragraphs filtered (not sent to LLM):`,
               [...skipped.entries()].map(([i, name]) => `#${i + 1} (${name}): "${units[i].text.substring(0, 30)}"`)
             );
@@ -98934,9 +98684,9 @@ var TextProcessor = class {
       } else if (useBatch && translatableUnits.length > 1) {
         const raw = await this.plugin.translation.translateBatch(fullText, translatableUnits.length);
         if (this.plugin.settings.debugMode) {
-          console.log(`[Batch Input]:
+          console.debug(`[Batch Input]:
 ${fullText}`);
-          console.log(`[Batch Raw Output]:
+          console.debug(`[Batch Raw Output]:
 ${raw}`);
         }
         translatedLines = await this.extractNumberedLinesRobust(raw, translatableUnits.length, translatableUnits.map((u) => u.text));
@@ -99103,12 +98853,12 @@ ${raw}`);
       try {
         const chunkText = chunk.map((t2, j) => `[#${j + 1}] ${t2}`).join("\n");
         if (this.plugin.settings.debugMode) {
-          console.log(`[Chunk ${i + 1}/${finalChunks.length} Input]:
+          console.debug(`[Chunk ${i + 1}/${finalChunks.length} Input]:
 ${chunkText.substring(0, 200)}...`);
         }
         const raw = await this.plugin.translation.translateBatch(chunkText, chunk.length);
         if (this.plugin.settings.debugMode) {
-          console.log(`[Chunk ${i + 1}/${finalChunks.length} Raw Output]:
+          console.debug(`[Chunk ${i + 1}/${finalChunks.length} Raw Output]:
 ${(raw == null ? void 0 : raw.substring(0, 200)) || "(empty)"}`);
         }
         const lines = await this.extractNumberedLinesRobust(raw, chunk.length, chunk);
@@ -99336,8 +99086,8 @@ ${(raw == null ? void 0 : raw.substring(0, 200)) || "(empty)"}`);
       var _a;
       const cleaned = line.replace(/<br\s*\/?>/gi, " ").replace(/\s+/g, " ").trim();
       const orig = ((_a = units[i]) == null ? void 0 : _a.text) || "";
-      const origLead = orig.match(/^\s*(\d+[\.\)]\s*|[-•*]\s*|#\s*)/);
-      if (origLead && !cleaned.match(/^\s*(\d+[\.\)]\s*|[-•*]\s*|#\s*)/)) {
+      const origLead = orig.match(/^\s*(\d+[.)]\s*|[-•*]\s*|#\s*)/);
+      if (origLead && !cleaned.match(/^\s*(\d+[.)]\s*|[-•*]\s*|#\s*)/)) {
         return origLead[1] + cleaned;
       }
       return cleaned;
@@ -99697,7 +99447,7 @@ var RegionReprocessor = class {
   async run() {
     const { app, settings } = this.plugin;
     if (this.debug) {
-      console.log("[RegionReprocessor] Starting \u2013 waiting for Shift+drag...");
+      console.debug("[RegionReprocessor] Starting \u2013 waiting for Shift+drag...");
     }
     if (!settings.enableTranslation) {
       new import_obsidian18.Notice("PDF translation is disabled in settings.");
@@ -99993,7 +99743,7 @@ var RegionReprocessor = class {
     const items = savedOverlay.pageOverlays[pageKey] || [];
     await this.plugin.storage.updatePageOverlaysAndWrite(file, { [modifiedPage]: items }, { replace: true });
     if (this.debug) {
-      console.log(`[RegionReprocessor] Saved page ${modifiedPage} for ${file.path}`);
+      console.debug(`[RegionReprocessor] Saved page ${modifiedPage} for ${file.path}`);
     }
   }
   isOverlapping(a, b) {
@@ -100233,7 +99983,7 @@ ${outputFileName}`, 6e3);
     }
     commitBlock();
     const total = Object.values(exportData).reduce((n, a) => n + a.length, 0);
-    console.log(`[PDF Export] Parsed ${total} overlay(s) across ${Object.keys(exportData).length} page(s).`);
+    console.debug(`[PDF Export] Parsed ${total} overlay(s) across ${Object.keys(exportData).length} page(s).`);
     return exportData;
   }
   normalizeFontFamily(ff) {
@@ -100265,7 +100015,7 @@ ${outputFileName}`, 6e3);
       } catch (err) {
         return reject(new Error(`Failed to write temp JSON: ${err.message}`));
       }
-      console.log(`[PDF Export] Spawning: ${pythonCmd} "${this.scriptPath}"`);
+      console.debug(`[PDF Export] Spawning: ${pythonCmd} "${this.scriptPath}"`);
       const spawnEnv = import_obsidian19.Platform.isDesktop ? { env: { ...((_a = window.process) == null ? void 0 : _a.env) || {} } } : {};
       const child = this.spawn(
         pythonCmd,
@@ -100284,7 +100034,7 @@ ${outputFileName}`, 6e3);
       child.on("close", (code) => {
         this.tryDeleteTemp(tempFile);
         if (stdout)
-          console.log("[PDF Export] stdout:\n" + stdout);
+          console.debug("[PDF Export] stdout:\n" + stdout);
         if (stderr)
           console.warn("[PDF Export] stderr:\n" + stderr);
         if (code === 0) {
@@ -100341,7 +100091,6 @@ ${outputFileName}`, 6e3);
 
 // layout-parser-debug.ts
 var import_obsidian20 = require("obsidian");
-var STYLE_ID = "pdf-layout-parser-debug-styles";
 var LAYER_CLASS = "pdf-layout-parser-debug-layer";
 var BOX_PARAGRAPH_CLASS = "pdf-layout-parser-debug-paragraph";
 var BOX_COLUMN_CLASS = "pdf-layout-parser-debug-column";
@@ -100424,8 +100173,7 @@ var LayoutParserDebugModule = class {
       ghost.className = GHOST_CLASS;
       ghost.style.left = `${event.clientX}px`;
       ghost.style.top = `${event.clientY}px`;
-      ghost.style.width = "0px";
-      ghost.style.height = "0px";
+      ghost.setCssStyles({ width: "0px", height: "0px" });
       document.body.appendChild(ghost);
       this.ghostBox = ghost;
     };
@@ -100494,7 +100242,6 @@ var LayoutParserDebugModule = class {
       this.cancelDrawing();
     };
     this.plugin = plugin;
-    this.ensureStyles();
     this.enabled = !!this.plugin.settings.layoutDebugMode;
     if (this.enabled) {
       this.bindListeners();
@@ -100674,13 +100421,21 @@ var LayoutParserDebugModule = class {
     }
     const legend = document.createElement("div");
     legend.className = LEGEND_CLASS;
-    legend.innerHTML = [
-      '<span class="i p"></span> parser bboxes',
-      '<span class="i c"></span> columns',
-      '<span class="i g"></span> gap strips',
-      '<span class="i v"></span> vertical gaps',
-      '<span class="i m"></span> manual bboxes'
-    ].join("<br>");
+    const legendItems = [
+      ["i p", "parser bboxes"],
+      ["i c", "columns"],
+      ["i g", "gap strips"],
+      ["i v", "vertical gaps"],
+      ["i m", "manual bboxes"]
+    ];
+    legendItems.forEach(([cls, label], idx) => {
+      const swatch = document.createElement("span");
+      swatch.className = cls;
+      legend.appendChild(swatch);
+      legend.appendChild(document.createTextNode(" " + label));
+      if (idx < legendItems.length - 1)
+        legend.appendChild(document.createElement("br"));
+    });
     layer.appendChild(legend);
   }
   renderManualBoxes(pageElement, boxes) {
@@ -100707,87 +100462,6 @@ var LayoutParserDebugModule = class {
       pageElement.appendChild(layer);
     }
     return layer;
-  }
-  ensureStyles() {
-    if (document.getElementById(STYLE_ID))
-      return;
-    const style = document.createElement("style");
-    style.id = STYLE_ID;
-    style.textContent = `
-            .${LAYER_CLASS} {
-                position: absolute;
-                left: 0;
-                top: 0;
-                width: 100%;
-                height: 100%;
-                pointer-events: none;
-                z-index: 220;
-            }
-            .${BOX_PARAGRAPH_CLASS} {
-                position: absolute;
-                box-sizing: border-box;
-                border: 1px solid rgba(37, 190, 122, 0.98);
-                background: rgba(37, 190, 122, 0.10);
-            }
-            .${BOX_COLUMN_CLASS} {
-                position: absolute;
-                box-sizing: border-box;
-                border: 1px solid rgba(53, 130, 246, 0.96);
-                background: rgba(53, 130, 246, 0.07);
-            }
-            .${BOX_GAP_CLASS} {
-                position: absolute;
-                box-sizing: border-box;
-                border: 1px dashed rgba(255, 78, 78, 0.98);
-                background: rgba(255, 78, 78, 0.12);
-            }
-            .${LINE_VERTICAL_GAP_CLASS} {
-                position: absolute;
-                top: 0;
-                width: 0;
-                height: 100%;
-                border-left: 2px solid rgba(255, 177, 31, 0.96);
-            }
-            .${BOX_MANUAL_CLASS} {
-                position: absolute;
-                box-sizing: border-box;
-                border: 2px solid rgba(255, 221, 87, 0.98);
-                background: rgba(255, 221, 87, 0.15);
-            }
-            .${LEGEND_CLASS} {
-                position: absolute;
-                left: 8px;
-                top: 8px;
-                padding: 6px 8px;
-                background: rgba(0, 0, 0, 0.74);
-                color: #ffffff;
-                font-size: 11px;
-                line-height: 1.35;
-                border-radius: 4px;
-                font-family: Menlo, Consolas, monospace;
-            }
-            .${LEGEND_CLASS} .i {
-                display: inline-block;
-                width: 10px;
-                height: 10px;
-                margin-right: 6px;
-                vertical-align: -1px;
-            }
-            .${LEGEND_CLASS} .i.p { background: rgba(37, 190, 122, 0.9); }
-            .${LEGEND_CLASS} .i.c { background: rgba(53, 130, 246, 0.9); }
-            .${LEGEND_CLASS} .i.g { background: rgba(255, 78, 78, 0.9); }
-            .${LEGEND_CLASS} .i.v { background: rgba(255, 177, 31, 0.9); }
-            .${LEGEND_CLASS} .i.m { background: rgba(255, 221, 87, 0.9); }
-            .${GHOST_CLASS} {
-                position: fixed;
-                box-sizing: border-box;
-                pointer-events: none;
-                z-index: 100000;
-                border: 2px dashed rgba(255, 221, 87, 0.98);
-                background: rgba(255, 221, 87, 0.14);
-            }
-        `;
-    document.head.appendChild(style);
   }
   buildDetectionSnapshot(pageElement, spans, result, pageNumber, source) {
     var _a, _b;
@@ -102223,15 +101897,15 @@ var PdfWatcher = class {
     if (queueItem) {
       this.queue.delete(pdfPath);
       this.notifyChange();
-      console.log(`[PdfWatcher] Removed deleted PDF from queue: ${pdfPath}`);
+      console.debug(`[PdfWatcher] Removed deleted PDF from queue: ${pdfPath}`);
     }
     if (this.plugin.pdfToMdMap.has(pdfPath)) {
       this.plugin.pdfToMdMap.delete(pdfPath);
-      console.log(`[PdfWatcher] Cleared pdfToMdMap entry for deleted PDF: ${pdfPath}`);
+      console.debug(`[PdfWatcher] Cleared pdfToMdMap entry for deleted PDF: ${pdfPath}`);
     }
     if (this.current && this.currentFilePath === pdfPath) {
       this.current.cancel();
-      console.log(`[PdfWatcher] Cancelled in-flight translation for deleted PDF: ${pdfPath}`);
+      console.debug(`[PdfWatcher] Cancelled in-flight translation for deleted PDF: ${pdfPath}`);
     }
     (_b = (_a = this.plugin.pdfLayoutQueue) == null ? void 0 : _a.clearFile) == null ? void 0 : _b.call(_a, pdfPath);
   }
@@ -102561,7 +102235,7 @@ var PdfWatcher = class {
     let lastProgressMsg = "";
     while (Date.now() - start < timeoutMs) {
       if (queue.isCancelled()) {
-        console.log(`[PdfWatcher] waitForQueueCompletion: queue cancelled, stopping wait for "${file.path}".`);
+        console.debug(`[PdfWatcher] waitForQueueCompletion: queue cancelled, stopping wait for "${file.path}".`);
         return;
       }
       const state = queue.getState();
@@ -102576,7 +102250,7 @@ var PdfWatcher = class {
         const elapsed = Math.round((Date.now() - start) / 1e3);
         const progressMsg = `[PdfWatcher] "${file.basename}" still processing: ${done}/${total} done, ${pending} pending (${elapsed}s elapsed)`;
         if (elapsed % 30 === 0 && progressMsg !== lastProgressMsg) {
-          console.log(progressMsg);
+          console.debug(progressMsg);
           lastProgressMsg = progressMsg;
         }
       }
@@ -102942,21 +102616,21 @@ Original error: ${this.pdfjsInitError}`
     let lastErr = null;
     try {
       if (debug)
-        console.log(`${LOG_PREFIX} import('pdfjs-dist/legacy/build/pdf.js')...`);
-      const mod = await Promise.resolve().then(() => __toESM(require_pdf()));
+        console.debug(`${LOG_PREFIX} import('pdfjs-dist/legacy/build/pdf.js')...`);
+      const mod = await Promise.resolve().then(() => __toESM(require_pdf(), 1));
       this.pdfjsLib = (_b = mod.default) != null ? _b : mod;
       if (debug)
-        console.log(`${LOG_PREFIX} Loaded pdfjs-dist (legacy CJS). Version: ${this.pdfjsLib.version || "unknown"}`);
+        console.debug(`${LOG_PREFIX} Loaded pdfjs-dist (legacy CJS). Version: ${this.pdfjsLib.version || "unknown"}`);
       if (debug)
-        console.log(`${LOG_PREFIX} import('pdfjs-dist/legacy/build/pdf.worker.js')...`);
-      const workerMod = await Promise.resolve().then(() => __toESM(require_pdf_worker()));
+        console.debug(`${LOG_PREFIX} import('pdfjs-dist/legacy/build/pdf.worker.js')...`);
+      const workerMod = await Promise.resolve().then(() => __toESM(require_pdf_worker(), 1));
       const workerExports = workerMod && typeof workerMod.WorkerMessageHandler !== "undefined" ? workerMod : workerMod == null ? void 0 : workerMod.default;
       if (workerExports && typeof workerExports.WorkerMessageHandler !== "undefined") {
         if (!globalThis.pdfjsWorker) {
           globalThis.pdfjsWorker = workerExports;
         }
         if (debug)
-          console.log(`${LOG_PREFIX} Registered bundled pdf.js worker (globalThis.pdfjsWorker).`);
+          console.debug(`${LOG_PREFIX} Registered bundled pdf.js worker (globalThis.pdfjsWorker).`);
       } else {
         console.warn(`${LOG_PREFIX} Bundled pdf.worker.js did not export WorkerMessageHandler; pdf.js may fall back to loadScript().`);
       }
@@ -102980,7 +102654,7 @@ The plugin installation appears to be corrupted \u2014 please reinstall the plug
       if (this.pdfjsLib.GlobalWorkerOptions) {
         this.pdfjsLib.GlobalWorkerOptions.workerSrc = "";
         if (debug)
-          console.log(`${LOG_PREFIX} pdfjs fake-worker mode enabled (workerSrc = '').`);
+          console.debug(`${LOG_PREFIX} pdfjs fake-worker mode enabled (workerSrc = '').`);
       } else {
         console.warn(`${LOG_PREFIX} pdfjsLib.GlobalWorkerOptions not found \u2014 worker may spawn unexpectedly.`);
       }
@@ -103036,10 +102710,10 @@ The plugin installation appears to be corrupted \u2014 please reinstall the plug
     const debug = !!((_a = this.plugin.settings) == null ? void 0 : _a.debugMode);
     const t0 = Date.now();
     if (debug)
-      console.log(`${LOG_PREFIX} extractPage("${file.path}", p${pageNum}) starting...`);
+      console.debug(`${LOG_PREFIX} extractPage("${file.path}", p${pageNum}) starting...`);
     const pdfBytes = await this.readPdfBytes(file);
     if (debug)
-      console.log(`${LOG_PREFIX} [p${pageNum}] PDF bytes: ${(pdfBytes.byteLength / 1024).toFixed(1)}KB (cached=${this.pdfBytesCache.has(file.path)})`);
+      console.debug(`${LOG_PREFIX} [p${pageNum}] PDF bytes: ${(pdfBytes.byteLength / 1024).toFixed(1)}KB (cached=${this.pdfBytesCache.has(file.path)})`);
     const pdfjsLib = await this.ensurePdfjs();
     const data = new Uint8Array(pdfBytes.slice(0));
     const t1 = Date.now();
@@ -103067,7 +102741,7 @@ The plugin installation appears to be corrupted \u2014 please reinstall the plug
       throw err;
     }
     if (debug)
-      console.log(`${LOG_PREFIX} [p${pageNum}] Document loaded in ${Date.now() - t1}ms`);
+      console.debug(`${LOG_PREFIX} [p${pageNum}] Document loaded in ${Date.now() - t1}ms`);
     try {
       const page = await pdf.getPage(pageNum);
       return await this.extractPageFromHandle(pdf, page, pageNum, debug, t0);
@@ -103126,10 +102800,10 @@ The plugin installation appears to be corrupted \u2014 please reinstall the plug
     const t0 = Date.now();
     const pageNumsPreview = pageNums.length <= 8 ? `[${pageNums.join(",")}]` : `[${pageNums.slice(0, 8).join(",")}+${pageNums.length - 8} more]`;
     if (debug)
-      console.log(`${LOG_PREFIX} extractPagesBatch("${file.path}", ${pageNumsPreview}) starting...`);
+      console.debug(`${LOG_PREFIX} extractPagesBatch("${file.path}", ${pageNumsPreview}) starting...`);
     const pdfBytes = await this.readPdfBytes(file);
     if (debug)
-      console.log(`${LOG_PREFIX} PDF bytes: ${(pdfBytes.byteLength / 1024).toFixed(1)}KB (cached=${this.pdfBytesCache.has(file.path)})`);
+      console.debug(`${LOG_PREFIX} PDF bytes: ${(pdfBytes.byteLength / 1024).toFixed(1)}KB (cached=${this.pdfBytesCache.has(file.path)})`);
     const pdfjsLib = await this.ensurePdfjs();
     const data = new Uint8Array(pdfBytes.slice(0));
     const t1 = Date.now();
@@ -103154,7 +102828,7 @@ The plugin installation appears to be corrupted \u2014 please reinstall the plug
       throw err;
     }
     if (debug)
-      console.log(`${LOG_PREFIX} Document loaded in ${Date.now() - t1}ms (reused for ${pageNums.length} page(s))`);
+      console.debug(`${LOG_PREFIX} Document loaded in ${Date.now() - t1}ms (reused for ${pageNums.length} page(s))`);
     try {
       for (const pageNum of pageNums) {
         if (this.disposed)
@@ -103182,7 +102856,7 @@ The plugin installation appears to be corrupted \u2014 please reinstall the plug
       if (debug) {
         const okCount = [...results.values()].filter((r) => !("error" in r)).length;
         const errCount = results.size - okCount;
-        console.log(`${LOG_PREFIX} Batch done in ${Date.now() - t0}ms (${okCount} ok, ${errCount} failed).`);
+        console.debug(`${LOG_PREFIX} Batch done in ${Date.now() - t0}ms (${okCount} ok, ${errCount} failed).`);
       }
     }
   }
@@ -103208,7 +102882,7 @@ The plugin installation appears to be corrupted \u2014 please reinstall the plug
     const pageWidth = viewport.width;
     const pageHeight = viewport.height;
     if (debug)
-      console.log(`${LOG_PREFIX} [p${pageNum}] Page size: ${pageWidth.toFixed(0)}\xD7${pageHeight.toFixed(0)}`, {
+      console.debug(`${LOG_PREFIX} [p${pageNum}] Page size: ${pageWidth.toFixed(0)}\xD7${pageHeight.toFixed(0)}`, {
         view: page.view,
         offsetX: viewport.offsetX,
         offsetY: viewport.offsetY,
@@ -103217,17 +102891,17 @@ The plugin installation appears to be corrupted \u2014 please reinstall the plug
     const t2 = Date.now();
     const textContent = await page.getTextContent();
     if (debug)
-      console.log(`${LOG_PREFIX} [p${pageNum}] getTextContent: ${textContent.items.length} items in ${Date.now() - t2}ms`);
+      console.debug(`${LOG_PREFIX} [p${pageNum}] getTextContent: ${textContent.items.length} items in ${Date.now() - t2}ms`);
     const t3 = Date.now();
     await page.getOperatorList();
     if (debug)
-      console.log(`${LOG_PREFIX} [p${pageNum}] getOperatorList: ${Date.now() - t3}ms (font loading)`);
+      console.debug(`${LOG_PREFIX} [p${pageNum}] getOperatorList: ${Date.now() - t3}ms (font loading)`);
     const fontNames = this.resolveFontNames(textContent.items, page);
     if (debug)
-      console.log(`${LOG_PREFIX} [p${pageNum}] Resolved ${fontNames.size} font(s)`);
+      console.debug(`${LOG_PREFIX} [p${pageNum}] Resolved ${fontNames.size} font(s)`);
     const rects = this.buildInputRects(textContent.items, fontNames, viewport);
     if (debug)
-      console.log(`${LOG_PREFIX} [p${pageNum}] Built ${rects.length} input rects`);
+      console.debug(`${LOG_PREFIX} [p${pageNum}] Built ${rects.length} input rects`);
     const t4 = Date.now();
     const ls = this.plugin.layoutSettings;
     const contourCellSize = typeof (ls == null ? void 0 : ls.contourCellSize) === "number" && ls.contourCellSize > 0 ? ls.contourCellSize : 4;
@@ -103244,11 +102918,11 @@ The plugin installation appears to be corrupted \u2014 please reinstall the plug
       decorationThreshold: typeof (ls == null ? void 0 : ls.decorationThreshold) === "number" ? ls.decorationThreshold : 0.7
     });
     if (debug)
-      console.log(`${LOG_PREFIX} [p${pageNum}] Pipeline: ${rects.length} rects \u2192 ${paragraphs.length} paragraphs in ${Date.now() - t4}ms`);
+      console.debug(`${LOG_PREFIX} [p${pageNum}] Pipeline: ${rects.length} rects \u2192 ${paragraphs.length} paragraphs in ${Date.now() - t4}ms`);
     const normalized = paragraphs.map((p) => this.normalizeParagraph(p, pageWidth, pageHeight, pageNum));
     const totalMs = Date.now() - t0;
     if (debug)
-      console.log(`${LOG_PREFIX} [p${pageNum}] Total: ${normalized.length} paragraphs in ${totalMs}ms`);
+      console.debug(`${LOG_PREFIX} [p${pageNum}] Total: ${normalized.length} paragraphs in ${totalMs}ms`);
     return { paragraphs: normalized, pageWidth, pageHeight, pageNum };
   }
   /**
@@ -104040,7 +103714,7 @@ var PdfLayoutQueue = class {
       (_b = this.plugin.settings.backgroundTranslationConcurrency) != null ? _b : 3
     ));
     if (debug)
-      console.log(`${LOG_PREFIX2} processQueue starting (concurrency=${concurrency})`);
+      console.debug(`${LOG_PREFIX2} processQueue starting (concurrency=${concurrency})`);
     const MAX_QUEUE_SIZE = Math.max(10, concurrency * 10);
     const translationQueue = [];
     let translationQueueClosed = false;
@@ -104083,7 +103757,7 @@ var PdfLayoutQueue = class {
             return;
           }
           if (debug) {
-            console.log(`${LOG_PREFIX2} [p${jobTask.pageNum}] Translated ${translatedTexts.length} segment(s) in ${translateMs}ms (worker ${workerId}).`);
+            console.debug(`${LOG_PREFIX2} [p${jobTask.pageNum}] Translated ${translatedTexts.length} segment(s) in ${translateMs}ms (worker ${workerId}).`);
           }
           const overlayData = this.buildOverlayData(paragraphs, translatedTexts);
           if (overlayData.length === 0) {
@@ -104152,7 +103826,7 @@ var PdfLayoutQueue = class {
         this.notifyChange();
         const batchPageNums = pendingTasks.map((p) => p.pageNum);
         if (debug)
-          console.log(`${LOG_PREFIX2} [${shortName}] Batch extracting ${batchPageNums.length} page(s): ${batchPageNums.join(",")}`);
+          console.debug(`${LOG_PREFIX2} [${shortName}] Batch extracting ${batchPageNums.length} page(s): ${batchPageNums.join(",")}`);
         new import_obsidian27.Notice(`\u{1F4D6} [${shortName}] extracting ${batchPageNums.length} page(s)...`, 2e3);
         const extractStart = Date.now();
         let results;
@@ -104176,7 +103850,7 @@ var PdfLayoutQueue = class {
         }
         const extractMs = Date.now() - extractStart;
         if (debug)
-          console.log(`${LOG_PREFIX2} [${shortName}] Batch extraction done in ${extractMs}ms (${results.size} results).`);
+          console.debug(`${LOG_PREFIX2} [${shortName}] Batch extraction done in ${extractMs}ms (${results.size} results).`);
         for (const { pageNum, task } of pendingTasks) {
           if (this.cancelled) {
             task.status = "error";
@@ -104207,7 +103881,7 @@ var PdfLayoutQueue = class {
             continue;
           }
           if (debug) {
-            console.log(`${LOG_PREFIX2} [p${pageNum}] Extracted ${result.paragraphs.length} paragraph(s).`);
+            console.debug(`${LOG_PREFIX2} [p${pageNum}] Extracted ${result.paragraphs.length} paragraph(s).`);
           }
           while (translationQueue.length >= MAX_QUEUE_SIZE) {
             if (this.cancelled || this.disposed)
@@ -104317,7 +103991,7 @@ var PdfLayoutQueue = class {
     const result = new Array(paragraphs.length).fill("");
     if (translatableTexts.length === 0) {
       if (debug)
-        console.log(`${LOG_PREFIX2} [p${pageNum}] No translatable text on page.`);
+        console.debug(`${LOG_PREFIX2} [p${pageNum}] No translatable text on page.`);
       return result;
     }
     let filteredTexts = translatableTexts;
@@ -104335,7 +104009,7 @@ var PdfLayoutQueue = class {
             skippedByFilter.add(translatableIndices[localIdx]);
           }
           if (debug) {
-            console.log(`${LOG_PREFIX2} [p${pageNum}] ParagraphFilter: ${skipped.size}/${translatableTexts.length} paragraphs filtered (not sent to LLM)`);
+            console.debug(`${LOG_PREFIX2} [p${pageNum}] ParagraphFilter: ${skipped.size}/${translatableTexts.length} paragraphs filtered (not sent to LLM)`);
           }
         }
       }
@@ -104545,23 +104219,14 @@ var OpenRouterTranslatorPlugin = class extends import_obsidian28.Plugin {
     this.recentlyWrittenPaths = /* @__PURE__ */ new Map();
   }
   async onload() {
-    console.log("\u{1F9E9} OpenRouter PDF Translator plugin loaded");
+    console.debug("\u{1F9E9} OpenRouter PDF Translator plugin loaded");
     try {
       const detected = this.detectLocale();
-      console.log(`[PDF Translator] Detected locale: "${detected}" \u2192 using "${this.mapLocale(detected)}"`);
+      console.debug(`[PDF Translator] Detected locale: "${detected}" \u2192 using "${this.mapLocale(detected)}"`);
       initI18n(this.mapLocale(detected));
     } catch (e) {
       console.warn("[PDF Translator] Locale detection failed, falling back to English:", e);
       initI18n("en");
-    }
-    try {
-      const styleEl = document.createElement("style");
-      styleEl.id = "pdf-translate-settings-ui-css";
-      styleEl.textContent = SETTINGS_UI_CSS;
-      document.head.appendChild(styleEl);
-      this.register(() => styleEl.remove());
-    } catch (e) {
-      console.warn("[PDF Translator] Failed to inject settings UI CSS:", e);
     }
     await this.loadSettings();
     this.debouncedBuildMap = (0, import_obsidian28.debounce)(async () => {
@@ -105263,7 +104928,7 @@ Open ${file.name}.translations.md to edit or use for backdoor translation.`,
       }
     }
     if (occFixed > 0 && this.settings.debugMode) {
-      console.log(`[LayoutDetector] Reset ${occFixed} invalid OCC field(s) to defaults`);
+      console.debug(`[LayoutDetector] Reset ${occFixed} invalid OCC field(s) to defaults`);
     }
     if (this.settings.layoutEngine === "ocr-api") {
       this.settings.layoutEngine = "internal";
@@ -105452,7 +105117,7 @@ Open ${file.name}.translations.md to edit or use for backdoor translation.`,
   }
   onunload() {
     var _a, _b, _c, _d, _e, _f, _g, _h, _i, _j, _k, _l, _m, _n;
-    console.log("\u{1F9E9} OpenRouter PDF Translator plugin unloaded");
+    console.debug("\u{1F9E9} OpenRouter PDF Translator plugin unloaded");
     try {
       (_b = (_a = this.debouncedBuildMap) == null ? void 0 : _a.cancel) == null ? void 0 : _b.call(_a);
     } catch (e) {
@@ -105527,7 +105192,7 @@ Open ${file.name}.translations.md to edit or use for backdoor translation.`,
   }
   logDebug(message, ...args) {
     if (this.settings.debugMode) {
-      console.log(`[PDF Translator] ${message}`, ...args);
+      console.debug(`[PDF Translator] ${message}`, ...args);
     }
   }
 };
@@ -105557,7 +105222,7 @@ var CleanTranslationsModal = class extends SingletonModal {
       });
       const checkbox = itemEl.createEl("input", { type: "checkbox" });
       checkbox.checked = true;
-      checkbox.style.marginTop = "4px";
+      checkbox.setCssStyles({ marginTop: "4px" });
       checkboxes.push(checkbox);
       const labelEl = itemEl.createEl("div");
       const mdName = orphan.mdFile.name.replace(".translations.md", "");

@@ -182,7 +182,7 @@ export class ExternalLayoutService {
 
           // Success: Cache the results
           this.layoutCache.set(filePath, result);
-          console.log(`External Layout Cached for ${filePath}`);
+          console.debug(`External Layout Cached for ${filePath}`);
           resolve(result);
 
         } catch (e) {

@@ -5,8 +5,6 @@ import { OpenRouterTranslatorSettings, DEFAULT_SETTINGS, OverlayPositionData } f
 // Initialise i18n strings for the new provider-registry UI (X-7).
 import { initI18n } from './i18n-strings';
 import { t } from './i18n';
-// CSS for the Progressive Disclosure settings UI.
-import { SETTINGS_UI_CSS } from './settings-ui.css';
 // Phase 7 (V4 Schema): stable per-overlay identifier generator. Stamped on
 // every originals-only layout overlay (createLayoutFileWithOriginals) so the
 // .translations.md file produced by "Create layout file" command has stable
@@ -97,7 +95,7 @@ export default class OpenRouterTranslatorPlugin extends Plugin {
     public isReady: Promise<void>;
 
     async onload() {
-        console.log('🧩 OpenRouter PDF Translator plugin loaded');
+        console.debug('🧩 OpenRouter PDF Translator plugin loaded');
 
         // ─── Locale detection ───
         // Detect Obsidian's UI language so the plugin UI matches. Priority:
@@ -108,23 +106,11 @@ export default class OpenRouterTranslatorPlugin extends Plugin {
         // Unsupported locales fall back to English (keys are defined in EN first).
         try {
             const detected = this.detectLocale();
-            console.log(`[PDF Translator] Detected locale: "${detected}" → using "${this.mapLocale(detected)}"`);
+            console.debug(`[PDF Translator] Detected locale: "${detected}" → using "${this.mapLocale(detected)}"`);
             initI18n(this.mapLocale(detected));
         } catch (e) {
             console.warn('[PDF Translator] Locale detection failed, falling back to English:', e);
             initI18n('en');
-        }
-
-        // Inject CSS for the Progressive Disclosure settings UI (level cards,
-        // preset chips, warning boxes, section groups).
-        try {
-            const styleEl = document.createElement('style');
-            styleEl.id = 'pdf-translate-settings-ui-css';
-            styleEl.textContent = SETTINGS_UI_CSS;
-            document.head.appendChild(styleEl);
-            this.register(() => styleEl.remove());
-        } catch (e) {
-            console.warn('[PDF Translator] Failed to inject settings UI CSS:', e);
         }
 
         await this.loadSettings();
@@ -1080,7 +1066,7 @@ export default class OpenRouterTranslatorPlugin extends Plugin {
             }
         }
         if (occFixed > 0 && this.settings.debugMode) {
-            console.log(`[LayoutDetector] Reset ${occFixed} invalid OCC field(s) to defaults`);
+            console.debug(`[LayoutDetector] Reset ${occFixed} invalid OCC field(s) to defaults`);
         }
 
         // Phase 1 (C2): the PresetManager + VaultStorage adapter (~50 lines)
@@ -1321,7 +1307,7 @@ export default class OpenRouterTranslatorPlugin extends Plugin {
     }
 
     onunload() {
-        console.log('🧩 OpenRouter PDF Translator plugin unloaded');
+        console.debug('🧩 OpenRouter PDF Translator plugin unloaded');
         // FIX (v5): use optional chaining on ALL services — if onload failed
         // early (e.g. import error), some services may not be initialized yet.
         // Without this, onunload crashes with "Cannot read properties of
@@ -1404,7 +1390,7 @@ export default class OpenRouterTranslatorPlugin extends Plugin {
 
     logDebug(message: string, ...args: any[]): void {
         if (this.settings.debugMode) {
-            console.log(`[PDF Translator] ${message}`, ...args);
+            console.debug(`[PDF Translator] ${message}`, ...args);
         }
     }
 }
@@ -1460,7 +1446,7 @@ export class CleanTranslationsModal extends SingletonModal<CleanTranslationsModa
 
             const checkbox = itemEl.createEl('input', { type: 'checkbox' });
             checkbox.checked = true;
-            checkbox.style.marginTop = '4px';
+            checkbox.setCssStyles({ marginTop: '4px' });
             checkboxes.push(checkbox);
 
             const labelEl = itemEl.createEl('div');
