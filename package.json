@@ -1,12 +1,14 @@
 {
   "name": "openrouter-pdf-translator",
   "version": "0.4.0",
-  "description": "Translate PDFs in Obsidian via OpenRouter and other LLM providers (overhauled build — bundled pdf.js, no CDN)",
+  "description": "Translate PDFs in Obsidian via OpenRouter and other LLM providers (standard Obsidian esbuild build, bundled pdf.js, no CDN)",
   "main": "main.js",
   "scripts": {
-    "dev": "node esbuild.mjs",
-    "build": "node esbuild.mjs production",
-    "verify": "bash scripts/verify-bundle.sh"
+    "dev": "node scripts/patch-pdfjs.mjs && node esbuild.mjs",
+    "build": "node scripts/patch-pdfjs.mjs && node esbuild.mjs production && node scripts/verify-bundle.mjs",
+    "verify": "node scripts/verify-bundle.mjs",
+    "test": "node scripts/patch-pdfjs.mjs && node build-runtime-tests.mjs && node test-runtime-bundle.js && node test-e2e-bundle.js",
+    "postinstall": "node scripts/patch-pdfjs.mjs"
   },
   "keywords": [
     "obsidian",
