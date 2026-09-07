@@ -564,6 +564,29 @@ export class PdfLayoutQueue {
   }
 
   /**
+   * FIX (stale-cancel, 2026-09): clear the sticky `cancelled` flag WITHOUT
+   * resuming background processing.
+   *
+   * `cancel()` sets a flag that is only reset by `resume()` or by the next
+   * explicit enqueue (triggerProcessing auto-resume). The interactive
+   * translation path (TextProcessor.executeTranslation) checks the flag
+   * between chunks but never reset it — so ONE Cancel anywhere (modal
+   * button, watcher stop) permanently poisoned every subsequent page
+   * translation: it threw 'cancelled' on the first chunk, fell back to the
+   * original texts and rendered untranslated overlays with a success toast.
+   *
+   * Unlike `resume()`, this does NOT kick `processQueue()` — pending
+   * background tasks stay pending until the user resumes them explicitly.
+   * Callers should only invoke this when the queue is idle
+   * (`!isRunning()`), so an in-flight cancellation wind-down is not undone.
+   */
+  clearCancelFlag(): void {
+    if (!this.cancelled) return;
+    this.cancelled = false;
+    this.notifyChange();
+  }
+
+  /**
    * Phase 11 (P2-22): remove ALL queue state for `filePath` — including
    * pending, running, and done tasks — without regard for terminal status.
    *

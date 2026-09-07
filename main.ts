@@ -335,6 +335,18 @@ export default class OpenRouterTranslatorPlugin extends Plugin {
                     if (this.overlay) {
                         this.overlay.resetStateForNewFile();
                     }
+                    // Bug fix: immediately re-attach marquee listeners if BBox
+                    // edit mode is ON. Don't wait for the debounced
+                    // setupPDFMonitoring (300ms) — the user might shift+drag
+                    // immediately after opening a PDF.
+                    if (this.settings.bboxEditMode && this.overlay) {
+                        try {
+                            this.overlay.detachMarqueeListeners();
+                            this.overlay.attachMarqueeListeners();
+                        } catch (e) {
+                            console.error('[active-leaf-change] marquee re-attach failed:', e);
+                        }
+                    }
                 }
 
                 // Phase 10: was `setTimeout(() => { ... }, 300)`. Replaced
@@ -677,28 +689,17 @@ export default class OpenRouterTranslatorPlugin extends Plugin {
                 } catch (e) {
                     console.error('[toggle-bbox-edit-mode] marquee listener attach/detach failed:', e);
                 }
-                // FIX (bbox race): pause/resume the background queue while the
-                // user is editing overlays. Without this, the worker could
-                // write a page mid-edit and clobber the user's manual changes
-                // via the read-modify-write merge in updatePageOverlaysAndWrite.
-                if (this.pdfLayoutQueue) {
-                    if (this.settings.bboxEditMode) {
-                        this.pdfLayoutQueue.cancel();
-                        new Notice(
-                            `BBox Edit Mode enabled. Background translation paused ` +
-                            `(running task will finish, no new tasks start).`,
-                            4000,
-                        );
-                    } else {
-                        this.pdfLayoutQueue.resume();
-                        new Notice(
-                            `BBox Edit Mode disabled. Background translation resumed.`,
-                            3000,
-                        );
-                    }
-                } else {
-                    new Notice(`BBox Edit Mode ${this.settings.bboxEditMode ? 'enabled' : 'disabled'}.`);
-                }
+                // Bug fix: BBox Edit Mode NO LONGER pauses the background queue.
+                // Previously this called pdfLayoutQueue.cancel() which permanently
+                // paused the queue until BBox mode was toggled off. But:
+                //   1. Interactive translation (addTextOverlay) doesn't use the queue
+                //      — it goes through processing.ts directly, so it was never blocked.
+                //   2. The queue.cancel() call made it look like BBox mode "blocked
+                //      translations" because background queue stayed stuck.
+                //   3. triggerProcessing() now auto-resumes on new enqueue, so even
+                //      if queue was cancelled, it would auto-resume. But the Notice
+                //      was misleading.
+                new Notice(`BBox Edit Mode ${this.settings.bboxEditMode ? 'enabled' : 'disabled'}.`);
             }
         });
 

@@ -440,6 +440,16 @@ export class OverlayRenderer {
         // Cleanup previous observers
         this.cleanupMonitoring();
 
+        // Bug fix: re-attach marquee listeners if BBox edit mode is ON.
+        // The OverlayUIRenderer constructor attaches them once, but if the
+        // user opens a NEW PDF (leaf change), the old listeners are still on
+        // `document` — however, they may have been detached by a prior
+        // cleanupMonitoring() or leaf switch. Re-attach to be safe.
+        if (this.plugin.settings.bboxEditMode && this.uiRenderer) {
+            this.uiRenderer.detachMarqueeListeners();
+            this.uiRenderer.attachMarqueeListeners();
+        }
+
         // Load translation data and identify pages that need overlays
         await this.initializeOverlayStateForPdf(leaf.view.file);
 

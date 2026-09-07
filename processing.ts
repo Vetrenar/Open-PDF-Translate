@@ -403,6 +403,28 @@ export class TextProcessor {
 
     if (units.length === 0) return [];
 
+    // FIX (stale-cancel, 2026-09): PdfLayoutQueue's `cancelled` flag is
+    // sticky — it survives the end of the session that set it (a modal
+    // Cancel button, PdfWatcher.stop(), dispose on unload). The queue path
+    // auto-clears it on the next enqueue (triggerProcessing), but the
+    // INTERACTIVE path never did: one Cancel anywhere permanently broke
+    // every subsequent page translation — performChunkedTranslation /
+    // performSequentialTranslation threw 'cancelled' on the first chunk,
+    // this method's catch fell back to the original texts, and the user
+    // saw "Translation failed: cancelled" while untranslated overlays were
+    // rendered as if the translation had succeeded.
+    //
+    // Starting a new interactive translation is an explicit user action:
+    // if the queue is idle (not winding down an in-flight cancellation),
+    // clear the stale flag first — same rationale as triggerProcessing's
+    // auto-resume ("if the user wanted to stay paused, they wouldn't have
+    // clicked Translate"). Mid-run Cancel still works: pressing Cancel
+    // AFTER this point sets the flag again and the per-chunk checks abort.
+    const staleQueue = this.plugin.pdfLayoutQueue;
+    if (staleQueue?.isCancelled?.() && !staleQueue.isRunning()) {
+      staleQueue.clearCancelFlag();
+    }
+
     // Stage 2.4 (NEW): Apply paragraph filter rules. Paragraphs matching
     // enabled filter rules (page numbers, single letters, etc.) are NOT
     // sent to the LLM — their original text is used as the "translation".

@@ -81,22 +81,28 @@ export class OverlayUIRenderer {
     // Reusable measurement element — created once, reused every call (perf fix)
     private measureSpan: HTMLSpanElement | null = null;
     private selectedOverlays: Set<HTMLElement> = new Set();
-    private selectionBox: HTMLDivElement | null = null;
-    private marqueeActive = false;
-    private marqueeStart: { x: number; y: number } | null = null;
-    private marqueeContainer: HTMLElement | null = null;
-    private marqueeHoldTimer: number | null = null;
-    private marqueeHandlers: {
-        down?: (event: MouseEvent) => void;
-        move?: (event: MouseEvent) => void;
-        up?: (event: MouseEvent) => void;
-    } = {};
-    // P1-17 (Phase 14): marquee listeners are now attached lazily on BBox
-    // edit-mode enter and detached on exit / cleanup. Previously they were
-    // attached once in the constructor and remained for the lifetime of the
-    // OverlayUIRenderer — meaning every mousedown / mousemove / mouseup on
-    // the entire document fired the handler even when BBox mode was off.
-    private marqueeListenersAttached = false;
+
+    // fix-bbox-selection: full-screen transparent overlay that captures
+    // ALL pointer events while BBox Edit Mode is ON. This replaces the old
+    // document-level capture-phase mousedown/mousemove/mouseup listeners
+    // which conflicted with per-overlay click handlers (the document
+    // handler fired first in the capture phase, called stopPropagation(),
+    // and prevented the overlay's click from ever firing). With a
+    // dedicated overlay div we get clean event ownership: this overlay
+    // owns all pointer events in BBox mode, and per-overlay handlers
+    // only fire in non-BBox mode (when this overlay is not in the DOM).
+    private selectionOverlay: HTMLElement | null = null;
+    // The marquee selection rectangle drawn on top of selectionOverlay.
+    private selectionDiv: HTMLElement | null = null;
+    // True while BBox Edit Mode is ON (selectionOverlay is present in DOM).
+    private isSelecting: boolean = false;
+    // True while a pointer drag is in progress (pointerdown → pointerup).
+    private isDragging: boolean = false;
+    // Anchor point of the current drag (clientX/Y from pointerdown).
+    private startX: number = 0;
+    private startY: number = 0;
+    // Escape-key listener registered while selectionOverlay is attached.
+    private boundOnKeyDown: ((e: KeyboardEvent) => void) | null = null;
 
     // P1-16 (Phase 15): monotonic z-index counter for `bringToTop`. The
     // previous implementation scanned every `.pdf-text-overlay-reflow` node
@@ -119,7 +125,10 @@ export class OverlayUIRenderer {
     constructor(plugin: OpenRouterTranslatorPlugin) {
         this.plugin = plugin;
         this.ensureGlobalStyles();
-        this.initMarqueeSelection();
+        // fix-bbox-selection: marquee/selection system is now lazily
+        // attached via attachMarqueeListeners() when BBox Edit Mode is
+        // toggled ON, and fully torn down via detachMarqueeListeners() on
+        // OFF / cleanup. No constructor-time initialisation is needed.
     }
 
     /**
@@ -203,197 +212,236 @@ export class OverlayUIRenderer {
         return !!this.plugin.settings.bboxEditMode;
     }
 
-    private initMarqueeSelection(): void {
-        const startSelectionBox = (x: number, y: number) => {
-            if (this.selectionBox) return;
-            const box = document.createElement('div');
-            box.style.position = 'fixed';
-            box.style.left = `${x}px`;
-            box.style.top = `${y}px`;
-            box.style.width = '0px';
-            box.style.height = '0px';
-            box.style.border = '1px dashed var(--interactive-accent)';
-            // Phase 17 (C19): color-mix gives a 12%-opacity accent fill,
-            // matching the old `rgba(29,122,252,0.12)` but theme-aware.
-            box.style.background = 'color-mix(in srgb, var(--interactive-accent) 12%, transparent)';
-            box.style.pointerEvents = 'none';
-            box.style.zIndex = '100000';
-            document.body.appendChild(box);
-            this.selectionBox = box;
-        };
-
-        const clearHoldTimer = () => {
-            if (this.marqueeHoldTimer !== null) {
-                window.clearTimeout(this.marqueeHoldTimer);
-                this.marqueeHoldTimer = null;
-            }
-        };
-
-        const onMouseDown = (event: MouseEvent) => {
-            if (!this.isBBoxEditMode()) return;
-            if (event.button !== 0) return;
-            const target = event.target as HTMLElement | null;
-            if (!target) return;
-            const container = target.closest('.pdf-text-overlay-container') as HTMLElement | null;
-            if (!container) return;
-            const clickedOverlay = target.closest('.pdf-text-overlay-reflow');
-            if (clickedOverlay) return;
-
-            event.preventDefault();
-            event.stopPropagation();
-            this.marqueeActive = true;
-            this.marqueeContainer = container;
-            this.marqueeStart = { x: event.clientX, y: event.clientY };
-            this.selectionBox?.remove();
-            this.selectionBox = null;
-            clearHoldTimer();
-            // Hold LMB briefly to trigger marquee box, like standard bbox tools.
-            this.marqueeHoldTimer = window.setTimeout(() => {
-                if (!this.marqueeActive || !this.marqueeStart) return;
-                startSelectionBox(this.marqueeStart.x, this.marqueeStart.y);
-            }, 140);
-        };
-
-        const onMouseMove = (event: MouseEvent) => {
-            if (!this.marqueeActive || !this.marqueeStart) return;
-            const dist = Math.hypot(event.clientX - this.marqueeStart.x, event.clientY - this.marqueeStart.y);
-            if (dist > 6 && !this.selectionBox) {
-                clearHoldTimer();
-                startSelectionBox(this.marqueeStart.x, this.marqueeStart.y);
-            }
-            if (!this.selectionBox) return;
-            const left = Math.min(this.marqueeStart.x, event.clientX);
-            const top = Math.min(this.marqueeStart.y, event.clientY);
-            const width = Math.abs(event.clientX - this.marqueeStart.x);
-            const height = Math.abs(event.clientY - this.marqueeStart.y);
-            this.selectionBox.style.left = `${left}px`;
-            this.selectionBox.style.top = `${top}px`;
-            this.selectionBox.style.width = `${width}px`;
-            this.selectionBox.style.height = `${height}px`;
-        };
-
-        const onMouseUp = (event: MouseEvent) => {
-            if (!this.marqueeActive || !this.marqueeStart || !this.marqueeContainer) return;
-            clearHoldTimer();
-            const left = Math.min(this.marqueeStart.x, event.clientX);
-            const top = Math.min(this.marqueeStart.y, event.clientY);
-            const right = Math.max(this.marqueeStart.x, event.clientX);
-            const bottom = Math.max(this.marqueeStart.y, event.clientY);
-
-            // P2-27 (Phase 15): capture the page number BEFORE clearing
-            // marqueeContainer below — we use it for the page-scoped Notice.
-            // The marquee is bounded by `marqueeContainer` (the
-            // `.pdf-text-overlay-container` of the page where mousedown
-            // fired), so only overlays on THAT page can be selected — even
-            // if the user dragged the selection box across two pages
-            // visually. Inform the user so they don't expect overlays from
-            // the second page to also be selected.
-            const marqueePageEl = this.marqueeContainer.closest('.page') as HTMLElement | null;
-            const marqueePageNumber = marqueePageEl?.getAttribute('data-page-number') || '';
-
-            // feat-1 (mass-select): shift+drag is additive (matches the
-            // pre-existing ctrl/meta behaviour), so an existing selection
-            // is preserved. Previously only ctrl/meta preserved it; a
-            // shift+drag would `clearSelection()` and silently wipe the
-            // mass-selection the user just built — breaking the
-            // shift+LMB-toggle → shift+drag-add workflow.
-            const additive = event.shiftKey || event.ctrlKey || event.metaKey;
-
-            if (this.selectionBox) {
-                const overlays = Array.from(this.marqueeContainer.querySelectorAll<HTMLElement>('.pdf-text-overlay-reflow'));
-                if (!additive) this.clearSelection();
-                for (const ov of overlays) {
-                    const r = ov.getBoundingClientRect();
-                    const overlaps = !(r.right < left || r.left > right || r.bottom < top || r.top > bottom);
-                    if (overlaps) {
-                        this.selectedOverlays.add(ov);
-                        this.updateSelectionVisual(ov, true);
-                    }
-                }
-                // P2-27 (Phase 15): notify if marquee selection completed.
-                // The marquee is page-scoped — only overlays whose
-                // container matches the mousedown page can be selected.
-                // When the user drags across two pages visually they may
-                // expect overlays from BOTH pages to be selected; the
-                // Notice explains why only one page's overlays are.
-                const selectedCount = this.selectedOverlays.size;
-                if (selectedCount > 0) {
-                    const pageLabel = marqueePageNumber ? `page ${marqueePageNumber}` : 'the current page';
-                    new Notice(
-                        `Selected ${selectedCount} boxes on ${pageLabel}. (Marquee is page-scoped)`,
-                        3000
-                    );
-                }
-            } else {
-                // feat-1 (mass-select): mousedown landed on empty space
-                // (the marquee down-handler only arms `marqueeActive` when
-                // no overlay was hit) but no actual drag happened —
-                // `selectionBox` is null because movement stayed under the
-                // 6px threshold AND the 140ms hold timer didn't fire in
-                // time. Treat this as a plain click on empty space:
-                // clear the selection unless an additive modifier
-                // (shift/ctrl/meta) is held, which signals the user
-                // intended additive marquee and we should leave the
-                // existing selection alone.
-                if (!additive) {
-                    this.clearSelection();
-                }
-            }
-
-            this.selectionBox?.remove();
-            this.selectionBox = null;
-            this.marqueeActive = false;
-            this.marqueeStart = null;
-            this.marqueeContainer = null;
-        };
-
-        this.marqueeHandlers = { down: onMouseDown, move: onMouseMove, up: onMouseUp };
-        // P1-17 (Phase 14): do NOT attach listeners here — they are now
-        // attached lazily by `attachMarqueeListeners()` when BBox edit mode
-        // is entered, and detached by `detachMarqueeListeners()` on exit /
-        // cleanup. This avoids firing marquee handlers on every document
-        // mouse event when BBox mode is off.
-    }
+    // ============================================================
+    // BBox Selection (pointer-events based, fix-bbox-selection)
+    // ============================================================
+    //
+    // WHY POINTER EVENTS ON A FULL-SCREEN OVERLAY?
+    //
+    // The previous implementation registered mousedown/mousemove/mouseup
+    // listeners on `document` with capture phase (`true`). Because the
+    // capture phase fires top-down, the document-level handler ran BEFORE
+    // the per-overlay click handler — and called `event.stopPropagation()`,
+    // which prevented the click from ever reaching the overlay. Result:
+    // shift+LMB mass-selection and empty-space deselect silently did
+    // nothing.
+    //
+    // The empty-space deselect also failed because `marqueeActive` was
+    // only armed when the mousedown landed on a `.pdf-text-overlay-container`
+    // but NOT on a `.pdf-text-overlay-reflow`. A plain click on empty space
+    // (e.g. on the page background outside the container) didn't even enter
+    // the marquee code path, so `onMouseUp` early-returned and never ran
+    // the deselect branch.
+    //
+    // The fix follows the user-provided reference pattern: while BBox Edit
+    // Mode is ON, a full-screen transparent `div` is appended to
+    // `document.body` with `position: fixed; inset: 0; z-index: 99999`. It
+    // intercepts ALL pointer events (pointerdown / pointermove / pointerup)
+    // and uses `setPointerCapture` so the same element keeps receiving
+    // events even if the pointer leaves its bounds. On pointerup:
+    //   - If the pointer moved > 5px → marquee drag → intersect the
+    //     drawn rect against every `.pdf-text-overlay-reflow` on the page
+    //     and add the hits to the selection.
+    //   - Otherwise it's a click → temporarily hide the overlay, call
+    //     `elementFromPoint` to find what's underneath, then either toggle
+    //     / select that overlay or clear the selection (empty space).
+    //
+    // Right-clicks are forwarded to the underlying overlay's
+    // `showContextMenu` via a `contextmenu` listener on the overlay, so the
+    // existing context-menu workflow keeps working in BBox mode.
 
     /**
-     * P1-17 (Phase 14): attach the marquee mousedown/mousemove/mouseup
-     * listeners to the document. Idempotent — safe to call multiple times.
-     * Called from `overlay.attachMarqueeListeners()` which is in turn called
-     * from `main.ts` when BBox edit mode is toggled ON.
+     * fix-bbox-selection: turn BBox Edit Mode ON. Creates the full-screen
+     * pointer-capture overlay and registers the Escape key listener.
+     * Idempotent — safe to call multiple times. Called from
+     * `overlay.attachMarqueeListeners()` (in turn called from `main.ts`
+     * when the user toggles BBox edit mode ON, and from `overlay.ts`
+     * constructor if BBox mode was already enabled at plugin load).
      */
     public attachMarqueeListeners(): void {
-        if (this.marqueeListenersAttached) return;
-        if (this.marqueeHandlers.down) document.addEventListener('mousedown', this.marqueeHandlers.down, true);
-        if (this.marqueeHandlers.move) document.addEventListener('mousemove', this.marqueeHandlers.move, true);
-        if (this.marqueeHandlers.up) document.addEventListener('mouseup', this.marqueeHandlers.up, true);
-        this.marqueeListenersAttached = true;
+        if (this.isSelecting) return;
+        this.isSelecting = true;
+
+        // NEW APPROACH: No permanent overlay. BBox Edit Mode is non-invasive:
+        //   - Normal cursor, scrolling works, all UI works
+        //   - Click on bbox → select (per-overlay clickHandler already handles this)
+        //   - Ctrl/shift+click → toggle (per-overlay clickHandler handles this)
+        //   - Click on empty space → deselect (document-level click listener)
+        //   - Shift+LMB+drag → temporary marquee overlay (created on pointerdown, removed on pointerup)
+        //
+        // Listeners are on `document` (not a full-screen overlay) so they
+        // don't block scrolling, menus, or any other Obsidian UI.
+
+        // 1. Shift+LMB mousedown → start temporary marquee
+        //    Use mousedown (not pointerdown) for broader compatibility —
+        //    some Obsidian/Electron environments don't fire pointerdown reliably.
+        document.addEventListener('mousedown', this.onDocMouseDown, true);
+
+        // 2. Click on empty space → deselect (uses click, not mousedown,
+        //    so it doesn't interfere with scrolling or drag-start)
+        document.addEventListener('click', this.onDocClick, true);
+
+        // 3. Escape clears selection
+        this.boundOnKeyDown = (e: KeyboardEvent) => {
+            if (e.key === 'Escape') {
+                e.preventDefault();
+                e.stopPropagation();
+                this.clearSelection();
+            }
+        };
+        document.addEventListener('keydown', this.boundOnKeyDown);
     }
 
     /**
-     * P1-17 (Phase 14): detach the marquee listeners. Idempotent. Also
-     * resets any in-flight marquee state (selection box, hold timer,
-     * marqueeActive flag) so a mid-drag BBox-mode-exit doesn't leave a
-     * dangling selection rectangle on the screen. Called from
-     * `overlay.detachMarqueeListeners()` on BBox edit mode OFF and from
-     * `cleanup()`.
+     * fix-bbox-selection: turn BBox Edit Mode OFF. Removes the full-screen
+     * overlay, aborts any in-flight drag, and unregisters the Escape
+     * listener. Idempotent. Called from `overlay.detachMarqueeListeners()`
+     * on BBox edit mode OFF and from `cleanup()`.
      */
     public detachMarqueeListeners(): void {
-        if (!this.marqueeListenersAttached) return;
-        if (this.marqueeHandlers.down) document.removeEventListener('mousedown', this.marqueeHandlers.down, true);
-        if (this.marqueeHandlers.move) document.removeEventListener('mousemove', this.marqueeHandlers.move, true);
-        if (this.marqueeHandlers.up) document.removeEventListener('mouseup', this.marqueeHandlers.up, true);
-        this.marqueeListenersAttached = false;
-        // Reset in-flight marquee state so a dangling drag doesn't persist.
-        if (this.marqueeHoldTimer !== null) {
-            window.clearTimeout(this.marqueeHoldTimer);
-            this.marqueeHoldTimer = null;
+        document.removeEventListener('mousedown', this.onDocMouseDown, true);
+        document.removeEventListener('click', this.onDocClick, true);
+        // Clean up any in-flight marquee
+        if (this.selectionOverlay) {
+            this.selectionOverlay.remove();
+            this.selectionOverlay = null;
         }
-        this.selectionBox?.remove();
-        this.selectionBox = null;
-        this.marqueeActive = false;
-        this.marqueeStart = null;
-        this.marqueeContainer = null;
+        this.selectionDiv?.remove();
+        this.selectionDiv = null;
+        this.isSelecting = false;
+        this.isDragging = false;
+        this.startX = 0;
+        this.startY = 0;
+        if (this.boundOnKeyDown) {
+            document.removeEventListener('keydown', this.boundOnKeyDown);
+            this.boundOnKeyDown = null;
+        }
     }
+
+    /**
+     * Document-level pointerdown (capture phase). Only fires when:
+     *   - BBox Edit Mode is ON
+     *   - Shift is held (marquee mode)
+     *   - Left mouse button
+     *   - NOT on a .pdf-text-overlay-reflow (let per-overlay handler deal with clicks)
+     *
+     * Creates a TEMPORARY overlay only for the duration of the drag.
+     * Does NOT block scrolling or any UI when not dragging.
+     */
+    private onDocMouseDown = (e: MouseEvent): void => {
+        if (!this.isBBoxEditMode()) return;
+        if (e.button !== 0) return;
+        if (!e.shiftKey) return;
+        const target = e.target as HTMLElement | null;
+        if (target?.closest('.pdf-text-overlay-reflow')) return;
+
+        e.preventDefault();
+        e.stopPropagation();
+
+        // Create TEMPORARY full-screen overlay — only exists during drag
+        this.selectionOverlay = document.body.createEl('div', { cls: 'ort-bbox-marquee-overlay' });
+        this.selectionOverlay.style.cssText = [
+            'position: fixed', 'top: 0', 'left: 0', 'right: 0', 'bottom: 0',
+            'z-index: 99999', 'cursor: crosshair', 'background-color: transparent',
+        ].join('; ');
+
+        this.startX = e.clientX;
+        this.startY = e.clientY;
+        this.isDragging = true;
+
+        this.selectionDiv = this.selectionOverlay.createEl('div', { cls: 'ort-selection-box' });
+        this.selectionDiv.style.cssText = [
+            'position: fixed',
+            'border: 2px dashed var(--interactive-accent)',
+            'background-color: color-mix(in srgb, var(--interactive-accent) 12%, transparent)',
+            'left: 0', 'top: 0', 'width: 0', 'height: 0',
+            'pointer-events: none', 'z-index: 100000',
+            `transform: translate(${this.startX}px, ${this.startY}px)`,
+        ].join('; ');
+
+        // Mouse events on the temporary overlay
+        this.selectionOverlay.addEventListener('mousemove', this.onMarqueeMouseMove);
+        this.selectionOverlay.addEventListener('mouseup', this.onMarqueeMouseUp);
+    };
+
+    private onMarqueeMouseMove = (e: MouseEvent): void => {
+        if (!this.isDragging || !this.selectionDiv) return;
+        e.preventDefault();
+        const left = Math.min(this.startX, e.clientX);
+        const top = Math.min(this.startY, e.clientY);
+        const width = Math.abs(this.startX - e.clientX);
+        const height = Math.abs(this.startY - e.clientY);
+        this.selectionDiv.style.transform = `translate(${left}px, ${top}px)`;
+        this.selectionDiv.style.width = `${width}px`;
+        this.selectionDiv.style.height = `${height}px`;
+    };
+
+    private onMarqueeMouseUp = (e: MouseEvent): void => {
+        if (!this.isDragging) return;
+        e.preventDefault();
+
+        const rect = this.selectionDiv?.getBoundingClientRect();
+        const additive = e.shiftKey || e.ctrlKey || e.metaKey;
+
+        this.teardownMarqueeOverlay();
+
+        if (rect && rect.width > 5 && rect.height > 5) {
+            if (!additive) this.clearSelection();
+            const overlays = document.querySelectorAll<HTMLElement>('.pdf-text-overlay-reflow');
+            let added = 0;
+            for (const ov of overlays) {
+                const r = ov.getBoundingClientRect();
+                if (r.width === 0 || r.height === 0) continue;
+                const overlaps = !(r.right < rect.left || r.left > rect.right || r.bottom < rect.top || r.top > rect.bottom);
+                if (overlaps) {
+                    this.selectedOverlays.add(ov);
+                    this.updateSelectionVisual(ov, true);
+                    added++;
+                }
+            }
+            if (added > 0) {
+                new Notice(`Selected ${added} box${added === 1 ? '' : 'es'}.`, 2000);
+            }
+        }
+    };
+
+    private teardownMarqueeOverlay(): void {
+        if (this.selectionOverlay) {
+            this.selectionOverlay.removeEventListener('mousemove', this.onMarqueeMouseMove);
+            this.selectionOverlay.removeEventListener('mouseup', this.onMarqueeMouseUp);
+            this.selectionOverlay.remove();
+            this.selectionOverlay = null;
+        }
+        this.selectionDiv?.remove();
+        this.selectionDiv = null;
+        this.isDragging = false;
+    };
+
+    /**
+     * Document-level click (capture phase). When BBox Edit Mode is ON and
+     * the click landed on empty space (inside PDF viewer but NOT on an
+     * overlay), clear the selection. Does NOT block scrolling or any UI
+     * because `click` fires AFTER pointerup — scrolling has already
+     * happened by then.
+     */
+    private onDocClick = (e: MouseEvent): void => {
+        if (!this.isBBoxEditMode()) return;
+        // Only handle clicks inside the PDF viewer
+        const target = e.target as HTMLElement | null;
+        if (!target) return;
+        // If click landed on an overlay, let per-overlay clickHandler handle it
+        if (target.closest('.pdf-text-overlay-reflow')) return;
+        // If click is inside a PDF page container → it's "empty space" in the PDF
+        if (target.closest('.pdf-viewer, .pdf-view, .page')) {
+            if (!e.shiftKey && !e.ctrlKey && !e.metaKey) {
+                this.clearSelection();
+            }
+        }
+    };
+
+    // ============================================================
+    // Selection state helpers
+    // ============================================================
 
     private updateSelectionVisual(el: HTMLElement, isSelected: boolean): void {
         if (isSelected) el.classList.add('bbox-selected');
@@ -1986,18 +2034,10 @@ export class OverlayUIRenderer {
         this.selectedOverlays.clear();
         this.createdOverlays = new WeakMap();
         this.tempDiv = null;
-        this.selectionBox?.remove();
-        this.selectionBox = null;
-        if (this.marqueeHoldTimer !== null) {
-            window.clearTimeout(this.marqueeHoldTimer);
-            this.marqueeHoldTimer = null;
-        }
-        // P1-17 (Phase 14): delegate marquee listener removal to the
-        // idempotent detachMarqueeListeners() helper. The previous inline
-        // removeEventListener calls + `this.marqueeHandlers = {}` wipe
-        // would have made a later attachMarqueeListeners() call a no-op
-        // (handlers gone) — detachMarqueeListeners preserves the handlers
-        // so re-init cycles are safe.
+        // fix-bbox-selection: detachMarqueeListeners() is now responsible
+        // for the full teardown of the selection overlay, in-flight drag
+        // state, and the Escape key listener. It is idempotent — safe to
+        // call whether BBox mode is currently ON or OFF.
         this.detachMarqueeListeners();
 
         // FIX: also clean up the persistent measure span

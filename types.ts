@@ -273,16 +273,6 @@ export interface OverlayPositionData {
     relativeSizes: number[];
     referenceHeight: number;
   };
-  /**
-   * T4.3 (v5): MANUAL style adjustments from the overlay context menu —
-   * persisted ONLY when the user made them (dataset.styleAdjusted), in
-   * dedicated fields so they can never be confused with `fontSize` (the
-   * ORIGINAL dominant size used as a sizing hint by some paths).
-   * adjustedFontSize is scale-free px (÷ viewer scale at save time).
-   */
-  adjustedFontSize?: number;
-  /** T4.3 (v5): manual line-height override (unitless multiplier). */
-  adjustedLineHeight?: number;
   fontSize?: number;
   fontFamily?: string;
   originalFontSizes?: number[];
@@ -561,10 +551,8 @@ export const DEFAULT_SETTINGS: OpenRouterTranslatorSettings = {
 
   // Stage 2.4 (NEW): default paragraph filter rules — 2 enabled presets.
   paragraphFilterRules: [
-    // VERIFICATION FIX: whole-text anchored patterns (no 'm' flag in
-    // compileRules) + Unicode-aware single-letter rule. See paragraph-filter.ts.
     { id: 'preset-page-numbers', name: 'Page numbers', pattern: '^\\d{1,4}$', enabled: true },
-    { id: 'preset-single-letter', name: 'Single letter', pattern: '^\\p{L}$', enabled: true },
+    { id: 'preset-single-letter', name: 'Single letter', pattern: '^[a-zA-Zа-яА-Я]$', enabled: true },
   ],
 
   // Progressive Disclosure: default to 'standard' so new users see the

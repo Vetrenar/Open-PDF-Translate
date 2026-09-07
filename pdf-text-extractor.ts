@@ -43,38 +43,39 @@ import type OpenRouterTranslatorPlugin from './main';
 import { buildOccupancyMap } from './OccupancyMap';
 import { buildParagraphs } from './IslandBuilder';
 
-// `require` is available globally in Obsidian (Electron CommonJS context).
-// We declare it here because TypeScript in ESM mode doesn't know about it.
-declare const require: ((id: string) => any) | undefined;
+// NOTE (2026-09 overhaul): pdfjs-dist is now loaded via LITERAL dynamic
+// import() — see the loading-strategy block below. The `require`-based
+// loader and the CDN <script> fallback were removed: the indirect
+// `const req = require; req(...)` pattern was NEVER bundled by esbuild, so
+// every installed build fell through to the CDN branch (constant Notice +
+// "dynamic <script> element creation" rejection by the community-plugin
+// validator). Full story: translate4-audit-deep.md.
 
 // ─────────────────────────────────────────────────────────────────────
-// CRITICAL: pdfjs-dist is loaded LAZILY via require() on first use.
+// CRITICAL: pdfjs-dist is loaded LAZILY via LITERAL dynamic import().
 //
-// WHY NOT A TOP-LEVEL IMPORT?
-//   pdfjs-dist 4.x has a static initializer (class PDFWorker { static
-//   _isSameOrigin = ...; }) that runs at module-load time. When esbuild
-//   bundles the ESM (.mjs) build into a CommonJS Obsidian plugin, circular
-//   dependencies inside pdfjs can cause `PDFWorker` to be `undefined` when
-//   the static field initializer runs, throwing:
-//     TypeError: Cannot set properties of undefined (setting '_isSameOrigin')
-//   This crashes the ENTIRE plugin at startup.
+// HOW THIS WORKS:
+//   `await import('pdfjs-dist/legacy/build/pdf.js')` with a STRING LITERAL
+//   specifier is statically resolved by esbuild at build time: the whole
+//   pdf.js CJS build is embedded into main.js as a lazy in-bundle module
+//   that only executes on first import. No runtime `require`, no CDN, no
+//   <script> injection — works on desktop AND mobile, online AND offline.
 //
-// WHY NOT dynamic `import()`?
-//   Dynamic `import('pdfjs-dist/legacy/build/pdf.mjs')` still triggers the
-//   static initializer (just deferred to first call). The ESM `.mjs` build
-//   crashes the same way. And `import('pdfjs-dist/legacy/build/pdf.js')`
-//   fails with "Failed to resolve module specifier" because esbuild does
-//   not resolve dynamic import() calls with explicit file extensions for
-//   bare module specifiers.
-//
-// WHY `require()` WITH THE CJS (`.js`) BUILD?
-//   1. esbuild correctly resolves `require('pdfjs-dist/...')` at bundle time.
-//   2. The CJS build (`pdf.js`, not `pdf.mjs`) is compiled without static
-//      class fields — it uses prototype assignment, which avoids the
-//      `_isSameOrigin` static-init crash entirely.
-//   3. `require()` is synchronous, which is fine for our use case (we call
-//      it inside `ensurePdfjs()` which runs on first extraction, not at
-//      plugin load).
+// DO NOT REGRESS (each of these once broke the plugin):
+//   1. The specifier MUST stay a string literal. A variable or template
+//      specifier is left as a runtime import and fails in Obsidian.
+//   2. Do NOT route loading through an intermediate variable
+//      (`const req = require; req(...)`) — esbuild only bundles DIRECT
+//      calls; an indirect require survives as a runtime require, and the
+//      installed plugin folder has no node_modules, so it throws
+//      "Cannot find module" on every launch.
+//   3. pdfjs-dist MUST stay pinned to 3.11.174 (exact, no `^`). Only the
+//      3.x line ships the CJS builds these paths resolve to; pdfjs-dist
+//      4.x is ESM-only (.mjs) and additionally crashes esbuild bundles
+//      via the `PDFWorker._isSameOrigin` static-init bug.
+//   4. After every build, verify: `stat -c%s main.js` > 1.5 MB and
+//      `grep -c PDFWorker main.js` > 0 (see scripts/verify-bundle.sh).
+//      A green build with a small main.js means pdfjs was NOT bundled.
 //
 // FAKE-WORKER MODE:
 //   `GlobalWorkerOptions.workerSrc = ''` makes pdfjs fall back to
@@ -82,11 +83,10 @@ declare const require: ((id: string) => any) | undefined;
 //   instead of spawning a Web Worker. This avoids Obsidian ≥1.5's
 //   cross-origin restrictions on plugin resource URLs.
 //
-// IF THIS STILL FAILS:
-//   The `_isSameOrigin` crash is a known pdfjs-dist 4.x + esbuild bug.
-//   Workaround: pin pdfjs-dist to v3.11.174 in package.json:
-//     npm install pdfjs-dist@3.11.174
-//   pdfjs-dist 3.x does not use static class fields and bundles cleanly.
+// WHY NOT a top-level static import?
+//   It would eagerly execute pdf.js's ~1 MB module body on the plugin
+//   startup critical path. The literal dynamic import keeps the same
+//   laziness the old loader had (first PDF operation), at negligible cost.
 // ─────────────────────────────────────────────────────────────────────
 
 // Re-export types so callers can `import type { ... }` from here instead of
@@ -208,100 +208,101 @@ export class PdfTextExtractor {
     // ════════════════════════════════════════════════════════════════
 
     /**
-     * Lazily load pdfjs-dist on first use. Async because the CDN fallback
-     * requires loading a <script> tag.
+     * Lazily load pdfjs-dist on first use.
      *
-     * Loading strategy (3 fallbacks):
+     * Loading strategy (bundled only — Obsidian community-plugin compliant):
      *
-     * 1. STATIC `require('pdfjs-dist/legacy/build/pdf.js')` — esbuild
-     *    bundles this at build time IF the argument is a string literal.
-     *    (The previous bug was using `require(candidate)` with a variable,
-     *    which esbuild leaves as a runtime require — fails in Obsidian.)
-     *    The CJS build avoids the ESM `_isSameOrigin` static-init crash.
+     * 1. LITERAL `await import('pdfjs-dist/legacy/build/pdf.js')` — esbuild
+     *    resolves the string literal at build time and embeds the CJS build
+     *    into main.js as a LAZY module (body executes on first import).
+     *    Interop: the CJS module exports the pdfjsLib object itself, and
+     *    esbuild's `__toESM` wrapper exposes it as `mod.default`.
      *
-     * 2. STATIC `require('pdfjs-dist/build/pdf.js')` — non-legacy CJS
-     *    build, alternative path.
+     * 2. LITERAL `await import('pdfjs-dist/legacy/build/pdf.worker.js')` —
+     *    the pdf.js WORKER is bundled too and registered on
+     *    `globalThis.pdfjsWorker`. This is CRITICAL: pdf.js resolves its
+     *    worker through, in order:
+     *      A) globalThis.pdfjsWorker.WorkerMessageHandler  ← we provide this
+     *      B) Node require()                                ← not in Obsidian
+     *      C) loadScript(workerSrc) — a dynamic <script> tag ← forbidden
+     *         (community-plugin validator) AND network-dependent
+     *    Without registration, PATH C is taken: the old CDN build silently
+     *    fetched pdf.worker.min.js from cdnjs on every extraction, and a
+     *    bundled-but-unregistered build would fail with
+     *    "No GlobalWorkerOptions.workerSrc specified" (workerSrc = '' is
+     *    falsy, and document.currentScript is null in a lazy bundle, so
+     *    pdf.js cannot derive a fallback worker URL).
      *
-     * 3. CDN fallback — load pdfjs v3.11.174 from cdnjs.cloudflare.com
-     *    via a <script> tag. v3.x does NOT have the static class field
-     *    bug, so it always works. Requires internet access.
+     * There is deliberately NO CDN/network fallback: dynamic <script>
+     * injection ("remote code loading") is rejected by the Obsidian
+     * community-plugin validator, and the installed plugin folder has no
+     * node_modules, so a runtime require cannot succeed either. If the
+     * bundled load fails, the installation itself is broken → reinstall.
      *
-     * @throws Error if all three strategies fail.
+     * NOTE: `disableWorker: true` passed to getDocument below is NOT an
+     * official pdf.js option (pdf.js 3.x ignores it). Fake-worker mode is
+     * actually forced by the worker registration above (PATH A runs the
+     * worker code on the main thread — no Web Worker, no network).
+     *
+     * @throws Error if the bundled load fails (corrupted install).
      */
     private async ensurePdfjs(): Promise<any> {
         if (this.pdfjsLib) return this.pdfjsLib;
         if (this.pdfjsInitError) {
             throw new Error(
                 `${LOG_PREFIX} pdfjs-dist previously failed to load and will not be retried.\n` +
-                `Original error: ${this.pdfjsInitError}\n` +
-                `If the error mentions '_isSameOrigin', pin pdfjs-dist to v3.11.174:\n` +
-                `  npm install pdfjs-dist@3.11.174`,
+                `Original error: ${this.pdfjsInitError}`,
             );
         }
 
         const debug = !!this.plugin.settings?.debugMode;
-        const req: ((id: string) => any) | undefined =
-            (typeof require !== 'undefined' ? require : (globalThis as any).require);
-
         let lastErr: any = null;
 
-        // ── Attempt 1: legacy CJS build (static literal — esbuild bundles) ──
-        if (typeof req === 'function') {
-            try {
-                if (debug) console.log(`${LOG_PREFIX} Trying require('pdfjs-dist/legacy/build/pdf.js')...`);
-                // STATIC string literal — esbuild MUST see this to bundle at build time.
-                // Do NOT change to a variable or template literal.
-                const mod: any = req('pdfjs-dist/legacy/build/pdf.js');
-                this.pdfjsLib = mod.default || mod;
-                if (debug) console.log(`${LOG_PREFIX} Loaded pdfjs-dist (legacy CJS). Version: ${this.pdfjsLib.version || 'unknown'}`);
-            } catch (e1: any) {
-                lastErr = e1;
-                if (debug) console.warn(`${LOG_PREFIX} legacy CJS require failed:`, e1?.message || e1);
+        try {
+            // ── Library: legacy CJS build (LITERAL specifier — esbuild bundles) ──
+            if (debug) console.log(`${LOG_PREFIX} import('pdfjs-dist/legacy/build/pdf.js')...`);
+            // STATIC string literal — esbuild MUST see this to bundle at build time.
+            // Do NOT change to a variable or template literal.
+            const mod: any = await import('pdfjs-dist/legacy/build/pdf.js');
+            this.pdfjsLib = mod.default ?? mod;
+            if (debug) console.log(`${LOG_PREFIX} Loaded pdfjs-dist (legacy CJS). Version: ${this.pdfjsLib.version || 'unknown'}`);
 
-                // ── Attempt 2: non-legacy CJS build ──
-                try {
-                    if (debug) console.log(`${LOG_PREFIX} Trying require('pdfjs-dist/build/pdf.js')...`);
-                    const mod: any = req('pdfjs-dist/build/pdf.js');
-                    this.pdfjsLib = mod.default || mod;
-                    if (debug) console.log(`${LOG_PREFIX} Loaded pdfjs-dist (non-legacy CJS). Version: ${this.pdfjsLib.version || 'unknown'}`);
-                } catch (e2: any) {
-                    lastErr = e2;
-                    if (debug) console.warn(`${LOG_PREFIX} non-legacy CJS require failed:`, e2?.message || e2);
+            // ── Worker: register the bundled module on globalThis.pdfjsWorker ──
+            // Activates pdf.js worker-resolution PATH A (see docstring above):
+            // no Web Worker spawn, no loadScript(), fully offline.
+            if (debug) console.log(`${LOG_PREFIX} import('pdfjs-dist/legacy/build/pdf.worker.js')...`);
+            // @ts-ignore — pdfjs-dist 3.x ships no pdf.worker.d.ts; the module is
+            // consumed as an opaque { WorkerMessageHandler } object (typed any).
+            const workerMod: any = await import('pdfjs-dist/legacy/build/pdf.worker.js');
+            // __toESM interop: workerMod.default is the raw CJS exports
+            // ({ WorkerMessageHandler }); the namespace also carries the
+            // named export. Prefer whichever exposes WorkerMessageHandler.
+            const workerExports = (workerMod && typeof workerMod.WorkerMessageHandler !== 'undefined')
+                ? workerMod
+                : workerMod?.default;
+            if (workerExports && typeof workerExports.WorkerMessageHandler !== 'undefined') {
+                if (!(globalThis as any).pdfjsWorker) {
+                    (globalThis as any).pdfjsWorker = workerExports;
                 }
+                if (debug) console.log(`${LOG_PREFIX} Registered bundled pdf.js worker (globalThis.pdfjsWorker).`);
+            } else {
+                // Not fatal by itself, but PATH C would then be required — log loudly.
+                console.warn(`${LOG_PREFIX} Bundled pdf.worker.js did not export WorkerMessageHandler; pdf.js may fall back to loadScript().`);
             }
+        } catch (e1: any) {
+            lastErr = e1;
+            if (debug) console.warn(`${LOG_PREFIX} bundled pdfjs-dist import failed:`, e1?.message || e1);
         }
 
-        // ── Attempt 3: CDN fallback (pdfjs v3.11.174 — no static field bug) ──
-        if (!this.pdfjsLib) {
-            try {
-                if (debug) console.log(`${LOG_PREFIX} Trying CDN fallback (pdfjs 3.11.174)...`);
-                this.pdfjsLib = await this.loadPdfjsFromCdn();
-                if (debug) console.log(`${LOG_PREFIX} Loaded pdfjs-dist from CDN. Version: ${this.pdfjsLib.version || 'unknown'}`);
-                new Notice(
-                    'PDF Translator: pdfjs-dist loaded from CDN (bundled version failed). ' +
-                    'Background translation requires internet access. ' +
-                    'To fix permanently, run: npm install pdfjs-dist@3.11.174',
-                    8000,
-                );
-            } catch (e3: any) {
-                lastErr = e3;
-                if (debug) console.warn(`${LOG_PREFIX} CDN fallback failed:`, e3?.message || e3);
-            }
-        }
-
-        // ── All attempts failed ──
+        // ── Bundled load failed → installation is broken ──
         if (!this.pdfjsLib) {
             const msg = lastErr?.message ?? String(lastErr);
             this.pdfjsInitError = msg;
-            console.error(`${LOG_PREFIX} All pdfjs-dist loading strategies failed.`, lastErr);
+            console.error(`${LOG_PREFIX} Bundled pdfjs-dist failed to load.`, lastErr);
             throw new Error(
-                `${LOG_PREFIX} Could not load pdfjs-dist.\n` +
+                `${LOG_PREFIX} Could not load pdfjs-dist (bundled).\n` +
                 `Last error: ${msg}\n\n` +
-                `To fix:\n` +
-                `  1. Run: npm install pdfjs-dist@3.11.174\n` +
-                `  2. Rebuild the plugin\n` +
-                `  3. If that fails, ensure internet access is available (CDN fallback)\n` +
-                `Or pin pdfjs-dist to v3.x in package.json to avoid the _isSameOrigin bug.`,
+                `The plugin installation appears to be corrupted — please reinstall the plugin.`,
             );
         }
 
@@ -318,56 +319,6 @@ export class PdfTextExtractor {
         }
 
         return this.pdfjsLib;
-    }
-
-    /**
-     * Load pdfjs v3.11.174 from cdnjs CDN via a <script> tag.
-     *
-     * v3.x is used because it does NOT have the static class field bug
-     * (`_isSameOrigin`) that crashes pdfjs-dist 4.x when bundled by esbuild.
-     *
-     * The script sets `window.pdfjsLib` globally on load.
-     *
-     * @throws Error if the script fails to load or window.pdfjsLib is not set.
-     */
-    private loadPdfjsFromCdn(): Promise<any> {
-        return new Promise((resolve, reject) => {
-            // If already loaded (e.g. from a previous call), reuse.
-            const existing = (window as any).pdfjsLib;
-            if (existing && typeof existing.getDocument === 'function') {
-                resolve(existing);
-                return;
-            }
-
-            const script = document.createElement('script');
-            // v3.11.174 — last 3.x release, no static field bug, API-compatible.
-            script.src = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js';
-            script.async = true;
-            script.crossOrigin = 'anonymous';
-
-            const timeoutMs = 15_000;
-            const timer = setTimeout(() => {
-                script.onload = null;
-                script.onerror = null;
-                reject(new Error(`CDN script load timed out after ${timeoutMs}ms`));
-            }, timeoutMs);
-
-            script.onload = () => {
-                clearTimeout(timer);
-                const lib = (window as any).pdfjsLib;
-                if (lib && typeof lib.getDocument === 'function') {
-                    resolve(lib);
-                } else {
-                    reject(new Error('CDN script loaded but window.pdfjsLib not found or missing getDocument'));
-                }
-            };
-            script.onerror = () => {
-                clearTimeout(timer);
-                reject(new Error('Failed to load pdfjs script from CDN (cdnjs.cloudflare.com). Check internet connection.'));
-            };
-
-            document.head.appendChild(script);
-        });
     }
 
     // ════════════════════════════════════════════════════════════════
@@ -429,7 +380,8 @@ export class PdfTextExtractor {
         const pdfBytes = await this.readPdfBytes(file);
         if (debug) console.log(`${LOG_PREFIX} [p${pageNum}] PDF bytes: ${(pdfBytes.byteLength / 1024).toFixed(1)}KB (cached=${this.pdfBytesCache.has(file.path)})`);
 
-        // Lazily load pdfjs-dist on first use (async — CDN fallback needs <script> tag).
+        // Lazily load pdfjs-dist on first use (async — literal dynamic import
+        // of the bundled module; no network, no <script> tag).
         const pdfjsLib = await this.ensurePdfjs();
 
         // getDocument takes ownership of the Uint8Array and may detach the
@@ -777,7 +729,8 @@ export class PdfTextExtractor {
         const pdfBytes = await this.readPdfBytes(file);
         const data = new Uint8Array(pdfBytes.slice(0));
 
-        // Lazily load pdfjs-dist on first use (async — CDN fallback needs <script> tag).
+        // Lazily load pdfjs-dist on first use (async — literal dynamic import
+        // of the bundled module; no network, no <script> tag).
         const pdfjsLib = await this.ensurePdfjs();
 
         const loadingTask = pdfjsLib.getDocument({

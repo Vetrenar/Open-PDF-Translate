@@ -1135,6 +1135,18 @@ export class TranslationStorage {
      * rename succeeds (new content fully visible) or it fails (old content still
      * intact). No partial state.
      *
+     * FIX (2026-09): Obsidian's `vault.rename` REFUSES to overwrite an existing
+     * destination — it throws "Destination file already exists!". So the
+     * temp+rename dance only works for files that don't exist yet. For an
+     * EXISTING target (the common case — appending overlays to an already
+     * created `.translations.md`) the rename ALWAYS failed and every save
+     * logged "Atomic write failed, falling back to direct write" before the
+     * fallback saved the data anyway. We now case-split upfront:
+     *   - existing file → direct `vault.modify` (the same write path Obsidian
+     *     itself uses; identical to the old fallback, minus the noise and the
+     *     wasted temp-file churn);
+     *   - new file → temp + rename (genuinely atomic, destination is free).
+     *
      * Fallback: if rename fails (e.g. cross-device, permission, or adapter
      * doesn't support rename on mobile), we fall back to direct modify/create.
      * This is non-atomic but matches the pre-Phase-8 behaviour so we don't
@@ -1177,15 +1189,27 @@ export class TranslationStorage {
                 await this.app.vault.delete(existingTemp);
             }
 
-            // Write temp file (same folder as target — required for rename to
-            // be atomic; cross-folder renames can be non-atomic on some
-            // filesystems).
+            // FIX (2026-09, case split): an existing destination CANNOT be
+            // atomically replaced via public API — `vault.rename` refuses to
+            // overwrite ("Destination file already exists!"). Don't even try;
+            // go straight to `vault.modify` — what the old fallback did, minus
+            // the guaranteed-failing rename, the console warning and the
+            // temp-file churn.
+            if (targetFile) {
+                await this.app.vault.modify(targetFile, content);
+                return;
+            }
+
+            // New file: temp + rename. Write temp (same folder as target —
+            // required for rename to be atomic; cross-folder renames can be
+            // non-atomic on some filesystems).
             tempFile = await this.app.vault.create(tempPath, content);
 
-            // Rename temp over target. `vault.rename` handles both the
-            // "overwrite existing" and "create new" cases atomically —
-            // Obsidian's adapter delegates to the underlying FS rename which
-            // is atomic on POSIX systems and on Windows (with ReplaceFile semantics).
+            // Rename temp to target. `vault.rename` works here because the
+            // destination does not exist yet (we only take this path when
+            // `targetFile` is null). Obsidian's adapter delegates to the
+            // underlying FS rename which is atomic on POSIX systems and on
+            // Windows.
             await this.app.vault.rename(tempFile, targetPath);
             // After a successful rename, `tempFile` is no longer at `tempPath`
             // (it now lives at `targetPath`), so the finally/cleanup below
