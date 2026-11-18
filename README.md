@@ -61,18 +61,11 @@ BBox Edit Mode does **not** pause the background translation queue. You can edit
 
 ### Background Translation Queue
 
-The background queue translates entire PDFs (or page ranges) without blocking the UI:
-
-- **Entry points**: Watcher modal (per-file Translate button), "Translate multiple pages..." modal, "Run All" in watcher
-- **Processing**: The `PdfLayoutQueue` processes pages sequentially within a file (extraction is serial, translation is parallel up to `backgroundTranslationConcurrency`). Multiple files are processed in FIFO order.
-- **Backpressure**: The extraction-to-translation queue has a high-watermark (`concurrency × 10`). If the queue is full, extraction pauses until translation drains it — prevents OOM on 1000+ page PDFs.
-- **Document reuse**: PDF documents are loaded once per batch (not per page), reducing extraction time by ~30–60s on 100-page PDFs.
-- **Cancellation**: Cancel stops in-flight work at the next chunk boundary (5–10 seconds). The queue auto-resumes when new tasks are enqueued.
-- **Progress**: The watcher modal shows live progress per file (pages done/total + progress bar). Active translations appear in a scrollable accent-bordered section; available files appear in a compact list below.
+The background queue translates entire PDFs (or page ranges) without blocking the UI
 
 ### V4 Translation Format
 
-Translation files (`.translations.md`) use the V4 format:
+Translation files (`.translations.md`) use format:
 
 ```yaml
 ---
@@ -97,37 +90,6 @@ layoutSettingsHash: a1b2c3d4e5f67890
 
 Translated text here
 ```
-
-#### Per-overlay fields
-
-| Field | Type | Description |
-|---|---|---|
-| `r` | `{l,t,w,h}` | Relative bounding rect (0–1 fractions of page dimensions, 4-decimal precision) |
-| `page` | number | Page number |
-| `ot` | string | Original text content (used for edit-modal lookup) |
-| `fs` | number | Font size (persisted but inert — rendering uses `ofs` instead) |
-| `ff` | string | Font family |
-| `ofs` | number[] | Original font sizes array (drives overlay rendering — dominant/mode size) |
-| `id` | string | Stable hash `hash(page + rect@2dec + textContent)` — enables exact overlay lookup and merge-by-id |
-| `engine` | string | `<provider>/<model>` that produced this translation |
-
-#### Frontmatter fields
-
-| Field | Description |
-|---|---|
-| `pdf-source` | Wikilink to the source PDF (ties `.translations.md` to its PDF) |
-| `timestamp` | ISO-8601 creation/update time (display only) |
-| `format-version` | `4` (V3 files are auto-migrated on first edit) |
-| `engine` | Primary engine used for this file |
-| `layoutSettingsHash` | Hash of layout settings — `isCached` invalidates on mismatch, forcing re-translate when layout preset changes |
-
-#### V3 → V4 Migration
-
-Automatic on first edit/translate after plugin update:
-- V3 files (`format-version: 3`) continue to work without changes
-- On next edit/translate, `id` and `engine` are stamped on all overlays, `format-version` bumped to 4
-- `layoutSettingsHash` added to frontmatter
-- No manual migration needed
 
 ## Features
 
