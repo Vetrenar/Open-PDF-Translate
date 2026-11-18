@@ -29,6 +29,21 @@
 import { Notice, TFile, TAbstractFile, EventRef } from 'obsidian';
 import type OpenRouterTranslatorPlugin from './main';
 import { HeadlessTranslator } from './headless-translate';
+// Phase 5.1 (W-2b): watcher-owned job tokens — stop()/Cancel kill ONLY
+// the watcher scope, never the shared queue's other jobs.
+import { JobToken } from './job-token';
+import { FileJob } from './file-job';
+// Phase 5.3: the queue's FileJob becomes the single source of truth for a
+// running item's status — the watcher only DERIVES its QueueItem from it
+// (type-only import: no runtime cycle).
+import type { PdfLayoutQueue } from './pdf-layout-queue';
+
+/**
+ * Phase 5.3: safety cap for the event-driven runOneViaQueue wait. Same
+ * 60-minute budget the old 500ms-polling `waitForQueueCompletion` had — a
+ * pathological queue hang must not block `runOne` (Run All) forever.
+ */
+const WAIT_TERMINAL_TIMEOUT_MS = 3_600_000;
 
 export interface QueueItem {
     path: string;
@@ -46,6 +61,8 @@ export class PdfWatcher {
     private queue: Map<string, QueueItem> = new Map();
     private running = false;
     private current: HeadlessTranslator | null = null;
+    private pythonJobs = new Map<string, HeadlessTranslator>();
+    private queueTokens = new Set<JobToken>();
     private currentFilePath: string | null = null;  // FIX H13: track for delete-cleanup
     /** Cancel hook for the internal-engine path (PdfLayoutQueue). */
     private currentQueueCancel: (() => void) | null = null;
@@ -90,14 +107,34 @@ export class PdfWatcher {
     }
 
     stop(): void {
-        // P1-3 (Phase 9): cancel any in-flight translation before tearing
-        // down listeners. Previously `stop()` only detached vault event
-        // refs, leaving a running HeadlessTranslator / PdfLayoutQueue job
-        // alive — it would still call back into `this.current` after stop,
-        // write to the .translations.md file, and notify subscribers whose
-        // modal had already been detached. `cancelRunning()` is a no-op if
-        // nothing is running, so this is safe to call unconditionally.
-        this.cancelRunning();
+        for (const translator of this.pythonJobs.values()) translator.cancel();
+        // W-2a fix (2026-09-12): `stop()` NO LONGER cancels the shared
+        // PdfLayoutQueue. The queue is a singleton shared between the watcher,
+        // "Translate Multiple Pages" (modal.ts) and the extract command
+        // (main.ts) — the old `cancelRunning()` call here meant that flipping
+        // the watcher OFF in settings (settings.ts toggle) or CHANGING the
+        // watched folder (start() → stop() at the top of this method) silently
+        // killed unrelated in-flight translations. We now cancel only the
+        // watcher's OWN python-engine translator (`this.current`).
+        //
+        // Consequences (accepted, documented in CHANGELOG):
+        //   • Turning the watcher off while ITS OWN internal-engine translation
+        //     runs: the translation continues in the background and finishes —
+        //     data stays valid, the watcher item is updated via its queue
+        //     subscription until it reaches a terminal status.
+        //   • The python path keeps its direct cancel: `this.current.cancel()`
+        //     (translator stays alive until the `finally` in runOneViaPython).
+        //   • Plugin unload is NOT weakened: main.ts onunload separately calls
+        //     pdfLayoutQueue.dispose(), which stops everything.
+        //   • The watcher-modal Cancel button is unaffected — it calls
+        //     cancelRunning() directly (watcher-modal.ts).
+        if (this.current) {
+            try {
+                this.current.cancel();
+            } catch (e) {
+                console.warn('[PdfWatcher] cancel failed:', e);
+            }
+        }
         // Drop the running-job references immediately so any late callback
         // from the cancelled job (Promise resolution, .then() in runOne*)
         // observes `this.current === null` and short-circuits its post-run
@@ -111,6 +148,30 @@ export class PdfWatcher {
 
     setOnChange(cb: (() => void) | null) { this.onChange = cb; }
     private notifyChange() { this.onChange?.(); }
+
+    /**
+     * W-1 fix (2026-09-12): real-time occupancy check for a file in the
+     * shared PdfLayoutQueue.
+     *
+     * The watcher item's own `status === 'running'` is NOT evidence of
+     * anything — it can be stale (the 60-minute waitForQueueCompletion
+     * timeout exits silently while the item still says 'running'; a queue
+     * crash leaves items 'running' forever). The only trustworthy signals
+     * are: (a) the queue's processing loop is alive, AND (b) the file has
+     * pending/running tasks in the queue's OWN state. If either is false,
+     * the file is not being worked on right now and a retry is safe.
+     */
+    private isItemActuallyBusyInQueue(path: string): boolean {
+        if (this.pythonJobs.has(path)) return true;
+        // Phase 5.2: FileJob.isBusy() is the single point of truth for a
+        // file's occupancy in the queue — no more walking getState()
+        // snapshots. The loop-liveness check stays HERE (W-1 semantics):
+        // a dead processing loop means nothing is actually busy, so a
+        // watcher retry remains safe.
+        const q = this.plugin.pdfLayoutQueue;
+        if (!q || !q.isRunning()) return false;  // dead loop → nothing is busy
+        return q.getFileJob(path)?.isBusy() ?? false;
+    }
 
     // ── folder matching (non-recursive) ───────────────────────────────────
     /**
@@ -162,6 +223,7 @@ export class PdfWatcher {
     // user might re-add the PDF later. Use "Clean unused translations" command
     // to remove orphaned translation files.
     private onDeleted(file: TAbstractFile): void {
+        this.pythonJobs.get(file.path)?.cancel();
         if (!(file instanceof TFile) || file.extension !== 'pdf') return;
 
         const pdfPath = file.path;
@@ -203,15 +265,7 @@ export class PdfWatcher {
         // Phase 18 (C22): rename-race protection — if a translation file
         // is already linked to this PDF (rename race, or already processed
         // earlier in this session), skip queueing.
-        const existingTranslation = await this.plugin.storage
-            .findTranslationFileForPdf(file)
-            .catch(() => null);
-        if (existingTranslation) {
-            this.plugin.logDebug?.(
-                `Translation file already exists for ${file.path}, skipping queue addition.`,
-            );
-            return;
-        }
+        if (await this.isFullyTranslated(file)) return;
 
         if (this.queue.has(file.path)) return;
 
@@ -221,6 +275,16 @@ export class PdfWatcher {
         });
         this.notifyChange();
         new Notice(`New PDF detected: ${file.basename}. Queued for background translation.`, 4000);
+    }
+
+    private async isFullyTranslated(file: TFile): Promise<boolean> {
+        try {
+            const cached = await FileJob.readCachedPages(this.plugin, file);
+            if (!cached.size) return false;
+            const count = await this.plugin.pdfLayoutService.getPageCount(file);
+            return Number.isInteger(count) && count > 0 &&
+                Array.from({length:count}, (_, i) => i + 1).every(n => cached.has(n));
+        } catch { return false; }
     }
 
     /** Scan the folder for existing untranslated PDFs and queue them. */
@@ -235,8 +299,7 @@ export class PdfWatcher {
             const parentNorm = this.norm(f.parent?.path ?? '');
             if (parentNorm !== targetNorm) continue;
             if (this.queue.has(f.path)) continue;
-            const translated = await this.plugin.storage.findTranslationFileForPdf(f).catch(() => null);
-            if (translated) continue;
+            if (await this.isFullyTranslated(f)) continue;
             this.queue.set(f.path, { path: f.path, name: f.basename, addedAt: Date.now(), status: 'pending' });
             added++;
         }
@@ -256,8 +319,7 @@ export class PdfWatcher {
         for (const f of this.plugin.app.vault.getFiles()) {
             if (f.extension !== 'pdf') continue;
             if (this.queue.has(f.path)) continue;
-            const translated = await this.plugin.storage.findTranslationFileForPdf(f).catch(() => null);
-            if (translated) continue;
+            if (await this.isFullyTranslated(f)) continue;
             this.queue.set(f.path, {
                 path: f.path,
                 name: f.basename,
@@ -287,22 +349,26 @@ export class PdfWatcher {
      * stops new tasks from starting (the in-flight page finishes naturally).
      * For the python engine, this calls `HeadlessTranslator.cancel()`.
      *
-     * FIX (bg-queue audit fix): always call `queue.cancel()` directly instead
-     * of relying on the single `currentQueueCancel` slot. When multiple
-     * `runOneViaQueue` calls are in flight (Translate Selected / Run All
-     * kicked off in parallel), only the LAST one's cancel fn is stored — so
-     * after the first one finishes and clears the slot, the user's Cancel
-     * click would silently no-op for any still-running siblings. Calling
-     * `queue.cancel()` directly is safe (idempotent, no-op if already
-     * cancelled) and cancels ALL queue work in one shot.
+     * FIX (bg-queue audit fix): always cancel the queue side directly
+     * instead of relying on the single `currentQueueCancel` slot — when
+     * multiple `runOneViaQueue` calls are in flight (Translate Selected /
+     * Run All in parallel), only the LAST one's cancel fn is stored, so a
+     * slot-based cancel would silently no-op for still-running siblings.
+     *
+     * 5.1 (W-2b): the queue side is now SCOPED — cancelScope('watcher')
+     * cancels every watcher-owned job (all parallel runOneViaQueue calls
+     * run under watcher tokens), and NOTHING else: an unrelated
+     * "Translate pages" (modal) translation or an extract command keeps
+     * running. The old global `queue.cancel()` murdered them all.
      */
     cancelRunning() {
+        for (const token of this.queueTokens) this.plugin.pdfLayoutQueue?.cancelJob(token);
+        for (const translator of this.pythonJobs.values()) translator.cancel();
         if (this.current) {
             this.current.cancel();
         }
-        // Always cancel the layout queue — supports parallel runOneViaQueue
-        // calls. queue.cancel() is idempotent (no-op if already cancelled).
-        this.plugin.pdfLayoutQueue?.cancel();
+        // Scoped: watcher jobs only (covers parallel runOneViaQueue calls).
+        this.plugin.pdfLayoutQueue?.cancelScope('watcher');
     }
 
     // ── manual trigger: run one item or the whole pending queue ───────────
@@ -328,8 +394,13 @@ export class PdfWatcher {
     async runOne(path: string, opts?: { force?: boolean }): Promise<void> {
         const item = this.queue.get(path);
         if (!item) return;
-        // Allow retry when item is stuck at 'running' due to queue cancel.
-        if (item.status === 'running' && !this.plugin.pdfLayoutQueue?.isCancelled()) {
+        // W-1 fix (2026-09-12): block a retry ONLY when the file is
+        // genuinely busy in a LIVE queue. The old guard
+        // (`running && !queue.isCancelled()`) trusted the watcher item's
+        // own status — after the 60-min waitForQueueCompletion timeout (or
+        // a queue crash) that status is a lie, and Translate became a
+        // silent no-op while the modal still showed "Translating…".
+        if (item.status === 'running' && this.isItemActuallyBusyInQueue(path)) {
             return;
         }
 
@@ -345,7 +416,7 @@ export class PdfWatcher {
         if (engine === 'internal') {
             await this.runOneViaQueue(item, file, opts);
         } else {
-            await this.runOneViaPython(item, file);
+            await this.runOneViaPython(item, file, opts);
         }
     }
 
@@ -378,25 +449,30 @@ export class PdfWatcher {
             return;
         }
 
-        // Subscribe to queue state changes to relay progress.
+        // 5.3: ONE subscription drives BOTH progress display and the wait:
+        // every queue change re-derives the item's status/message from the
+        // file's FileJob (single source of truth) and resolves the wait when
+        // the derivation reaches a terminal / paused state. This replaces the
+        // old progress relay + waitForQueueCompletion poll + post-hoc status
+        // inference — the watcher no longer keeps a second state machine.
+        let settleWait: (() => void) | null = null;
+        const waitTerminal = new Promise<void>(resolve => { settleWait = resolve; });
+        const token = new JobToken('watcher', item.path);
+        this.queueTokens.add(token);
+        let enqueued = false;
         const unsub = queue.onChange(() => {
-            const state = queue.getState();
-            const fileState = state.files.find(f => f.file.path === file.path);
-            if (!fileState) return;
-            const tasks = [...fileState.tasks.values()];
-            const done = tasks.filter(t => t.status === 'done').length;
-            const err = tasks.filter(t => t.status === 'error').length;
-            const pend = tasks.filter(t => t.status === 'pending' || t.status === 'running').length;
-            const total = fileState.totalPages || tasks.length;
-            item.message = `worker: ${done}/${total} done, ${pend} pending${err ? `, ${err} error` : ''}`;
-            this.notifyChange();
+            if (enqueued && this.syncItemFromQueue(item, queue)) settleWait?.();
         });
         this.currentQueueUnsub = unsub;
         this.currentQueueCancel = () => {
-            queue.cancel();
+            queue.cancelScope('watcher');  // 5.1 (W-2b): scoped, not global
         };
 
         try {
+            // 5.1 (W-2b): this run is a watcher-owned job — cancelRunning() /
+            // stop() cancel exactly this scope; modal/command jobs of other
+            // files are not touched.
+
             // FIX (bg-queue audit fix): when `opts.force` is true, use
             // `enqueuePageRange(1, totalPages)` instead of `enqueuePdf` so
             // already-cached pages are re-queued for re-translation. Used by
@@ -404,86 +480,69 @@ export class PdfWatcher {
             let count: number;
             if (opts?.force) {
                 const totalPages = await this.plugin.pdfLayoutService.getPageCount(file);
-                count = await queue.enqueuePageRange(file, 1, totalPages);
+                count = await queue.enqueuePageRange(file, 1, totalPages, { token });
             } else {
-                count = await queue.enqueuePdf(file);
+                count = await queue.enqueuePdf(file, { token });
             }
-            if (count === 0) {
+            if (token.cancelled) {
+                item.status = 'pending';
+                item.message = 'cancelled — click Translate to resume';
+                return;
+            }
+            enqueued = true;
+            if (this.syncItemFromQueue(item, queue)) settleWait?.();
+            if (count === 0 && !queue.getFileJob(file.path)?.isBusy()) {
                 // Distinguish "all cached" from "error": if file is NOT in
                 // queue state, enqueuePdf threw before creating the file state
                 // (e.g. pdfjs failed to load). Check queue state to be sure.
                 const state = queue.getState();
                 const fileState = state.files.find(f => f.file.path === file.path);
-                if (!fileState || fileState.tasks.size === 0) {
+                const tasks = fileState ? [...fileState.tasks.values()] : [];
+                // M-11 fix (2026-09-12): report the TRUTH. Previously ANY
+                // count===0 situation claimed "all pages already cached" —
+                // a lie for pages that were abandoned (Q-2 cancel) or failed;
+                // users deleted a perfectly good .translations.md and re-paid
+                // LLM costs on the false premise that everything was cached.
+                const notTranslated = tasks.filter(t => t.status === 'error' || t.status === 'pending').length;
+                if (notTranslated > 0) {
+                    item.status = 'error';
+                    item.message = `${notTranslated} page(s) not translated (cancelled or failed — click Translate to retry)`;
+                } else if (!fileState || tasks.length === 0) {
                     // enqueuePdf returned 0 without creating tasks — this means
                     // getPageCount threw (pdfjs load failure, corrupt PDF, etc.)
                     // The error was re-thrown by enqueuePdf, so we should have
                     // caught it in the catch block below. But just in case:
                     item.status = 'skipped';
-                    item.message = 'no pages queued (PDF may be empty or unreadable — check console for errors)';
+                    item.message = 'all pages already cached';
                 } else {
                     item.status = 'skipped';
                     item.message = 'all pages already cached (delete .translations.md to re-extract)';
                 }
             } else {
-                // Wait for the queue to finish processing this file's tasks.
-                // enqueuePdf only queues; the actual extraction+translation
-                // happens asynchronously in processQueue().
-                await this.waitForQueueCompletion(file);
-
-                // Determine final status from queue state.
-                const state = queue.getState();
-                const fileState = state.files.find(f => f.file.path === file.path);
-                if (fileState) {
-                    const tasks = [...fileState.tasks.values()];
-                    const errCount = tasks.filter(t => t.status === 'error').length;
-                    const doneCount = tasks.filter(t => t.status === 'done').length;
-                    if (errCount > 0 && doneCount === 0) {
-                        item.status = 'error';
-                        item.message = `${errCount} page(s) failed (see console)`;
-                    } else if (errCount > 0) {
-                        item.status = 'done';
-                        item.message = `${doneCount} page(s) done, ${errCount} failed`;
-                    } else {
-                        // P2-21 (Phase 11): distinguish a true "all done"
-                        // state from a `waitForQueueCompletion` timeout.
-                        // `waitForQueueCompletion` returns silently after its
-                        // 60-minute timeout (and also returns early if the
-                        // queue gets cancelled), so reaching this branch does
-                        // NOT guarantee that every task has reached a terminal
-                        // state. Previously we always marked `done` here, which
-                        // gave a misleading green checkmark on items that were
-                        // actually still translating in the background — the
-                        // user would close the modal, come back later, and
-                        // wonder why the overlays weren't all there yet. Now
-                        // we check whether any tasks are still `pending` /
-                        // `running` and, if so, leave the item at `running`
-                        // with an explicit "(timeout)" suffix so the queue
-                        // loop can pick it up on the next pass.
-                        //
-                        // FIX (bg-queue audit fix §3.5): if the queue is
-                        // cancelled, set status back to 'pending' (NOT
-                        // 'running') with a "paused" message so the user can
-                        // retry via the per-item "Translate" button. The
-                        // previous code stamped 'running' + '(timeout)' which
-                        // blocked retry via runOne's guard.
-                        const pendingCount = tasks.filter(t => t.status === 'pending' || t.status === 'running').length;
-                        if (pendingCount > 0) {
-                            if (queue.isCancelled()) {
-                                item.status = 'pending';
-                                item.message = `paused — ${doneCount} done, ${pendingCount} pending (click Translate to resume)`;
-                            } else {
-                                item.status = 'running';
-                                item.message = `${doneCount} done, ${pendingCount} still running (timeout)`;
-                            }
-                        } else {
-                            item.status = 'done';
-                            item.message = `${doneCount} page(s) extracted + translated`;
-                        }
+                // 5.3: event-driven wait. The subscription above re-derives
+                // the item from FileJob state on every change and resolves
+                // `waitTerminal` at terminal/paused — no 500ms polling loop.
+                // The 60-minute safety timeout is kept (a pathological hang
+                // must not block Run All forever); on timeout the item keeps
+                // its 'running' status with an explicit suffix (P2-21).
+                let timedOut = false;
+                const timer = setTimeout(() => {
+                    timedOut = true;
+                    if (item.status === 'running') {
+                        item.message = `${item.message ?? ''} (timeout)`;
                     }
-                } else {
-                    item.status = 'done';
-                    item.message = 'extracted + translated';
+                    this.notifyChange();
+                    settleWait?.();
+                }, WAIT_TERMINAL_TIMEOUT_MS);
+                try {
+                    await waitTerminal;
+                } finally {
+                    clearTimeout(timer);
+                }
+                if (!timedOut) {
+                    // Final re-derivation (idempotent — the subscription's
+                    // last sync already produced this state; belt and braces).
+                    this.syncItemFromQueue(item, queue);
                 }
             }
         } catch (e: any) {
@@ -496,6 +555,7 @@ export class PdfWatcher {
             // Also show a Notice so the user doesn't have to hover the queue item
             new Notice(`Background translation failed: ${item.message}`, 8000);
         } finally {
+            this.queueTokens.delete(token);
             unsub();
             // FIX (bg-queue audit fix): only clear the shared refs if they
             // still point to THIS call's unsub/cancel. When multiple
@@ -518,7 +578,7 @@ export class PdfWatcher {
      * Python-engine path: HeadlessTranslator (legacy).
      * Requires Python + PyMuPDF + layout_engine.py script configured in settings.
      */
-    private async runOneViaPython(item: QueueItem, file: TFile): Promise<void> {
+    private async runOneViaPython(item: QueueItem, file: TFile, opts?: { force?: boolean }): Promise<void> {
         const translator = new HeadlessTranslator(this.plugin);
         const pre = translator.canRun();
         if (!pre.ok) {
@@ -529,6 +589,7 @@ export class PdfWatcher {
             return;
         }
 
+        this.pythonJobs.set(file.path, translator);
         this.current = translator;
         // P0-13 (Phase 1): `QueueItem` has no `filePath` field — only `path`.
         // The previous `item.filePath` access silently returned `undefined`,
@@ -539,7 +600,7 @@ export class PdfWatcher {
         item.message = undefined;
         this.notifyChange();
         try {
-            const res = await translator.translateFile(file);
+            const res = await translator.translateFile(file, opts);
             if (res.ok && res.error === 'already translated') {
                 item.status = 'skipped';
                 item.message = 'already translated';
@@ -547,65 +608,77 @@ export class PdfWatcher {
                 item.status = 'done';
                 item.message = `${res.pages} page(s), ${res.segments} segment(s)`;
             } else {
-                item.status = 'error';
-                item.message = res.error;
+                item.status = res.cancelled ? 'pending' : 'error';
+                item.message = `${res.error}; ${res.pages} page(s) saved`;
             }
         } catch (e: any) {
             item.status = 'error';
             item.message = e?.message ?? String(e);
         } finally {
-            this.current = null;
+            this.pythonJobs.delete(file.path);
+            if (this.current === translator) this.current = null;
             this.notifyChange();
         }
     }
 
     /**
-     * Wait until all of `file`'s tasks in the PdfLayoutQueue reach a terminal
-     * state (done or error). Polls every 500ms with a 60-minute timeout
-     * (large PDFs with LLM translation can take a long time).
-     * On timeout, returns without error — the queue continues processing in
-     * the background and the watcher item will be updated on the next change.
+     * Phase 5.3: derive a watcher QueueItem's status/message from the
+     * queue's FileJob — the single source of truth. One mapping replaces
+     * BOTH old machines: the progress relay (message-only updates) and the
+     * post-hoc final-status inference in runOneViaQueue. Message strings
+     * are unchanged so the watcher modal and the tests see the same UX.
+     *
+     * Returns true when the item reached a state the runOneViaQueue wait
+     * can stop on:
+     *   • terminal (all tasks done / error — item set accordingly);
+     *   • PAUSED — the file's non-terminal tasks all belong to cancelled
+     *     jobs (isFileStalled): no progress is possible until a fresh
+     *     enqueue re-activates them, so waiting is pointless (the exact
+     *     old FIX H12 early-exit);
+     *   • no queue state for the file (cleared / never created).
      */
-    private async waitForQueueCompletion(file: TFile, timeoutMs = 3_600_000): Promise<void> {
-        const start = Date.now();
-        const queue = this.plugin.pdfLayoutQueue;
-        if (!queue) return;
+    private syncItemFromQueue(item: QueueItem, queue: PdfLayoutQueue): boolean {
+        const job = queue.getFileJob(item.path);
+        if (!job) return true;   // no queue state — nothing to wait for
+        const tasks = [...job.tasks.values()];
+        if (tasks.length === 0) return false;   // transient — don't touch, don't resolve
 
-        let lastProgressMsg = '';
-        while (Date.now() - start < timeoutMs) {
-            // FIX H12: early-exit if queue is cancelled — pending tasks
-            // will never reach terminal state, so waiting would hang for the
-            // full 1-hour timeout. After cancel, the watcher item should be
-            // marked as done (or error) by the caller.
-            if (queue.isCancelled()) {
-                console.debug(`[PdfWatcher] waitForQueueCompletion: queue cancelled, stopping wait for "${file.path}".`);
-                return;
+        const done = tasks.filter(t => t.status === 'done').length;
+        const err = tasks.filter(t => t.status === 'error').length;
+        const pend = tasks.filter(t => t.status === 'pending' || t.status === 'running').length;
+        const total = job.totalPages || tasks.length;
+
+        if (pend > 0) {
+            // 5.1: per-file stalled check — this file's non-terminal tasks
+            // all belong to cancelled jobs: paused, retryable via Translate.
+            if (queue.isFileStalled(item.path)) {
+                item.status = 'pending';
+                item.message = `paused — ${done} done, ${pend} pending (click Translate to resume)`;
+                this.notifyChange();
+                return true;
             }
-
-            const state = queue.getState();
-            const fileState = state.files.find(f => f.file.path === file.path);
-            if (fileState) {
-                const tasks = [...fileState.tasks.values()];
-                const pending = tasks.filter(t => t.status === 'pending' || t.status === 'running').length;
-                if (pending === 0) return; // all tasks terminal
-
-                // Log progress every 30 seconds (avoid spamming console)
-                const done = tasks.filter(t => t.status === 'done').length;
-                const total = fileState.totalPages || tasks.length;
-                const elapsed = Math.round((Date.now() - start) / 1000);
-                const progressMsg = `[PdfWatcher] "${file.basename}" still processing: ${done}/${total} done, ${pending} pending (${elapsed}s elapsed)`;
-                if (elapsed % 30 === 0 && progressMsg !== lastProgressMsg) {
-                    console.debug(progressMsg);
-                    lastProgressMsg = progressMsg;
-                }
-            }
-            await new Promise(r => setTimeout(r, 500));
+            item.status = 'running';
+            item.message = `worker: ${done}/${total} done, ${pend} pending${err ? `, ${err} error` : ''}`;
+            this.notifyChange();
+            return false;
         }
-        // Timeout — not an error, queue keeps running in background.
-        console.warn(
-            `[PdfWatcher] waitForQueueCompletion timed out for "${file.path}" after ${timeoutMs / 1000}s — ` +
-            `queue continues in background. Check the queue state in the watcher modal.`,
-        );
+
+        // All tasks terminal — final mapping (same strings as the old
+        // post-hoc inference block).
+        if (err > 0 && done === 0) {
+            item.status = 'error';
+            item.message = `${err} page(s) failed (see console)`;
+        } else if (err > 0) {
+            item.status = 'error';
+            item.message = `${done} page(s) done, ${err} failed`;
+        } else if (done > 0) {
+            item.status = 'done';
+            item.message = `${done} page(s) extracted + translated`;
+        }
+        // (done === 0 && err === 0: zero tasks — the count===0 branch of
+        // runOneViaQueue already produced the honest message.)
+        this.notifyChange();
+        return true;
     }
 
     /**
@@ -639,9 +712,14 @@ export class PdfWatcher {
         this.running = true;
         this.notifyChange();
         try {
-            const items = this.getQueue().filter(
-                item => item.status !== 'done' && item.status !== 'skipped' && item.status !== 'running'
-            );
+            // W-1 fix (2026-09-12): a 'running' item is skipped ONLY if it is
+            // genuinely busy in a live queue; stale 'running' items (timeout,
+            // crash) are included so Run All can resurrect them.
+            const items = this.getQueue().filter(item => {
+                if (item.status === 'done' || item.status === 'skipped') return false;
+                if (item.status === 'running') return !this.isItemActuallyBusyInQueue(item.path);
+                return true;  // pending, error — as before (P2-14)
+            });
             if (items.length === 0) {
                 new Notice('No pending items to translate.', 3000);
                 return;

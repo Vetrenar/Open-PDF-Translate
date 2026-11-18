@@ -1,6 +1,7 @@
+import { regionRevision } from './region-layout';
 // storage.ts
 import { TFile, TFolder, normalizePath, Notice, parseYaml, App } from 'obsidian';
-import DOMPurify from 'dompurify';
+import DOMPurify, { type Config } from 'dompurify';
 import OpenRouterTranslatorPlugin from './main';
 import { SavedOverlay, OverlayPositionData } from './types';
 import {
@@ -36,11 +37,12 @@ import { generateOverlayId, computeLayoutSettingsHash, getCurrentEngine } from '
 // - KEEP_CONTENT: true — strip disallowed tags but keep their text content
 //   (so `<script>alert(1)</script>` becomes `alert(1)` instead of executing,
 //   and `<a href="...">click</a>` becomes `click`).
-const PURIFY_CONFIG: DOMPurify.Config = {
+const PURIFY_CONFIG = {
     ALLOWED_TAGS: ['b', 'i', 'em', 'strong', 'br', 'sup', 'sub', 'u'],
     ALLOWED_ATTR: [],
     KEEP_CONTENT: true,
-};
+    RETURN_TRUSTED_TYPE: false,
+} satisfies Config;
 
 /**
  * VERSION HISTORY:
@@ -70,6 +72,28 @@ export class TranslationStorage {
     private app: App;
     private loadingPromises: Map<string, Promise<void>> = new Map();  // Per-file concurrency guard
     private writingPromises: Map<string, Promise<void>> = new Map(); // Concurrency guard for writing
+
+    // ── PIPE-FIX-25 (F28-b): write-through overlay cache ────────────────
+    // The queue's translateAndPersist writes ONE page per call. Every writer
+    // cycle re-read + re-parsed the WHOLE .translations.md (vault.read +
+    // regex line scan + JSON.parse per overlay) — O(file) per page, O(N²)
+    // over an N-page book. Measured pre-fix on a 300-page synthetic book:
+    // 14 ms (p1, 11 KB) → 34 ms (p300, 3.9 MB) per write, 5.75 s total
+    // main-thread CPU — and the real app adds vault I/O + metadataCache
+    // re-indexing on top. On big books this is the progressive "app freezes
+    // at some point" CPU component.
+    //
+    // The cache stores the overlay object our own writer LAST WROTE, keyed
+    // by the md file's path, valid only while the file's mtime is unchanged.
+    // Any external write (user edit, Obsidian Sync, another writer) bumps
+    // mtime → automatic miss → full read+parse (the pre-fix behavior). The
+    // cache is only ever REPLACED after a successful atomicWrite, and a hit
+    // hands out a SHALLOW CLONE so the merge of the in-flight cycle cannot
+    // poison the cached state (a failed write never lands in the cache).
+    private readonly overlayWriteCache = new Map<string, { overlay: SavedOverlay; mtime: number }>();
+    /** Max cached files (LRU by insertion order; bounded memory). */
+    private static readonly OVERLAY_WRITE_CACHE_MAX_ENTRIES = 8;
+
 
     // Phase 4 (P1-34): the `domCacheTimestamps` Map, the
     // `invalidateDomCache` method, the `DOM_CACHE_TTL_MS` constant, and
@@ -272,6 +296,8 @@ export class TranslationStorage {
                     metadata.engine = item.engine;
                 }
 
+                if (item.layoutRegionRevision !== undefined) metadata.layoutRegionRevision = item.layoutRegionRevision;
+                if (item.translationStatus === 'fallback') metadata.translationStatus = 'fallback';
                 const metadataStr = JSON.stringify(metadata);
                 const comment = `%% ${metadataStr} %%`;
 
@@ -488,8 +514,20 @@ export class TranslationStorage {
                             translatedLines.push(nextLine);
                             i = j; // advance past the last consumed content line
                         }
+                        // TABLE-KEEP (2026-09-15): `<br>` — ЕДИНЫЙ маркер
+                        // перевода строки в памяти (как в live-путях):
+                        // рендер createReflowOverlay рисует его строкой,
+                        // id/`data-original-text` стабильны между live и
+                        // reload (hash по одному и тому же виду текста).
+                        // Прежний реверс `<br>` → `\n` ломал построчный
+                        // рендер таблиц после перезагрузки (`\n` в
+                        // white-space:normal склеивается пробелом) и
+                        // рассинхронизировал id. Многострочные (ручные)
+                        // тела склеиваются через `<br>` —      writer всё равно
+                        // пишет `\n` → `<br>`, обратное преобразование
+                        // симметрично.
                         let translatedText = translatedLines.length > 0
-                            ? translatedLines.join('\n').replace(/<br\s*\/?>/gi, '\n')
+                            ? translatedLines.filter(l => l !== '').join('<br>')
                             : '';
 
                         // Phase 7 (C4): sanitize translated text to prevent stored XSS.
@@ -538,6 +576,8 @@ export class TranslationStorage {
                             // (e.g. future stale-engine-detection) should
                             // treat `undefined` as "unknown — pre-V4".
                             engine: metadata.engine,
+                            translationStatus: metadata.translationStatus === 'fallback' ? 'fallback' : undefined,
+                            layoutRegionRevision: metadata.layoutRegionRevision,
                         };
                         if (!pageOverlays[realPageKey]) pageOverlays[realPageKey] = [];
                         pageOverlays[realPageKey].push(overlayData);
@@ -714,6 +754,9 @@ export class TranslationStorage {
             if (Object.keys(savedOverlay.pageOverlays).length === 0) {
                 await this.app.vault.trash(translationFile, true);
                 this.plugin.pdfToMdMap.delete(activeFile.path);
+                // PIPE-FIX-25 (F28-b): the file is gone — its write-cache
+                // entry must not survive it.
+                this.invalidateOverlayWriteCache(translationFile.path);
                 new Notice(`Translation file deleted for ${activeFile.basename}`);
             } else {
                 const markdownContent = this.generateMarkdownForOverlay(savedOverlay, activeFile);
@@ -721,6 +764,10 @@ export class TranslationStorage {
                 // Phase 8 (C5): atomic write — partial writes could otherwise
                 // corrupt the file mid-delete if Obsidian is interrupted.
                 await this.atomicWrite(translationFile, translationFile.path, markdownContent);
+                // PIPE-FIX-25 (F28-b): this writer bypassed
+                // updatePageOverlaysAndWrite — drop the stale cache entry
+                // (its page set no longer matches the file we just wrote).
+                this.invalidateOverlayWriteCache(translationFile.path);
                 new Notice(`Overlay deleted for page ${currentPageNumber}`);
             }
 
@@ -731,21 +778,13 @@ export class TranslationStorage {
         }
     }
 
-    /**
-     * Extracts positioning and content data from rendered overlay elements.
-     * Uses the closest .page[data-page-number] to determine the page number.
-     */
-    extractPositionData(textLayer: HTMLElement, overlayContainer: Element): OverlayPositionData[] {
-        // Delegate to the canonical implementation in OverlayRenderer, which is
-        // leaf-scoped (via the PDF adapter) instead of using a global
-        // document.querySelector. (#15 dedupe.)
-        const textLayerRect = textLayer.getBoundingClientRect();
-        if (textLayerRect.width === 0 || textLayerRect.height === 0) {
-            console.error('PDF Translator: Text layer has zero dimensions');
-            return [];
-        }
-        return this.plugin.overlay.extractPositionDataFrom(textLayer, overlayContainer, textLayerRect);
-    }
+    // O-1 fix (2026-09-12): extractPositionData(textLayer, overlayContainer)
+    // removed — DEAD CODE (zero live callers, grep-verified). Its docstring
+    // claimed it "uses the closest .page[data-page-number]" but it never
+    // did, and it delegated to overlay.extractPositionDataFrom() whose page
+    // number came from the ACTIVE page — precisely the O-1 corruption
+    // pattern. Keeping it around invited future callers to reintroduce the
+    // bug.
 
 
     // ============================================================
@@ -812,6 +851,7 @@ export class TranslationStorage {
             originalsOnly?: boolean;
             frontmatter?: Record<string, string>;
             replace?: boolean;
+            expectedPages?: Record<number, OverlayPositionData[]>;
         },
     ): Promise<void> {
         const lockKey = pdfFile.path;
@@ -830,13 +870,37 @@ export class TranslationStorage {
             let parseFailed = false;
 
             if (mdFile) {
-                // MODIFY PATH: File exists, so we read it.
-                try {
-                    const content = await this.app.vault.read(mdFile);
-                    savedOverlay = this.parseMarkdownOverlay(content, pdfFile);
-                } catch (e) {
-                    this.plugin.logDebug("Failed to read or parse existing translation file, will overwrite.", e);
-                    parseFailed = true;
+                // PIPE-FIX-25 (F28-b): write-through cache hit — our own last
+                // write is still the newest change to the file (mtime
+                // matches). Skip vault.read + parseMarkdownOverlay entirely.
+                // A hit hands out a SHALLOW CLONE: the merge below mutates
+                // `savedOverlay.pageOverlays`, and the cached object must
+                // stay exactly what we last serialized (failure isolation —
+                // a failed write of THIS cycle must not corrupt the cache).
+                const cachedWrite = this.overlayWriteCache.get(mdFile.path);
+                // Editor snapshots come from parseMarkdownOverlay. The write cache
+                // retains unrounded input geometry and a different property order.
+                // Compare against freshly parsed disk state under this lock, not
+                // raw cached objects; otherwise every warm-cache edit conflicts.
+                if (!opts?.expectedPages && cachedWrite && cachedWrite.mtime === mdFile.stat.mtime) {
+                    savedOverlay = {
+                        ...cachedWrite.overlay,
+                        pageOverlays: { ...cachedWrite.overlay.pageOverlays },
+                    };
+                    this.plugin.logDebug?.(
+                        `[Storage] write-cache HIT for "${mdFile.path}" (${Object.keys(savedOverlay.pageOverlays).length} pages) — skipping read+parse.`
+                    );
+                } else {
+                    // MODIFY PATH: File exists, so we read it.
+                    try {
+                        const content = await this.app.vault.read(mdFile);
+                        savedOverlay = this.parseMarkdownOverlay(content, pdfFile);
+                        if (opts?.expectedPages && !savedOverlay) throw new Error('Cannot parse the current translation file. Existing data was preserved.');
+                    } catch (e) {
+                        if (opts?.expectedPages) throw e;
+                        this.plugin.logDebug("Failed to read or parse existing translation file, will overwrite.", e);
+                        parseFailed = true;
+                    }
                 }
             }
 
@@ -881,6 +945,13 @@ export class TranslationStorage {
                         needsMigration: false,
                     };
                 }
+            }
+
+            // Compare against the live page while holding the write lock, before
+            // migration mutates legacy metadata. Never publish a stale editor snapshot.
+            for (const [page, expected] of Object.entries(opts?.expectedPages || {})) {
+                if (JSON.stringify(savedOverlay.pageOverlays[page] || []) !== JSON.stringify(expected))
+                    throw new Error('Page changed during layout editing. Refresh preview and retry.');
             }
 
             // Phase 8 (V4 Schema): V3→V4 migration. If the parsed file was
@@ -937,8 +1008,12 @@ export class TranslationStorage {
             // keep "orphaned" items from the existing page whose rects overlap
             // the survivors, silently resurrecting deleted overlays on next
             // render (see P0-9 / audit 08 finding X1).
-            for (const [pageStr, newItems] of Object.entries(pages)) {
+            for (const [pageStr, incomingItems] of Object.entries(pages)) {
+                const newItems = incomingItems.map(item => ({...item}));
                 const p = Number(pageStr);
+                const revision = regionRevision(this.plugin.layoutSettings || {}, pdfFile.path, p);
+                // Stamp only incoming items; untouched pages retain their own revision.
+                for (const item of newItems) item.layoutRegionRevision = revision;
                 if (newItems.length > 0) {
                     if (opts?.replace === true) {
                         // REPLACE: drop the entire existing page array, install
@@ -1010,6 +1085,12 @@ export class TranslationStorage {
                 this.plugin.pdfToMdMap.set(pdfFile.path, translationPath);
             }
 
+            // PIPE-FIX-25 (F28-b): write-through — remember what we just
+            // serialized so the next page-write of this file skips the
+            // O(file) read+parse. Only after a SUCCESSFUL write; the mtime
+            // stamp invalidates on any external modification.
+            this.refreshOverlayWriteCache(translationPath, savedOverlay);
+
             // FIX B1 (revised): directly update the renderer's in-memory cache
             // with the freshly-written data. This replaces the previous approach
             // of invalidating the cache via metadataCache.on('changed') — which
@@ -1033,7 +1114,17 @@ export class TranslationStorage {
 
         // Promise-based locking mechanism to serialize write operations for the same file
         const pendingPromise = this.writingPromises.get(lockKey) || Promise.resolve();
-        const newPromise = pendingPromise.then(() => writer()).finally(() => {
+        // S-1 fix (2026-09-12): break the poisoned chain. `pendingPromise.then(...)`
+        // SKIPS the writer callback when the previous write rejected — the next
+        // page's write then rejected with the PREVIOUS page's error without its
+        // writer ever running (one transient failure = two lost pages). The
+        // previous write's error has already been reported to ITS caller (who
+        // awaited its promise); we only swallow the already-reported failure so
+        // this writer always runs.
+        const newPromise = pendingPromise
+            .catch(() => {})
+            .then(() => writer())
+            .finally(() => {
             // IMPORTANT: Clean up the map once the operation is done.
             // This check ensures we don't accidentally delete a newer promise
             // if operations were chained very quickly.
@@ -1044,6 +1135,57 @@ export class TranslationStorage {
 
         this.writingPromises.set(lockKey, newPromise);
         await newPromise;
+    }
+
+    // ============================================================
+    // PIPE-FIX-25 (F28-b): write-through overlay cache helpers
+    // ============================================================
+
+    /**
+     * PIPE-FIX-25 (F28-b): store the overlay our writer just serialized,
+     * stamped with the file's POST-WRITE mtime. Called ONLY after a
+     * successful atomicWrite — a failed write never enters the cache.
+     *
+     * Re-fetches the file (rather than trusting the caller's TFile) so the
+     * stamp matches what the vault reports after the write; a file that
+     * vanished mid-cycle (delete race) simply drops the cache entry.
+     *
+     * Bounded LRU: at most OVERLAY_WRITE_CACHE_MAX_ENTRIES files. Eviction
+     * is plain insertion-order (Map iteration = oldest first) — the cached
+     * SavedOverlay objects are shared by reference with the hit-path clones'
+     * page arrays, so eviction can never take anything away from an
+     * in-flight writer (same reasoning as the queue's paragraph cache).
+     */
+    private refreshOverlayWriteCache(mdPath: string, overlay: SavedOverlay): void {
+        try {
+            const written = this.app.vault.getAbstractFileByPath(mdPath);
+            if (!(written instanceof TFile)) {
+                this.overlayWriteCache.delete(mdPath);
+                return;
+            }
+            this.overlayWriteCache.delete(mdPath);   // LRU touch: re-insert at the end
+            this.overlayWriteCache.set(mdPath, { overlay, mtime: written.stat.mtime });
+            while (this.overlayWriteCache.size > TranslationStorage.OVERLAY_WRITE_CACHE_MAX_ENTRIES) {
+                const oldest = this.overlayWriteCache.keys().next().value as string | undefined;
+                if (oldest === undefined) break;
+                this.overlayWriteCache.delete(oldest);
+            }
+        } catch (err) {
+            // Never let cache bookkeeping fail a completed write.
+            this.overlayWriteCache.delete(mdPath);
+            this.plugin.logDebug?.(`[Storage] write-cache refresh failed for "${mdPath}" (entry dropped):`, err);
+        }
+    }
+
+    /**
+     * PIPE-FIX-25 (F28-b): drop the cached overlay for a file another code
+     * path just rewrote (or deleted) OUTSIDE updatePageOverlaysAndWrite —
+     * deleteCurrentOverlay's rewrite/trash and ensurePdfSourceLinkPointsTo's
+     * frontmatter repair. The next writer re-reads from disk (pre-fix
+     * behavior) — correctness over speed on these rare paths.
+     */
+    private invalidateOverlayWriteCache(mdPath: string): void {
+        this.overlayWriteCache.delete(mdPath);
     }
 
 
@@ -1115,6 +1257,10 @@ export class TranslationStorage {
             // write, an interrupted rename-repair could leave a half-written
             // frontmatter and a broken pdf-source link.
             await this.atomicWrite(fileMd, fileMd.path, updated);
+            // PIPE-FIX-25 (F28-b): frontmatter was rewritten outside
+            // updatePageOverlaysAndWrite — the cached overlay (whose parse
+            // captured the old frontmatter) is stale; drop it.
+            this.invalidateOverlayWriteCache(fileMd.path);
         }
     }
 

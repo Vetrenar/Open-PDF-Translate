@@ -34,6 +34,28 @@ export interface InputRect {
   // helpers read it — without this declaration those reads required
   // `as any` casts which `@ts-nocheck` was masking.
   text?: string;
+  /** Baseline direction in viewport coordinates, radians. */
+  textAngle?: number;
+  textQuad?: Array<[number, number]>;
+  /** Consecutive PDF text items on one source baseline (before x sorting). */
+  sourceRun?: number;
+  spaceBefore?: boolean;
+  /** Reading coordinates for a rotated region, independent of display bbox. */
+  readingBox?: { left: number; top: number; right: number; bottom: number };
+  // LAYOUT-FIX-9 (P3, 2026-09-17): the DECLARED right edge, set by
+  // ink-geometry.ts when the feed clamps `right` to an ink-based edge
+  // (queue Tm-clamp / DOM Range measurement). Absent on unclamped rects —
+  // presence marks an ink feed for the slicer's P4 assignment rules, and
+  // `restoreDeclaredRights()` copies it back into `right` after detection
+  // so downstream consumers (queue normalization, DOM span matching) keep
+  // byte-identical declared geometry. Internal transport field, never
+  // serialized.
+  declRight?: number;
+  // LAYOUT-FIX-9 (P3): which ink channel clamped this rect —
+  // 'tm' (queue: right = next item's exact start; the slicer re-caps such
+  // edges at the column boundary because the clamp can fake adjacency
+  // across the gutter) or 'range' (DOM: true rendered ink; no cap needed).
+  inkSource?: 'tm' | 'range';
 }
 
 export interface LineInfo {
@@ -60,26 +82,27 @@ export interface OccupancyMapResult {
  * Two modes:
  *   - `preserveStyle: false` (default, legacy behavior): strips weight/style
  *     suffix. "AGaramondPro-Bold" → "AGaramondPro". Bold and Italic variants
- *     of the same family are treated as the SAME family — used by the DOM
- *     path (which can't resolve g_d0_fN to real font names) and by the
- *     pdfjs path (which historically also stripped to keep behavior
- *     consistent with DOM).
- *   - `preserveStyle: true` (new): keeps weight/style suffix.
+ *     of the same family are treated as the SAME family — per the original
+ *     user spec ("bold, italic, другой цвет - можно допускать как один
+ *     стиль"). This is what BOTH production paths use since LAYOUT-FIX-5.
+ *   - `preserveStyle: true`: keeps weight/style suffix.
  *     "AGaramondPro-Bold" → "AGaramondPro-Bold". Bold and Italic are
- *     treated as DIFFERENT families — used by the pdfjs path so that
- *     `splitByFont` correctly splits paragraphs at bold/italic boundaries,
- *     matching what the DOM path already does (via g_d0_fN distinction).
- *
- * The pdfjs path now uses `preserveStyle: true` (see pdf-text-extractor.ts).
- * This makes the cache written by background translation consistent with
- * what the DOM path produces on cache miss. Without this, the same PDF
- * would produce different paragraph splits depending on whether the cache
- * was populated by the DOM path (preserves) or the pdfjs path (stripped),
- * causing translations to be applied to the wrong paragraphs.
+ *     treated as DIFFERENT families — STEP 7 (splitByFont) then splits a
+ *     paragraph at every style-run boundary. NOTE (LAYOUT-FIX-5,
+ *     2026-09-16): no production caller uses this mode anymore. Stage 2.1
+ *     (Q5) enabled it on the pdfjs path to keep the pdfjs/DOM caches
+ *     consistent, but that reasoning died with pdf.js 4+: the textLayer
+ *     now resolves every span to a GENERIC font family (serif / sans-
+ *     serif), so the DOM path stopped distinguishing style variants —
+ *     while the pdfjs path kept tearing paragraphs at Regular↔Italic
+ *     boundaries ("oversplitting на курсив тексте внутри абзаца", book
+ *     p.11: one paragraph → 5 units, words split mid-word "evi-/dence").
+ *     The option remains for A/B tests (they pass `true` explicitly to
+ *     reproduce the Q5-era behavior).
  *
  * PDF.js textLayer class identifiers like "g_d0_f1" are already unique per
- * PDF font variant — passed through unchanged in both modes (DOM path
- * can't resolve them without PDF.js internals).
+ * PDF font variant — passed through unchanged in both modes (emitted only
+ * by pdf.js ≤ 3.x; 4.x+ sets a generic inline font-family instead).
  */
 export function getFontFamily(fontname: string | undefined, preserveStyle: boolean = false): string {
   if (!fontname) return 'unknown';
@@ -99,12 +122,11 @@ export function getFontFamily(fontname: string | undefined, preserveStyle: boole
   if (fam.includes('+')) fam = fam.split('+')[1];
 
   // Stage 2.1 (Q5): if preserveStyle is true, keep the full family name
-  // including weight/style suffix. This makes pdfjs path produce the same
-  // paragraph splits as DOM path (which preserves bold/italic distinction
-  // via g_d0_fN IDs).
+  // including weight/style suffix (Q5-era behavior — see the docblock
+  // above for why production no longer uses it).
   if (preserveStyle) return fam;
 
-  // Legacy behavior: strip weight/style suffix.
+  // Default (LAYOUT-FIX-5): strip weight/style suffix.
   // "AGaramondPro-Regular" → "AGaramondPro"
   // "AGaramondPro-BoldItalic" → "AGaramondPro"
   //

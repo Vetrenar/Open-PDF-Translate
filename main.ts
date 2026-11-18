@@ -243,6 +243,12 @@ export default class OpenRouterTranslatorPlugin extends Plugin {
 
             // 1. If a PDF was renamed, we might need to update the translation file name
             if (file.extension === 'pdf') {
+                const rules = this.layoutSettings.regionLayouts?.[oldPath];
+                if (rules) {
+                    this.layoutSettings.regionLayouts![file.path] = rules;
+                    delete this.layoutSettings.regionLayouts![oldPath];
+                    await this.saveSettings();
+                }
                 const mdPath = this.pdfToMdMap.get(oldPath);
                 if (mdPath) {
                     // Phase 10: was `setTimeout(async () => { ... }, 200)`.
@@ -1103,6 +1109,18 @@ export default class OpenRouterTranslatorPlugin extends Plugin {
         // — `undefined` is falsy and the `?? false` fallbacks in code handle it.
         if (typeof this.settings.preserveSourceLineBreaks !== 'boolean') {
             this.settings.preserveSourceLineBreaks = false;
+        }
+
+        // W-CLEAN (2026-09-25): the real-worker engine mode was REMOVED —
+        // the main-thread pseudo-worker is the plugin's ONLY PDF engine
+        // (see pdf-text-extractor.ts header). data.json files saved by
+        // older builds may still carry a pdfWorkerMode key; strip it so
+        // it doesn't linger as dead weight. The key is referenced ONLY as
+        // a quoted literal here (never a property access) — that is what
+        // the [W-CLEAN] invariant in scripts/verify-bundle.sh greps for.
+        const staleWorkerModeKey = 'pdfWorkerMode';
+        if (staleWorkerModeKey in this.settings) {
+            delete (this.settings as any)[staleWorkerModeKey];
         }
 
         // Background translation concurrency: default 3 for new installs.

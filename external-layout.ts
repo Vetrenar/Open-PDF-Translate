@@ -1,3 +1,5 @@
+import { isManualMode, rulesForPage } from './region-layout';
+import { computeLayoutSettingsHash } from './overlay-id';
 // external-layout.ts
 // ─────────────────────────────────────────────────────────────────────────
 // Phase 4 (C1) correction: the previous version imported `spawn` from
@@ -14,6 +16,7 @@
 
 import { Notice, Platform, TFile } from 'obsidian';
 import OpenRouterTranslatorPlugin from './main';
+import { makeAbortError } from './job-token';
 
 export interface ExternalLayoutItem {
   id: string;
@@ -31,6 +34,10 @@ export class ExternalLayoutService {
   private plugin: OpenRouterTranslatorPlugin;
   // Cache: PDF File Path -> Layout Data
   private layoutCache: Map<string, ExternalPageLayout> = new Map();
+  private cacheRevisions = new Map<string, string>();
+  private cacheRevision(file: string): string {
+    return computeLayoutSettingsHash(this.plugin.layoutSettings) + JSON.stringify(this.plugin.layoutSettings?.regionLayouts?.[file] || []);
+  }
   private activeProcesses: Map<string, boolean> = new Map();
 
   constructor(plugin: OpenRouterTranslatorPlugin) {
@@ -38,10 +45,11 @@ export class ExternalLayoutService {
   }
 
   public hasCachedLayout(filePath: string): boolean {
-    return this.layoutCache.has(filePath);
+    return this.layoutCache.has(filePath) && this.cacheRevisions.get(filePath) === this.cacheRevision(filePath);
   }
 
   public getCachedPage(filePath: string, pageNumber: number): ExternalLayoutItem[] | null {
+    if (!this.hasCachedLayout(filePath)) return null;
     const docLayout = this.layoutCache.get(filePath);
     if (!docLayout) return null;
     return docLayout[String(pageNumber)] || [];
@@ -94,7 +102,8 @@ export class ExternalLayoutService {
    * to surface the error to the user (typically via Notice) — most call
    * sites already catch and report failures.
    */
-  public async generateLayout(pdfFile: TFile): Promise<ExternalPageLayout | null> {
+  public async generateLayout(pdfFile: TFile, opts?: { signal?: AbortSignal; timeoutMs?: number }): Promise<ExternalPageLayout | null> {
+    if (opts?.signal?.aborted) throw makeAbortError();
     // ── Phase 4 (C1): Platform guard ───────────────────────────────
     // `child_process.spawn` is only available on desktop (Electron/Node).
     // On Obsidian Mobile the static `import { spawn } from 'child_process'`
@@ -138,68 +147,67 @@ export class ExternalLayoutService {
       return null;
     }
 
+    const settingsSnapshot = JSON.parse(JSON.stringify(this.plugin.layoutSettings || {}));
+    const extractionRevision = this.cacheRevision(filePath);
+    const scriptArgs = [ocrScriptPath, absolutePdfPath];
+    const preset = this.plugin.layoutSettings?.layoutPreset;
+    if (preset && preset !== 'standard' && !isManualMode(preset)) scriptArgs.push('--preset', String(preset));
+    // A synchronous spawn error must not leave a permanently busy file.
+    const child = spawn(pythonPath, scriptArgs);
     this.activeProcesses.set(filePath, true);
-    new Notice(`Analyzing PDF layout with Python...`);
-
-    return new Promise((resolve) => {
-      const process = spawn(pythonPath, [ocrScriptPath, absolutePdfPath]);
-      
-      let stdoutData = '';
-      let stderrData = '';
-
-      process.stdout.on('data', (data) => {
-        stdoutData += data.toString();
-      });
-
-      process.stderr.on('data', (data) => {
-        stderrData += data.toString();
-      });
-
-      process.on('close', (code) => {
+    return new Promise((resolve, reject) => {
+      let settled = false, stdout = '', stderr = '';
+      const signal = opts?.signal;
+      const finish = (error?: Error, result?: ExternalPageLayout) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        signal?.removeEventListener('abort', onAbort);
         this.activeProcesses.delete(filePath);
-        
-        // If Python exited with a non-zero code, it's usually a hard crash
-        if (code !== 0) {
-          console.error("Python Script Failed (exit code:", code, ")");
-          console.error("STDERR:", stderrData);
-          console.error("STDOUT:", stdoutData.substring(0, 500) + "...");
-          new Notice("Layout analysis failed. Check console for details.");
-          resolve(null);
-          return;
-        }
-
+        if (error) reject(error);
+        else { this.layoutCache.set(filePath, result!); this.cacheRevisions.set(filePath, extractionRevision); resolve(result!); }
+      };
+      const stop = (error: Error) => {
+        // Mark settled before kill: mocked or platform close can be synchronous.
+        finish(error);
+        try { child.kill('SIGKILL'); } catch { /* already exited */ }
+      };
+      const onAbort = () => stop(makeAbortError());
+      const timeout = Number(opts?.timeoutMs);
+      const timer = setTimeout(() => stop(Object.assign(new Error('Python layout extraction timed out'),
+        {name:'TimeoutError'})), Number.isFinite(timeout) && timeout > 0 ? timeout : 300000);
+      signal?.addEventListener('abort', onAbort, {once:true});
+      child.stdout.on('data', (data: any) => { if (!settled) stdout += data.toString(); });
+      child.stderr.on('data', (data: any) => { if (!settled) stderr += data.toString(); });
+      child.on('error', (error: Error) => finish(error));
+      child.on('close', async (code: number) => {
+        if (settled) return;
+        if (code !== 0) { finish(new Error(`Python layout exited ${code}: ${stderr.slice(-500)}`)); return; }
         try {
-          // Attempt to parse the output using the robust helper
-          const result = this.tryParseJson(stdoutData);
-
-          // Check for logical errors returned by the script
-          if (result.error) {
-            new Notice(`PDF Analysis Error: ${result.error}`);
-            console.error("Python Logical Error:", result.error);
-            resolve(null);
-            return;
+          const result = this.tryParseJson(stdout);
+          if (!result || typeof result !== 'object' || Array.isArray(result) || result.error) {
+            throw new Error(result?.error || 'Invalid Python layout output');
           }
-
-          // Success: Cache the results
-          this.layoutCache.set(filePath, result);
-          console.debug(`External Layout Cached for ${filePath}`);
-          resolve(result);
-
-        } catch (e) {
-          console.error("Failed to parse Python output.");
-          console.error("Raw Output was:", stdoutData.substring(0, 500) + "...");
-          console.error("Parse Error:", e);
-          new Notice("Failed to parse PDF layout data. Check console for details.");
-          resolve(null);
-        }
+          if (Object.entries(result).some(([page, items]) => !Number.isInteger(Number(page)) || Number(page) < 1 || !Array.isArray(items))) {
+            throw new Error('Invalid Python layout page map');
+          }
+          // Manual constraints have a single implementation. Re-extract affected
+          // pages with native spans instead of feeding already-merged Python boxes.
+          for (const key of Object.keys(result)) {
+            const page=Number(key);
+            if (!isManualMode(settingsSnapshot.layoutPreset) && !rulesForPage(settingsSnapshot,filePath,page).length) continue;
+            if (settled || signal?.aborted) return;
+            const native=await this.plugin.pdfLayoutService.extractPage(pdfFile,page,settingsSnapshot);
+            if (settled || signal?.aborted) return;
+            if (!native.paragraphs.length && result[key].length) throw new Error(`No native text for manual layout on page ${page}; Python layout was not overwritten.`);
+            result[key]=native.paragraphs.map((p,i)=>({id:`manual-${page}-${i}`,text:p.text,
+              rect:{l:p.relativeRect.left,t:p.relativeRect.top,w:p.relativeRect.width,h:p.relativeRect.height},
+              fontSize:p.fontSize,fontFamily:p.fontFamily,originalFontSizes:p.originalFontSizes}));
+          }
+          finish(undefined, result);
+        } catch (e: any) { finish(e); }
       });
-
-      process.on('error', (err) => {
-        this.activeProcesses.delete(filePath);
-        console.error("Failed to spawn Python process:", err);
-        new Notice("Could not start Python process. Check your Python path in settings.");
-        resolve(null);
-      });
+      if (signal?.aborted) onAbort();
     });
   }
 }

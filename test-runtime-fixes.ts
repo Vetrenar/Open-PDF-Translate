@@ -1,10 +1,11 @@
 // test-runtime-fixes.ts — regression tests for the two 2026-09 runtime fixes.
 //
-//   FIX 1 (stale-cancel): TextProcessor.executeTranslation must survive a
-//   sticky PdfLayoutQueue `cancelled` flag left over from a previous
-//   cancelled session. Symptom it guards against:
-//     "[PDF Translator] Translation failed: Error: cancelled"
-//   …followed by untranslated overlays rendered as if translation succeeded.
+//   FIX 1 (stale-cancel → Phase 5.1): TextProcessor.executeTranslation is
+//   decoupled from ANY queue cancellation state. The old FIX 1 fought a
+//   sticky global `cancelled` flag with a pre-flight clearCancelFlag();
+//   Phase 5.1 removed the flag itself — interactive translation passes no
+//   AbortSignal and is NEVER aborted, while a queue job's mid-run cancel
+//   lands on the job's own token (scoped). Scenarios updated 2026-09-13.
 //
 //   FIX 2 (atomic write): StorageLayer.atomicWrite with an EXISTING target
 //   must use vault.modify directly. Obsidian's vault.rename refuses to
@@ -17,6 +18,7 @@ import { TFile } from 'obsidian';
 import { PdfLayoutQueue } from './pdf-layout-queue';
 import { TextProcessor } from './processing';
 import { TranslationStorage } from './storage';
+import { JobToken, isAbortError } from './job-token';
 
 let failures = 0;
 function check(name: string, cond: boolean): void {
@@ -58,20 +60,18 @@ async function testStaleCancel(): Promise<void> {
     fakePlugin.pdfLayoutQueue = queue;
     const tp = new TextProcessor(fakePlugin);
 
-    // Scenario 1 — the user's bug: stale flag from a previous cancelled
-    // session (modal Cancel / watcher stop), queue idle, new interactive
-    // translation must NOT abort.
+    // Scenario 1 — 5.1: queue cancellation is SCOPED to jobs; interactive
+    // translation (no signal) survives a cancelAll() untouched.
     queue.cancel();
-    check('S1 setup: cancelled=true, idle', queue.isCancelled() === true && queue.isRunning() === false);
-
     const result = await tp.executeTranslation(makeUnits());
     check('S1: 3 results returned', result.length === 3);
-    check('S1: results are translations (not fallback originals)',
+    check('S1: translations survive a queue cancel (interactive path is not poisoned)',
         result.every(r => r.startsWith('TRANSLATED-')));
-    check('S1: stale flag cleared by pre-flight resume', queue.isCancelled() === false);
 
-    // Scenario 2 — mid-run Cancel still works: cancelling DURING translation
-    // (chunk 1) must abort chunk 2 and fall back to originals.
+    // Scenario 2 — 5.1 (this WAS the W-2b bug): cancelling the QUEUE mid-run
+    // must NOT abort an interactive translation either. Old behaviour: the
+    // global flag made chunk 2 abort and fall back to originals — one
+    // Cancel anywhere poisoned every other job in the process.
     const queue2 = new PdfLayoutQueue(fakePlugin, {} as any);
     fakePlugin.pdfLayoutQueue = queue2;
     let firstChunk = true;
@@ -80,8 +80,26 @@ async function testStaleCancel(): Promise<void> {
         return Array.from({ length: count }, (_, i) => `[#${i + 1}] TRANSLATED-${i + 1}`).join('\n');
     };
     const result2 = await tp.executeTranslation(makeUnits());
-    check('S2: mid-run cancel aborts → fallback to originals',
-        result2.length === 3 && result2.every(r => r.startsWith('ORIGINAL-')));
+    check('S2: mid-run queue cancel does NOT abort interactive translation (scoped)',
+        result2.length === 3 && result2.every(r => r.startsWith('TRANSLATED-')));
+
+    // Scenario 2b — 5.1: a job-scoped signal DOES abort: the owning job's
+    // token fires mid-run → AbortError escapes (no fallback-to-originals).
+    const token = new JobToken('command', 's2b');
+    let chunkSeen = 0;
+    fakePlugin.translation.translateBatch = async (_text: string, count: number) => {
+        chunkSeen++;
+        if (chunkSeen === 1) token.cancel('S2b mid-run');
+        return Array.from({ length: count }, (_, i) => `[#${i + 1}] TRANSLATED-${i + 1}`).join('\n');
+    };
+    let aborted = false;
+    try {
+        await tp.executeTranslation(makeUnits(), { signal: token.signal });
+    } catch (e: any) {
+        aborted = isAbortError(e);
+    }
+    check('S2b: job-scoped signal aborts (AbortError escapes, no silent fallback)',
+        aborted && chunkSeen < 3);
 
     // Scenario 3 — plugin.pdfLayoutQueue absent (?. short-circuit path).
     fakePlugin.pdfLayoutQueue = undefined;
@@ -105,7 +123,7 @@ async function testAtomicWrite(): Promise<void> {
             getAbstractFileByPath: (p: string) => files.get(p) ?? null,
             create: async (p: string, _c: string) => {
                 calls.push(`create ${p}`);
-                const f = new TFile(p);
+                const f = Object.assign(new TFile(), {path: p});
                 files.set(p, f);
                 return f;
             },
@@ -129,7 +147,7 @@ async function testAtomicWrite(): Promise<void> {
 
         // Existing destination → straight vault.modify, no temp, no doomed
         // rename, no console warning.
-        const existing = new TFile('doc.translations.md');
+        const existing = Object.assign(new TFile(), {path: 'doc.translations.md'});
         files.set('doc.translations.md', existing);
         calls.length = 0;
         await atomicWrite(existing, 'doc.translations.md', 'updated');

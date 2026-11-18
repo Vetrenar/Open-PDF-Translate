@@ -134,6 +134,14 @@ export interface OpenRouterTranslatorSettings {
    * Default: 3. Set to 1 for strict sequential (rate-limit sensitive APIs).
    */
   backgroundTranslationConcurrency: number;
+  /**
+   * Phase 5.2 (FileJob paragraph cache): max pages of cached extraction
+   * paragraphs per file (LRU). Re-translating / re-enqueueing a page skips
+   * the pdfjs extraction while its paragraphs are cached. Default 100;
+   * 0 disables the cache. Cached pages are dropped when the layout
+   * preset changes (extraction-settings hash mismatch).
+   */
+  paragraphCachePages: number;
 
   // Storage Settings
   autoSaveOverlay: boolean;
@@ -240,6 +248,7 @@ export interface ExternalLayoutItem {
 // ════════════════════════════════════════════════════════════════
 
 export interface TranslationUnit {
+  translationStatus?: 'fallback';
   originalSpans: HTMLSpanElement[];
   text: string;
   id: string;
@@ -253,6 +262,9 @@ export interface TranslationUnit {
 }
 
 export interface OverlayPositionData {
+  layoutRegionRevision?: string;
+  engine?: string;
+  translationStatus?: 'fallback';
   // Phase 11 (C8): optional stable id stamped onto each rendered overlay as
   // `data-translation-id`. Lets the renderer reconcile stale overlays with
   // freshly-reloaded saved data without spurious diffs (matches by id
@@ -293,6 +305,9 @@ export interface StyledTextSegment {
 }
 
 export interface SavedOverlay {
+  engine?: string;
+  layoutSettingsHash?: string;
+  needsMigration?: boolean;
   fileName: string;
   filePath: string;
   timestamp: number;
@@ -539,6 +554,8 @@ export const DEFAULT_SETTINGS: OpenRouterTranslatorSettings = {
   // Processing Settings
   maxBatchChars: 4000,
   backgroundTranslationConcurrency: 3,
+  // Phase 5.2 (FileJob paragraph cache): 100 pages per file, LRU.
+  paragraphCachePages: 100,
 
   // Storage Settings
   autoSaveOverlay: true,

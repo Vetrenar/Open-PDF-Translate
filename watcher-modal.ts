@@ -14,6 +14,18 @@ export class WatcherQueueModal extends SingletonModal<WatcherQueueModal> {
     private listEl: HTMLElement | null = null;
     private sortMode: SortMode = 'addedAt';
     private layoutQueueUnsub: (() => void) | null = null;
+    /**
+     * 5.4: render generation + DOM-attachment guard. Every render()
+     * bumps the generation; scheduleRender() batches multiple change
+     * sources (watcher event + queue flush) landing in the same tick
+     * into ONE rebuild, and a direct render() in between invalidates
+     * the scheduled one via the generation. `document.contains` stops
+     * renders after the modal was closed while a coalesced trailing
+     * flush or an async `.then(render)` chain was still in flight —
+     * the old code rebuilt a detached DOM tree.
+     */
+    private renderGeneration = 0;
+    private renderScheduled = false;
 
     constructor(app: App, plugin: OpenRouterTranslatorPlugin) {
         super(app);
@@ -94,10 +106,12 @@ export class WatcherQueueModal extends SingletonModal<WatcherQueueModal> {
         };
 
         // Auto-scan on open
+        // 5.4: scheduleRender (guarded) — the scan can resolve after the
+        // modal was closed; a direct render() would rebuild detached DOM.
         void watcher.scanAllUntranslated().then(n => {
             if (n > 0) {
                 new Notice(t('modal.watcher.scan.found', { n: String(n) }), 3000);
-                this.render();
+                this.scheduleRender();
             }
         });
 
@@ -111,12 +125,15 @@ export class WatcherQueueModal extends SingletonModal<WatcherQueueModal> {
 
         // File list container — render() fills it with Active + Available sections
         this.listEl = this.contentEl.createDiv();
-        watcher.setOnChange(() => this.render());
+        watcher.setOnChange(() => this.scheduleRender());
 
         // Subscribe to queue changes for live progress
+        // 5.4: the queue flushes are already coalesced ≤ 2/100ms; batching
+        // here additionally collapses same-tick watcher+queue events into
+        // a single DOM rebuild.
         const queue = this.plugin.pdfLayoutQueue;
         if (queue) {
-            this.layoutQueueUnsub = queue.onChange(() => this.render());
+            this.layoutQueueUnsub = queue.onChange(() => this.scheduleRender());
         }
 
         this.render();
@@ -135,6 +152,12 @@ export class WatcherQueueModal extends SingletonModal<WatcherQueueModal> {
     private render() {
         const el = this.listEl;
         if (!el) return;
+        // 5.4: closed / detached modal — nothing to render. This runs
+        // BEFORE the generation bump: a late scheduled callback must not
+        // resurrect a dead DOM tree.
+        if (!this.containerEl || !document.contains(this.containerEl)) return;
+        this.renderGeneration++;
+
         el.empty();
 
         let items = this.plugin.watcher.getQueue();
@@ -292,6 +315,26 @@ export class WatcherQueueModal extends SingletonModal<WatcherQueueModal> {
         }
     }
 
+    /**
+     * 5.4: batched render request. Events that land in the same tick
+     * (a watcher notify + a queue flush, or two rapid flushes) collapse
+     * into ONE DOM rebuild; a synchronous render() that ran between
+     * scheduling and the microtask (user clicked a button) bumps the
+     * generation and thereby invalidates this stale slot.
+     */
+    private scheduleRender(): void {
+        if (this.renderScheduled) return;
+        this.renderScheduled = true;
+        const gen = ++this.renderGeneration;
+        queueMicrotask(() => {
+            this.renderScheduled = false;
+            // Someone rendered directly in between — their DOM is at
+            // least as fresh as ours; drop this slot.
+            if (gen !== this.renderGeneration) return;
+            this.render();
+        });
+    }
+
     private appendProgressBarTo(container: HTMLElement, item: any): void {
         if (item.status !== 'running' || !item.message) return;
         const match = String(item.message).match(/(\d+)\s*\/\s*(\d+)/);
@@ -338,6 +381,9 @@ export class WatcherQueueModal extends SingletonModal<WatcherQueueModal> {
     }
 
     onClose() {
+        // 5.4: invalidate any still-scheduled render BEFORE teardown —
+        // a coalesced queue flush arriving after close must not rebuild.
+        this.renderGeneration++;
         this.plugin.watcher.setOnChange(null);
         if (this.layoutQueueUnsub) {
             this.layoutQueueUnsub();

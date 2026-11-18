@@ -1,6 +1,10 @@
+import { screenToPageRegion } from './region-layout';
+import { RegionLayoutEditor } from './region-layout-editor';
+import { fallbackIndices } from './translation-result';
 // reprocessor.ts
 import { App, Notice, TFile } from 'obsidian';
 import OpenRouterTranslatorPlugin from './main';
+import { buildSpanFilterCtx } from './table-keep';
 import { OverlayPositionData, SavedOverlay } from './types';
 import { LayoutResult } from './layout-detector';
 // Phase 7 (V4 Schema): stable per-overlay identifier generator. Stamped on
@@ -88,7 +92,7 @@ export class RegionReprocessor {
             this.finish();
             return;
         }
-        const pageEl = document.querySelector<HTMLElement>(`.page[data-page-number="${pageNumber}"]`);
+        const pageEl = this.plugin.app.workspace.activeLeaf?.view.containerEl.querySelector<HTMLElement>(`.page[data-page-number="${pageNumber}"]`);
         if (!pageEl) {
             new Notice('Page is not rendered. Please scroll into view.');
             this.finish();
@@ -249,220 +253,17 @@ export class RegionReprocessor {
      * and translation to the main TextProcessor, then handles saving the results.
      * Calculates original font sizes correctly based on the current viewer scale.
      */
-    private async handleRegionReprocessing(
-        screenRect: DOMRect,
-        pageNumber: number,
-        file: TFile
-    ): Promise<void> {
-        // P1-21 (Phase 12): warn if a background translation worker is
-        // currently active on the same vault. We don't abort — the user may
-        // intentionally want to override the worker's pending output for
-        // this page — but we surface the conflict so they can decide
-        // whether to wait for the worker to drain first.
-        if (this.plugin.pdfLayoutQueue?.isRunning?.()) {
-            new Notice('Background translation in progress. Wait or cancel first.', 5000);
-            // Don't abort — let user decide. Just warn.
-        }
-
-        const pageEl = document.querySelector<HTMLElement>(`.page[data-page-number="${pageNumber}"]`);
-        const textLayer = pageEl?.querySelector<HTMLElement>('.textLayer');
-        if (!pageEl || !textLayer) {
-            new Notice('⚠️ Page or text layer not available.');
-            this.finish();
-            return;
-        }
-
-        // Step 1: Filter spans based on selection (Reprocessor's unique job)
-        const selectedSpans = Array.from(textLayer.querySelectorAll<HTMLSpanElement>('span'))
-            .filter(span => {
-                const r = span.getBoundingClientRect();
-                const overlaps = !(r.right < screenRect.left || r.left > screenRect.right || r.bottom < screenRect.top || r.top > screenRect.bottom);
-                return overlaps;
-            })
-            .filter(span => this.plugin.processor.isValidSpan(span));
-
-        if (selectedSpans.length === 0) {
-            new Notice('⚠️ No valid text found in selected region.');
-            this.finish();
-            return;
-        }
-
-        // Step 2: Delegate processing and translation to the main TextProcessor
-        // P0-3 (R-1): CRITICAL — `prepareTranslationUnits` is async and returns
-        // Promise<TranslationUnit[]>. The missing `await` meant `translationUnits`
-        // was a Promise, `translationUnits.length` was `undefined`, the guard
-        // `=== 0` never fired, the Notice printed "Translating undefined segment(s)",
-        // and `executeTranslation(translationUnits)` crashed inside `units.map(...)`
-        // with `TypeError: units.map is not a function`. Region Reprocessing
-        // was completely broken.
-        // Phase 15.1: pass `forceFresh: true` so reprocessing never serves a
-        // stale cached layout for the selected spans — the user explicitly
-        // asked to re-detect & re-translate this region.
-        const translationUnits = await this.plugin.processor.prepareTranslationUnits(selectedSpans, pageEl, true);
-        if (!translationUnits || translationUnits.length === 0) {
-            new Notice('No translatable segments found in the selected region.');
-            this.finish();
-            return;
-        }
-        new Notice(`🔁 Translating ${translationUnits.length} segment(s)...`, 3000);
-
-        let translatedTexts: string[];
-        try {
-            translatedTexts = await this.plugin.processor.executeTranslation(translationUnits);
-        } catch (err: any) {
-            console.error('[RegionReprocessor] Translation failed:', err);
-            new Notice(`❌ Translation failed: ${err.message}. Using original text.`);
-            translatedTexts = translationUnits.map(u => u.text); // Fallback to original text
-        }
-
-        // Step 3: Generate overlay data for saving (Reprocessor's unique job)
-        const newItems: OverlayPositionData[] = [];
-
-        // --- CORRECTED FONT SIZE CALCULATION ---
-        // Get the current scale factor from the PDF viewer container *at the time of selection*.
-        const pdfViewer = pageEl.closest('.pdfViewer, #viewer') as HTMLElement | null;
-        // P0-3b (R-3): previously the NaN/<=0 branch only warned and continued
-        // — every subsequent font-size computation became NaN (since
-        // `observed / NaN = NaN`) and was persisted to `.translations.md`.
-        // Now we actually fall back to 1.0 so downstream math stays finite.
-        let currentScaleFromViewer = parseFloat(pdfViewer?.style.getPropertyValue('--scale-factor') || '1');
-        if (isNaN(currentScaleFromViewer) || currentScaleFromViewer <= 0) {
-            console.warn('[RegionReprocessor] Invalid scale factor, falling back to 1.0');
-            currentScaleFromViewer = 1.0;
-        }
-        // --- END CORRECTED FONT SIZE CALCULATION ---
-
-        for (let i = 0; i < translationUnits.length; i++) {
-            const { originalSpans, text } = translationUnits[i];
-            if (originalSpans.length === 0) continue;
-
-            // Use processor.getSpansBbox which returns scaled values relative to the page element
-            const bboxResult = this.plugin.processor.getSpansBbox(originalSpans, pageEl);
-            if (!bboxResult || !bboxResult.rect) continue;
-
-            const rawBbox = bboxResult.rect; // This is already scaled relative to pageEl's current transform
-
-            // Calculate relative rect based on the *current* page dimensions (affected by scale)
-            const pageRect = pageEl.getBoundingClientRect(); // This is the *scaled* page rect
-            const relativeRect = {
-                left: rawBbox.left / pageRect.width, // rawBbox.left is relative to pageEl's content (scaled)
-                top: rawBbox.top / pageRect.height,  // rawBbox.top is relative to pageEl's content (scaled)
-                width: rawBbox.width / pageRect.width,
-                height: rawBbox.height / pageRect.height,
-            };
-
-            if (Object.values(relativeRect).some(v => !isFinite(v)) || relativeRect.width <= 0 || relativeRect.height <= 0) {
-                console.debug('[RegionReprocessor] Skipping item with invalid relative rect:', relativeRect);
-                continue;
-            }
-
-            // --- CORRECTED FONT SIZE CALCULATION ---
-            // bboxResult.fontSizes and avgFontSize are scaled (they come from getSpansBbox on scaled spans).
-            // To store the 'original' size for later rendering, we need to divide by the current scale.
-            // However, the OverlayUIRenderer expects 'originalFontSizes' to be the base size *before* applying scale and outputFontSizeScale.
-            // Therefore, storing the sizes as they were *observed* (scaled) and letting OverlayUIRenderer handle the scaling correctly is key.
-            // Let's store the sizes as they were *observed* (scaled) and let the renderer derive the base size correctly.
-
-            // The average font size observed *at the current scale*.
-            const observedAvgFontSize = bboxResult.avgFontSize; // This is the scaled size
-            // The original font sizes observed *at the current scale*.
-            const observedOriginalFontSizes = bboxResult.fontSizes; // These are the scaled sizes
-
-            // Calculate the *base* font size that corresponds to the original PDF text size.
-            // This is what the OverlayUIRenderer will use before applying scale and outputFontSizeScale.
-            const baseAvgFontSize = observedAvgFontSize / currentScaleFromViewer;
-            const baseOriginalFontSizes = observedOriginalFontSizes.map(fs => fs / currentScaleFromViewer);
-            // --- END CORRECTED FONT SIZE CALCULATION ---
-
-            newItems.push({
-                selector: '', // Not used for saved overlays typically
-                textContent: text, // Original HTML text content
-                translatedText: translatedTexts[i] || text, // Translated text
-                relativeRect, // Relative position
-                page: pageNumber, // Page number
-                // Store the *base* (unscaled) font sizes, as expected by OverlayUIRenderer
-                originalFontSizes: baseOriginalFontSizes,
-                fontFamily: bboxResult.fontFamily,
-                // fontSize is often derived from originalFontSizes or not strictly needed if originalFontSizes is present
-                // If you still want to store it, store the base size:
-                fontSize: baseAvgFontSize,
-                // Phase 7 (V4 Schema): stable id from page + rect@3dec + textContent.
-                // Matches the id produced by overlay.ts extractPositionDataFrom
-                // and pdf-layout-queue.ts buildOverlayData for the same source
-                // paragraph — enables merge-by-id-first in updatePageOverlaysAndWrite.
-                id: generateOverlayId(pageNumber, relativeRect, text || ''),
-                // Phase 8 (V4 Schema): engine stamp from current provider/model.
-                // Reprocessor re-translates via the live TranslationEngine, so
-                // the current settings reflect the engine that produced the
-                // retranslated text.
-                engine: getCurrentEngine(this.plugin),
-            });
-        }
-
-        if (newItems.length === 0) {
-            new Notice('⚠️ No valid layout regions could be generated from the selection.');
-            this.finish();
-            return;
-        }
-
-        // Step 4: Save the reprocessed page and refresh the view (Reprocessor's unique job).
-        //
-        // Phase 3 (P0-7): previously this block did a full-file read-modify-write
-        // via `loadSavedOverlay(file)` + manual rect-overlap merge + `saveOverlay`
-        // (which delegated to `writeSavedOverlayForFile` — a full-file overwrite).
-        // That clobbered any concurrent worker writes on OTHER pages — the worker
-        // writes via `updatePageOverlaysAndWrite` (which only touches the pages it
-        // was given), but the reprocessor's stale full-file read could overwrite
-        // those worker pages with their pre-worker state, silently losing data.
-        //
-        // Now we write ONLY the modified page through `updatePageOverlaysAndWrite`
-        // (via `saveOverlay`). Storage's per-page merge-by-rect-overlap preserves
-        // any existing non-overlapping items on this page; other pages on disk are
-        // NOT touched. Phase 7 will swap rect-overlap for merge-by-id-first, but
-        // rect-overlap is sufficient to fix P0-7 (no longer clobbering OTHER pages).
-        //
-        // We construct a minimal SavedOverlay containing only the new items for
-        // the modified page — `saveOverlay` extracts that page and forwards it
-        // to `updatePageOverlaysAndWrite` as `{ [modifiedPage]: items }`.
-        const savedOverlay: SavedOverlay = {
-            fileName: file.basename.replace(/\.pdf$/i, ''),
-            filePath: file.path,
-            timestamp: Date.now(),
-            pageOverlays: { [pageNumber]: newItems },
-        };
-        await this.saveOverlay(savedOverlay, file, pageNumber);
-
-        this.plugin.clearAllOverlays();
-        // Phase 3 (P0-11): use the overlay-side `loadSavedOverlayForCurrentPage`
-        // (leaf-scoped, uses the renderer's in-memory cache as the single source
-        // of truth) instead of the deleted storage-side version.
-        await this.plugin.overlay.loadSavedOverlayForCurrentPage(true);
-
-        new Notice(`✅ Reprocessed and saved ${newItems.length} segment(s)`);
+    private async handleRegionReprocessing(screenRect: DOMRect, pageNumber: number, file: TFile): Promise<void> {
+        if(this.plugin.app.workspace.getActiveFile()?.path !== file.path) throw new Error('Active PDF changed. Select the region again.');
+        const leaf = this.plugin.app.workspace.activeLeaf;
+        const frame = leaf?.view.containerEl.querySelector<HTMLElement>(`.page[data-page-number="${pageNumber}"] .textLayer`);
+        if (!frame) throw new Error('PDF text layer unavailable');
+        const bounds=frame.getBoundingClientRect();
+        const region=screenToPageRegion(screenRect,bounds);
+        const rotation=frame.getAttribute('data-main-rotation');
         this.finish();
-    }
-
-    /**
-     * Phase 3 (P0-7): writes ONLY the modified page through
-     * `updatePageOverlaysAndWrite`. Storage's per-page merge-by-rect-overlap
-     * preserves non-overlapping existing items on this page; other pages on
-     * disk are NOT touched (fixing the reprocessor-clobbers-worker-on-other-
-     * pages bug).
-     *
-     * `savedOverlay` is expected to contain at least an entry for
-     * `modifiedPage`; any other pages it may carry are ignored — we forward
-     * only `{ [modifiedPage]: items }` to the storage writer.
-     */
-    private async saveOverlay(savedOverlay: SavedOverlay, file: TFile, modifiedPage: number): Promise<void> {
-        const pageKey = String(modifiedPage);
-        const items = savedOverlay.pageOverlays[pageKey] || [];
-        // Bug 2 fix: use REPLACE semantics. Reprocessor builds a fresh set of items
-        // for the modified page (existing non-overlapping + new). MERGE would re-merge
-        // against disk state and could keep stale duplicates when rects drift slightly.
-        await this.plugin.storage.updatePageOverlaysAndWrite(file, { [modifiedPage]: items }, { replace: true });
-        if (this.debug) {
-            console.debug(`[RegionReprocessor] Saved page ${modifiedPage} for ${file.path}`);
-        }
+        if(!region) return;
+        new RegionLayoutEditor(this.plugin,file,pageNumber,region,rotation===null?undefined:Number(rotation)).open();
     }
 
     private isOverlapping(

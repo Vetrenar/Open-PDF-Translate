@@ -1,265 +1,328 @@
-# Open PDF Translate
+# translate4 — исходники + файлы сборки (плоская структура, стандартная сборка Obsidian)
 
-Translate PDF documents in Obsidian using OpenRouter, OpenAI, Anthropic, Gemini, Ollama, and other LLM providers. Features overlay rendering, OCR for scanned documents, batch translation with background queue, and a BBox edit mode for manual overlay adjustments.
+Комплект для исправления плагина **OpenRouter PDF Translator**. Структура архива
+**плоская** — как в вашем репозитории: `main.ts` лежит рядом с `main.js`,
+`esbuild.mjs`, `package.json` (папки `src/` нет). Сборка — **обычная,
+стандартная схема Obsidian** (esbuild-конфиг уровня obsidian-sample-plugin;
+подробности и одно необходимое исключение — в § «Сборка»).
 
-## How It Works
+Решает **пять проблем** одним набором файлов:
 
-### Translation Pipeline
+1. **Ошибка валидатора Obsidian community plugins** —
+   `Found 1 dynamic <script> element creation` (динамическое создание `<script>` для
+   загрузки pdf.js с cdnjs — запрещено политикой каталога).
+2. **Постоянный Notice «pdfjs-dist loaded from CDN (bundled version failed)»** —
+   pdf.js никогда не попадал в бандл: esbuild не в состоянии статически разрешить
+   `require`, спрятанный в промежуточную переменную `req`, поэтому в `main.js`
+   оставался рантайм-`require`, который у установленного плагина всегда падал
+   («Cannot find module» — в каталоге плагина нет node_modules), и срабатывал
+   CDN-фолбэк — в каждом сеансе.
+3. **Скрытая зависимость от CDN у самого pdf.js** — даже после загрузки библиотеки
+   pdf.js разрешал свой *worker* через `loadScript()` → ещё один динамический
+   `<script>` с cdnjs (`pdf.worker.min.js`). Именно поэтому «фоновый перевод требовал
+   интернет», и именно поэтому простое удаление CDN-фолбэка без регистрации воркера
+   сломало бы извлечение текста с ошибкой
+   `No "GlobalWorkerOptions.workerSrc specified` (доказано экспериментально).
+4. **«Translation failed: Error: cancelled» при интерактивном переводе** —
+   «липкий» флаг `cancelled` очереди (PdfLayoutQueue): одно нажатие Cancel
+   (в модалке перевода, в watcher-модалке, остановка watcher'а) оставляло флаг
+   навсегда, и КАЖДЫЙ следующий перевод страницы мгновенно падал с 'cancelled',
+   подменялся оригинальным текстом и рендерился как «успешные» непереведённые
+   оверлеи. Это существующий баг плагина, не связанный с pdfjs-фиксом.
+5. **«Atomic write failed, falling back to direct write: Destination file already
+   exists!»** в консоли при каждом сохранении оверлеев — `vault.rename` в Obsidian
+   **отказывается перезаписывать существующий файл**, поэтому «атомарная» запись
+   всегда падала в фолбэк (данные при этом сохранялись корректно через `modify`).
+   Тоже существующий баг, не связанный с pdfjs-фиксом.
 
-The plugin follows a multi-stage pipeline to translate PDF content:
+Полный разбор с экспериментальными доказательствами — в отчётах
+`translate4-audit.md` (v1) и `translate4-audit-deep.md` (v2).
 
-**1. Text extraction.** When you open a PDF and trigger translation, the plugin extracts text from the PDF page. Two extraction engines are available:
-
-- **Internal engine** (default, works everywhere): Uses PDF.js (bundled with Obsidian) to read text items, their positions, font sizes, and font families directly from the PDF's content streams. No external dependencies.
-- **Python engine** (desktop-only, more accurate on complex layouts): Spawns a PyMuPDF (`fitz`) child process that parses the PDF with a more sophisticated layout model. Requires Python 3.8+ and `pip install pymupdf`.
-
-Both engines produce the same output format: an array of text spans with bounding rectangles (relative to the page, as 0–1 fractions), font metadata, and the raw text content.
-
-**2. Layout detection.** The extracted spans are grouped into paragraphs by the layout detector
-
-Settings like `contourIndentThreshold`, `fontSizeTolerance`, `maxMergePasses`, `columnGapThreshold`, and `decorationThreshold` control how aggressive the splitting/merging is. The `preserveStyle` option (enabled by default) treats bold and italic as different font families, producing finer-grained paragraphs.
-
-**3. Translation.** Each paragraph's text is sent to your configured LLM provider. 
-
-The `maxBatchChars` setting controls the maximum characters per batch. If the total exceeds this, paragraphs are split into multiple batches. A `sequentialDelayMs` setting adds a pause between batches to avoid rate-limiting.
-
-**4. Overlay rendering.** Translated text is rendered as a `position: absolute` div overlay on top of the original PDF page. 
-
-**5. Persistence.** Translations are saved to a `.translations.md` file alongside the PDF (in the same folder, or a configurable storage folder). The file uses the V4 format (see below) with YAML frontmatter and Obsidian `%% {...} %%` comments containing per-overlay JSON metadata. Writes are atomic (temp file + rename) and serialized via a per-file write lock (`writingPromises`).
-
-### Overlay Visibility
-
-You can show or hide overlays without losing translations:
-
-- **Command**: `Toggle PDF overlay visibility` (or hotkey) flips all overlays globally
-- **Per-page**: Overlays are loaded lazily as you scroll. If visibility is off, overlays are still created in the DOM but with `visibility: hidden` — they become visible instantly when you toggle back on
-- **Settings**: `showOverlayByDefault` controls whether overlays appear when a PDF is first opened
-
-### BBox Edit Mode
-
-BBox Edit Mode is a non-invasive overlay editing system. When enabled:
-
-- **Normal cursor, scrolling, and all Obsidian UI work** — nothing is blocked
-- **Click on overlay** → select it (clears previous selection)
-- **Ctrl/Shift+click on overlay** → toggle selection (additive — select multiple)
-- **Click on empty space** → clear selection
-- **Shift+LMB+drag** → marquee selection (a temporary overlay appears only during the drag, then is removed)
-- **Escape** → clear selection
-- **Right-click on overlay** → context menu:
-  - **Retranslate selected** (paragraphs mode) — re-detects paragraphs in the selected region and retranslates
-  - **Merge selected** (block mode) — merges selected overlays into one block and retranslates
-  - **Delete selected** — removes selected overlays (uses REPLACE semantics, no resurrection)
-  - **Edit translation** — opens a modal to manually edit the translated text
-  - **Copy translation** — copies plain text (multi-line preserved via `innerText`)
-  - **Copy as callout / citation / footnote** — copies with formatting templates
-  - **Increase/decrease font size** — adjusts overlay font size (persisted to disk)
-  - **Increase/decrease line height** — adjusts overlay line height (persisted to disk)
-  - **Force refresh overlays** — reloads all visible overlays from disk
-  - **Go to translation file** — opens the `.translations.md` file at the current page heading
-
-BBox Edit Mode does **not** pause the background translation queue. You can edit overlays while background translation is running — writes are serialized via the per-file lock.
-
-### Background Translation Queue
-
-The background queue translates entire PDFs (or page ranges) without blocking the UI:
-
-- **Entry points**: Watcher modal (per-file Translate button), "Translate multiple pages..." modal, "Run All" in watcher
-- **Processing**: The `PdfLayoutQueue` processes pages sequentially within a file (extraction is serial, translation is parallel up to `backgroundTranslationConcurrency`). Multiple files are processed in FIFO order.
-- **Backpressure**: The extraction-to-translation queue has a high-watermark (`concurrency × 10`). If the queue is full, extraction pauses until translation drains it — prevents OOM on 1000+ page PDFs.
-- **Document reuse**: PDF documents are loaded once per batch (not per page), reducing extraction time by ~30–60s on 100-page PDFs.
-- **Cancellation**: Cancel stops in-flight work at the next chunk boundary (5–10 seconds). The queue auto-resumes when new tasks are enqueued.
-- **Progress**: The watcher modal shows live progress per file (pages done/total + progress bar). Active translations appear in a scrollable accent-bordered section; available files appear in a compact list below.
-
-### V4 Translation Format
-
-Translation files (`.translations.md`) use the V4 format:
-
-```yaml
 ---
-pdf-source: "[[document.pdf]]"
-timestamp: 2026-08-13T12:00:00.000Z
-format-version: 4
-engine: openrouter/openai/gpt-4o-mini
-layoutSettingsHash: a1b2c3d4e5f67890
----
-```
 
-```markdown
-# Translations for document
+## Что чем заменить в вашем репозитории
 
-> Last updated: 2026-08-13 12:00
+Изменены **четыре** TS-файла (остальные 36 TS-файлов идентичны вашим — они включены
+для сверки и чтобы архив был полностью собираемым «из коробки»). Все пути —
+корень репозитория (плоская структура).
 
-## Page 1
-
-[[document.pdf#page=1|→ View page]]
-
-%% {"r":{"l":0.12,"t":0.34,"w":0.56,"h":0.08},"page":1,"ot":"Original text","fs":12,"ff":"sans-serif","ofs":[12,12,11],"id":"a1b2c3d4e5f67890","engine":"openrouter/openai/gpt-4o-mini"} %%
-
-Translated text here
-```
-
-#### Per-overlay fields
-
-| Field | Type | Description |
+| Файл в архиве | Куда положить | Действие |
 |---|---|---|
-| `r` | `{l,t,w,h}` | Relative bounding rect (0–1 fractions of page dimensions, 4-decimal precision) |
-| `page` | number | Page number |
-| `ot` | string | Original text content (used for edit-modal lookup) |
-| `fs` | number | Font size (persisted but inert — rendering uses `ofs` instead) |
-| `ff` | string | Font family |
-| `ofs` | number[] | Original font sizes array (drives overlay rendering — dominant/mode size) |
-| `id` | string | Stable hash `hash(page + rect@2dec + textContent)` — enables exact overlay lookup and merge-by-id |
-| `engine` | string | `<provider>/<model>` that produced this translation |
+| `pdf-text-extractor.ts` | корень репо, рядом с `main.ts` | **ЗАМЕНИТЬ** — фикс загрузки pdf.js (см. ниже) |
+| `processing.ts` | корень репо | **ЗАМЕНИТЬ** — фикс «липкого» cancelled (см. § Runtime-фиксы) |
+| `pdf-layout-queue.ts` | корень репо | **ЗАМЕНИТЬ** — новый метод `clearCancelFlag()` |
+| `storage.ts` | корень репо | **ЗАМЕНИТЬ** — фикс atomicWrite (case split) |
+| `*.ts` (остальные), `styles.css` | корень репо | не тронуты (для сверки: `diff`) |
+| `esbuild.mjs` | корень репо | **ЗАМЕНИТЬ** — теперь это стандартный конфиг obsidian-sample-plugin (без кастомных esbuild-плагинов) |
+| `package.json` | корень репо | **ЗАМЕНИТЬ** или слить (npm-скрипты + пин зависимостей) |
+| `package-lock.json` | корень репо | заменить (фиксирует pdfjs-dist@3.11.174) |
+| `tsconfig.json` | корень репо | **ЗАМЕНИТЬ/добавить** (для IDE, `include: ["*.ts"]`) |
+| `scripts/patch-pdfjs.mjs` | `scripts/` | **ДОБАВИТЬ** — патч pdfjs-dist в node_modules (запускается автоматически) |
+| `scripts/verify-bundle.mjs` | `scripts/` | **ДОБАВИТЬ** — гейт проверки бандла (кросс-платформенный) |
+| `scripts/verify-bundle.sh` | — | **УДАЛИТЬ**, если стоял из прошлой версии (заменён на `.mjs` — bash больше не нужен, работает на Windows) |
+| `.gitignore` | корень репо | **ДОБАВИТЬ** (`node_modules/`, `main.js.map`, бандлы тестов — не коммитить) |
+| `test-runtime-fixes.ts`, `test-extraction.ts`, `test-obsidian-stub.cjs`, `build-runtime-tests.mjs`, `test.pdf` | корень репо | **ДОБАВИТЬ** (регрессионные + E2E тесты, `npm test`; можно не ставить в прод) |
+| `manifest.json`, `versions.json` | — | ваши файлы, не меняются |
 
-#### Frontmatter fields
+Если у вас свой `package.json`, который жалко терять, — перенесите отсюда как
+минимум:
 
-| Field | Description |
+```json
+"dependencies": {
+  "dompurify": "^3.1.6",
+  "pdfjs-dist": "3.11.174"
+}
+```
+
+(пин **точный, без `^`** — pdfjs-dist 4.x несовместим с этой схемой загрузки) и
+скрипты из `"scripts"` (см. § «Сборка»). Убедитесь, что `pdfjs-dist` **не**
+попадает в `external` вашего esbuild-конфига: в `main.js` НЕ должны попадать
+`require("pdfjs-dist…")`-вызовы.
+
+`main.js` в архив **не включён** намеренно: он собирается одной командой из этих
+исходников (референсная сборка прошла все проверки: 4.78 МБ, E2E-тест извлечения
+текста PASSED, вывод побайтово совпадает с предыдущей схемой сборки).
+
+## Сборка: возврат к обычной схеме Obsidian (v2.3)
+
+Кастомный esbuild-конфиг с плагином `pdfjs-community-patch` **убран**. Теперь
+архитектура сборки максимально близка к `obsidian-sample-plugin`:
+
+```
+esbuild.mjs               ← СТАНДАРТНЫЙ конфиг sample-plugin:
+                            entryPoints ["main.ts"], format "cjs", banner,
+                            watch/dev + production — БЕЗ кастомных esbuild-плагинов
+scripts/patch-pdfjs.mjs   ← единственная нестандартная деталь (см. ниже)
+scripts/verify-bundle.mjs ← проверка готового main.js (входит в npm run build)
+```
+
+**npm-скрипты** (всё через `node` — bash не нужен, работает на Windows):
+
+```json
+"dev":         "node scripts/patch-pdfjs.mjs && node esbuild.mjs",
+"build":       "node scripts/patch-pdfjs.mjs && node esbuild.mjs production && node scripts/verify-bundle.mjs",
+"verify":      "node scripts/verify-bundle.mjs",
+"test":        "node scripts/patch-pdfjs.mjs && node build-runtime-tests.mjs && node test-runtime-bundle.js && node test-e2e-bundle.js",
+"postinstall": "node scripts/patch-pdfjs.mjs"
+```
+
+Два осознанных отличия `esbuild.mjs` от sample-plugin (оба закомментированы в
+файле):
+
+1. `sourcemap: prod ? false : true` — в dev **внешний** map вместо inline
+   (иначе main.js в dev весит ~15 МБ — см. § «Размеры»);
+2. `pdfjs-dist` и `dompurify` **не** в `external` — они обязаны бандлиться
+   в `main.js` (у установленного плагина нет node_modules).
+
+### Зачем нужен `scripts/patch-pdfjs.mjs` (и почему его нельзя убрать совсем)
+
+В pdf.js 3.11.174 есть участки кода, которые **никогда не выполняются** в
+конфигурации плагина (воркер зарегистрирован через `globalThis.pdfjsWorker`,
+PDF всегда передаётся байтами, `isEvalSupported: false`), но которые
+**статически** ловит валидатор каталога. Эксперимент: чисто стандартная сборка
+(конфиг sample-plugin дословно, без патча) даёт в `main.js`:
+
+| Паттерн в бандле | Сколько | Откуда в pdf.js |
+|---|---|---|
+| `document.createElement("script")` | **1** | loadScript (PATH C) — тот самый «Found 1 dynamic <script>…» |
+| `eval(` | 1 | `eval("require")` (PATH B, только Node) |
+| `new Function` | 4 | проба isEvalSupported + компиляция PostScript/глифов |
+
+То есть при полном отказе от патча плагин снова не пройдёт проверку каталога —
+именно с той ошибкой, с которой всё началось.
+
+Скрипт применяет 6 точечных замен к двум файлам в `node_modules/pdfjs-dist/
+legacy/build/` (подход как у `patch-package`):
+
+| Паттерн в pdf.js 3.11.174 | Где | Почему безопасно патчить |
+|---|---|---|
+| `document.createElement("script")` (loadScript, PATH C) | `pdf.js` | недостижимо: воркер зарегистрирован (PATH A) |
+| `eval("require")` (PATH B, только Node) | `pdf.js` | `isNodeJS = false` в Electron-рендерере Obsidian |
+| `new Function("")` (проба isEvalSupported) | `pdf.js`, `pdf.worker.js` | заменена на `throw` → детерминированный `false` |
+| `new Function("c","size",…)` / `new Function("src",…)` (компиляция PostScript/глифов) | `pdf.js`, `pdf.worker.js` | под guard'ом `isEvalSupported`, а плагин передаёт `isEvalSupported: false` в каждый `getDocument` |
+
+Свойства скрипта:
+
+- **идемпотентный** — повторный запуск ничего не портит (определяет
+  «уже пропатчено» и пропускает);
+- **самозащищённый** — отказывается работать, если pdfjs-dist не ровно
+  3.11.174 или ожидаемые строки не найдены (т.е. после обновления версии):
+  сборка падает с внятной ошибкой, а не отгружает непатченный код;
+- **кросс-платформенный** — чистый Node, без bash;
+- **запускается сам**: после `npm install`/`npm ci` (postinstall) и перед каждой
+  сборкой (`npm run build` / `npm run dev` / `npm run test`).
+
+Вывод новой схемы **побайтово совпадает** со старой (проверено `cmp`): функция
+патча просто переехала из esbuild-плагина в отдельный скрипт.
+
+### `scripts/verify-bundle.mjs` — гейт после сборки
+
+Заменяет прежний `scripts/verify-bundle.sh` (который требовал bash и на Windows
+ронял `npm run verify`). Проверяет готовый `main.js`: pdfjs (lib+worker) и
+dompurify в бандле, размер > 1.5 МБ, маркер патча присутствует, запрещённых
+паттернов нет (`createElement("script")` / `eval(` / `new Function` /
+`document.write` / ссылки на CDN). Запускается автоматически в конце
+`npm run build`, отдельно — `npm run verify`.
+
+## Runtime-фиксы (v2.2): «cancelled» и «Atomic write failed»
+
+Оба бага существовали в плагине до pdfjs-оверхола и не связаны с ним. Симптомы —
+ровно те, что в консоли:
+
+```
+[PDF Translator] Translation failed: Error: cancelled
+[OverlayRenderer] Rendered 9 overlay(s) for page 1        ← оверлеи рендерятся,
+                                                            но с НЕпереведённым текстом
+Atomic write failed, falling back to direct write: Error: Destination file already exists!
+```
+
+### Фикс A — «липкий» флаг `cancelled` (processing.ts + pdf-layout-queue.ts)
+
+`PdfLayoutQueue.cancel()` ставит флаг, который сбрасывается только `resume()` или
+следующим enqueue. Интерактивный перевод (команда «Translate», без очереди)
+проверял этот флаг в начале каждой пачки, но никогда не сбрасывал. Итог: одно
+нажатие Cancel где угодно (модалка перевода, watcher-модалка, смена настроек
+watcher'а → `stop()` → `cancelRunning()`) — и **каждый следующий перевод страницы**
+мгновенно бросал `'cancelled'`, `executeTranslation` возвращал оригинальные тексты,
+а рендер рисовался «успешным» с непереведённым содержимым.
+
+Решение: перед началом нового интерактивного перевода (`executeTranslation`)
+«залипший» флаг сбрасывается — только если очередь простаивает
+(`!isRunning()`), чтобы не ломать идущую в этот момент отмену фоновой задачи.
+Новый метод `PdfLayoutQueue.clearCancelFlag()` сбрасывает флаг **без** запуска
+обработки отложенных задач (в отличие от `resume()`). Отмена во время перевода
+(кнопка Cancel в модалке) работает как раньше — проверка между пачками сохранена.
+
+### Фикс B — atomicWrite (storage.ts)
+
+`vault.rename(temp, target)` в Obsidian **отказывается перезаписывать существующий
+файл** («Destination file already exists!») — это публичное API, атомарной замены
+через него нет. Старый код всегда пытался temp+rename даже для существующих
+`.translations.md` → rename всегда падал → console.warn при каждом сохранении →
+фолбэк `vault.modify` (данные сохранялись, но шум + лишний churn temp-файла).
+
+Решение — case split: существующий файл → сразу `vault.modify` (то же, что делал
+фолбэк, без шума); новый файл → temp + `vault.rename` (по-настоящему атомарно,
+адресат свободен). Поведение при сбоях (кросс-устройство, права) — прежний
+фолбэк, сохранён как страховка.
+
+### Тесты (`npm test`)
+
+Два набора, оба на фейковых plugin/vault (без Obsidian, без LLM, без сети):
+
+1. **runtime-фиксы** — 11 проверок: залипший флаг сбрасывается; отмена во время
+   перевода по-прежнему прерывает; путь без очереди; существующий файл → прямой
+   modify без temp/warning; новый файл → temp+rename.
+2. **E2E извлечения** — полный конвейер `extractPage` на `test.pdf` в Node:
+   воркер зарегистрирован (`globalThis.pdfjsWorker`), текст
+   «Hello PDF extraction test», fontSize 24, размеры страницы, нормализация
+   координат. Проверяет на ВАШЕЙ машине, что pdfjs забандлился и пропатчился
+   корректно — полезно, если что-то падает локально.
+
+## Что изменено в `pdf-text-extractor.ts`
+
+| Было | Стало |
 |---|---|
-| `pdf-source` | Wikilink to the source PDF (ties `.translations.md` to its PDF) |
-| `timestamp` | ISO-8601 creation/update time (display only) |
-| `format-version` | `4` (V3 files are auto-migrated on first edit) |
-| `engine` | Primary engine used for this file |
-| `layoutSettingsHash` | Hash of layout settings — `isCached` invalidates on mismatch, forcing re-translate when layout preset changes |
+| `declare const require` + `const req = …; req('pdfjs-dist/…')` (косвенный вызов — **никогда не бандлился**) | `await import('pdfjs-dist/legacy/build/pdf.js')` — **литеральный** динамический импорт: esbuild вшивает библиотеку в `main.js` как ленивый модуль |
+| — | `await import('pdfjs-dist/legacy/build/pdf.worker.js')` + регистрация `globalThis.pdfjsWorker` — активирует путь разрешения воркера **PATH A** (без Web Worker, без `loadScript`, без сети) |
+| `loadPdfjsFromCdn()` — `document.createElement('script')` + cdnjs + таймаут 15 с | **удалён полностью** (вместе с Attempt 3, Notice и текстами про npm install) |
+| Тексты ошибок «run: npm install pdfjs-dist@3.11.174» (для разработчика, показывались пользователю) | «The plugin installation appears to be corrupted — please reinstall the plugin» |
+| Устаревшая require-стратегия в шапке файла | актуальная документация + правила «DO NOT REGRESS» |
 
-#### V3 → V4 Migration
+`pdfjsInitError`, кэши байт PDF, fake-worker (`workerSrc = ''`), весь конвейер
+извлечения (OccupancyMap → IslandBuilder → нормализация) — **без изменений**;
+функционал сохранён полностью.
 
-Automatic on first edit/translate after plugin update:
-- V3 files (`format-version: 3`) continue to work without changes
-- On next edit/translate, `id` and `engine` are stamped on all overlays, `format-version` bumped to 4
-- `layoutSettingsHash` added to frontmatter
-- No manual migration needed
+## Файлы сборки
 
-## Features
+- **`esbuild.mjs`** — стандартный конфиг obsidian-sample-plugin (entry point
+  `main.ts`, вывод `main.js` — оба в корне). Никаких кастомных esbuild-плагинов;
+  два осознанных отличия от sample описаны в § «Сборка».
+- **`scripts/patch-pdfjs.mjs`** — патч pdfjs-dist в node_modules (автозапуск:
+  postinstall + перед каждой сборкой). Подробности и таблицу замен — в § «Сборка».
+- **`package.json`** — скрипты: `dev`, `build` (production + патч + verify),
+  `verify`, `test`, `postinstall`. Зависимости: `pdfjs-dist@3.11.174` (пин),
+  `dompurify`.
+- **`tsconfig.json`** — для IDE (`include: ["*.ts"]` — корневые файлы, node_modules
+  исключается автоматически). Сборка — esbuild-only (дерево и раньше не проходило
+  строгий tsc; `npm run build` не вызывает tsc намеренно).
+- **`scripts/verify-bundle.mjs`** — автономная проверка готового `main.js`
+  (маркеры бандла + запрещённые паттерны), подходит для Windows/CI/перед релизом.
 
-- **Multi-provider support**: 15 LLM providers including OpenAI, Anthropic, Gemini, OpenRouter, RouterAI, DeepSeek, xAI, Groq, Mistral, Together, Qwen, Ollama, LM Studio, vLLM, and custom endpoints.
-- **PDF overlay rendering**: Translated text appears as an overlay on top of the original PDF, with adjustable positioning, font size, opacity, and colors. Overlays are virtualized (only 15 closest pages loaded in DOM).
-- **BBox Edit Mode**: Non-invasive editing — click to select, shift+click to toggle, shift+drag for marquee. Right-click for context menu (retranslate, merge, delete, edit, copy, font adjust).
-- **OCR for scanned documents**: Recognize text in scanned PDFs using vision models (GPT-4o, Claude, Gemini, LLaVA, etc.) and generate translation notes.
-- **Background translation queue**: Translate entire documents with a background worker. Watch a folder for new PDFs and auto-translate them. Live progress with per-file status and progress bars. Backpressure prevents OOM on large PDFs.
-- **Layout detection**: Internal (JS-based) and Python (PyMuPDF) layout engines. Configurable paragraph splitting (indent, font tolerance, merge passes, column gaps, decoration threshold).
-- **Watched folders**: Automatically detect and translate PDFs dropped into a watched folder.
-- **Export**: Export PDFs with baked-in translations (desktop + Python required).
-- **V4 translation format**: Stable overlay IDs, engine stamps, layout settings hash. Automatic V3→V4 migration.
-- **Bilingual support**: Show original and translated text side-by-side.
+## Сборка и проверка
 
-## Installation
+```bash
+npm install                 # зависимости + postinstall сам патчит pdfjs-dist
+npm run build               # патч → esbuild production → проверка бандла
+npm run verify              # повторная проверка артефакта (по желанию)
+npm test                    # регрессионные + E2E тесты (без Obsidian, без сети)
+# режим разработки:
+npm run dev                 # watch-режим, пересборка при изменениях
+```
 
-### From Obsidian Community Plugins
+Ожидаемый результат — см. таблицу ниже. Это нормально для PDF-плагинов: pdf.js
+lib ~1.9 МБ + pdf.worker ~1.9 МБ + dompurify + код плагина.
 
-1. Open Obsidian Settings → Community Plugins
-2. Search for "OpenRouter PDF Translator"
-3. Click Install, then Enable
-
-### Manual installation
-
-1. Download the latest release from [GitHub Releases](https://github.com/openrouter-pdf-translator/releases)
-2. Extract `main.js`, `manifest.json`, and `styles.css` to your vault's `.obsidian/plugins/openrouter-pdf-translator/` folder
-3. Enable the plugin in Obsidian Settings → Community Plugins
-
-## Quick Start
-
-1. **Configure provider**: Open plugin settings → Provider section → Select your LLM provider → Enter API key
-2. **Open a PDF**: Open any PDF in Obsidian
-3. **Translate**: Right-click on the PDF → "Translate multiple pages..." → Select page range → Start
-4. **View overlay**: Translated text appears as an overlay on the PDF
-5. **Toggle overlay** (optional): Command palette → "Toggle PDF overlay visibility" to show/hide
-6. **Edit overlays** (optional): Toggle BBox Edit Mode → click overlays to select, right-click for context menu (edit, retranslate, delete, copy)
-
-## Desktop-only Features
-
-The following features require desktop Obsidian (Windows, macOS, Linux) and are not available on mobile (iOS/iPadOS):
-
-- **Python layout engine** (`layoutEngine: 'python'`): Uses PyMuPDF for advanced layout detection. Requires Python 3.8+ and PyMuPDF installed on your system:
-  ```bash
-  pip install pymupdf
-  ```
-- **PDF Export with translations** (`Export PDF with translations` command): Renders a new PDF with translated text baked in. Same Python+PyMuPDF requirement.
-
-All other features (translation, overlay, OCR via cloud vision models, basic layout detection, BBox edit mode) work on both desktop and mobile.
-
-## Supported Providers
-
-| Provider | API Key Required | Default Model | Notes |
+| Режим | Команда | `main.js` | Побочные файлы |
 |---|---|---|---|
-| OpenAI | Yes | `gpt-4o-mini` | Full support including vision |
-| Anthropic | Yes | `claude-3-5-sonnet-latest` | Full support including vision |
-| Google Gemini | Yes | `gemini-2.0-flash-exp` | Full support including vision |
-| OpenRouter | Yes | `openai/gpt-4o-mini` | Aggregator — access many models |
-| RouterAI | Yes | `openai/gpt-4o` | Russian aggregator (routerai.ru) — OpenAI-compatible API |
-| DeepSeek | Yes | `deepseek-chat` | Text only |
-| xAI (Grok) | Yes | `grok-2` | Text only |
-| Groq | Yes | `llama-3.3-70b-versatile` | Fast inference |
-| Mistral | Yes | `mistral-small-latest` | Text only |
-| Together AI | Yes | `meta-llama/Llama-3-8b-chat-hf` | Open-source models |
-| Alibaba Qwen | Yes | `qwen-plus` | Text only |
-| Ollama | No | `llama3` | Local, requires Ollama running |
-| LM Studio | No | (user-set) | Local, requires LM Studio running |
-| vLLM | No | (auto-fetched) | Local, requires vLLM server |
-| Custom | Varies | (user-set) | Bring your own endpoint |
+| dev (watch) | `npm run dev` | **≈ 4.8 МБ** | `main.js.map` (~8 МБ, внешний sourcemap — только для отладки в DevTools) |
+| production | `npm run build` | **4.78 МБ**, без sourcemap | — |
 
-## Commands
+- **В релиз и каталог идёт ТОЛЬКО production-сборка** (`npm run build`).
+- Obsidian при загрузке плагина читает только `main.js` — `main.js.map` не читается;
+  не коммитите его и не включайте в релизный zip (см. `.gitignore` в архиве:
+  `node_modules/`, `main.js.map`, `test-*-bundle.js`).
+- Если сборка «зелёная», а `main.js` меньше 1.5 МБ — pdfjs **не** забандлился
+  (`npm run build` это ловит и роняет сборку на этапе verify).
+- **Почему раньше main.js весил ~15 МБ**: dev-сборка использовала *inline*
+  sourcemap (карта ~11 МБ вшивалась прямо в main.js). Теперь sourcemap вынесен в
+  отдельный файл `main.js.map`, и даже в dev-режиме Obsidian перечитывает только
+  ~4.8 МБ — перезагрузки плагина быстрее, а отладка в DevTools работает как раньше.
+- Если npm-скрипты по какой-то причине не использовались и патч не применился —
+  это не проблема: `npm run build`/`npm run dev` всегда запускают патч первыми.
 
-### Translation
-- `Translate multiple pages...` — Open the batch translation modal (page range, start/cancel)
-- `Translate and add overlay to current PDF page` — Quick single-page translate
-- `Reprocess/retranslate a text region` — Re-translate a selected region (shift+drag)
-- `Retranslate using saved overlay layout...` — Bulk re-translation from saved overlays
+Замечание про `ExperimentalWarning: Importing JSON modules is an experimental feature`:
+это безвредное предупреждение Node (появляется при загрузке некоторых зависимостей
+на определённых версиях Node, чаще всего в dev/watch-режиме). На результат сборки
+оно не влияет. Отключить, если мешает: `NODE_OPTIONS=--no-warnings node esbuild.mjs`
+(Windows PowerShell: `$env:NODE_OPTIONS="--no-warnings"; node esbuild.mjs`).
 
-### Overlay Management
-- `Save current PDF overlay` — Save current page's overlays to disk
-- `Refresh current PDF overlay` — Reload overlays from disk
-- `Clear current PDF overlay` — Remove all overlays from current page
-- `Toggle PDF overlay visibility` — Show/hide all overlays globally
-- `Toggle BBox Edit Mode` — Enable/disable overlay editing (non-invasive)
+Смоук-тест в Obsidian:
 
-### OCR
-- `OCR: recognize PDF to translated note` — OCR with translation (multi-page)
-- `OCR: recognize current page` — Single-page OCR
+1. Скопировать `main.js`, `manifest.json`, `styles.css` в
+   `.obsidian/plugins/<id>/`, перезапустить Obsidian.
+2. Открыть PDF → команда Translate → извлечение текста и вёрстки работает,
+   **Notice про CDN больше не появляется**.
+3. Повторить **при выключенном интернете** — извлечение текста должно работать
+   (перевод через API недоступен офлайн — это ожидаемо).
+4. Перезапустить Obsidian → поведение идентично.
 
-### Background Queue
-- `Background translation: open watched-folder queue` — Open watcher modal (Card Stack layout: Active + Available sections)
+## Правила, нарушение которых вернёт баг (продублировано в шапке pdf-text-extractor.ts)
 
-### Layout
-- `Layout: extract entire PDF (background)` — Extract layout data in background
-- `Layout: create file with originals` — Create originals-only translation file
+1. Спецификаторы `import('pdfjs-dist/…')` — **только строковые литералы** (никаких
+   переменных/шаблонов) — иначе останутся рантайм-импортами.
+2. **Не** оборачивать загрузку в промежуточную переменную `req`.
+3. `pdfjs-dist` — **пин 3.11.174** (4.x — только ESM, пути `…/pdf.js` не существуют;
+   плюс краш `_isSameOrigin` при бандлинге esbuild).
+4. **Не** удалять регистрацию `globalThis.pdfjsWorker` — иначе
+   `No "GlobalWorkerOptions.workerSrc specified`.
+5. **Не** собирать напрямую `node esbuild.mjs` в обход npm-скриптов — патч pdfjs
+   запускается скриптами (`npm run build` / `npm run dev`).
+6. После каждой сборки — проверка размера/маркеров (входит в `npm run build`;
+   отдельно: `npm run verify`).
 
-### Export & Maintenance
-- `Export PDF with translations` — Desktop-only, requires Python
-- `Repair translation links` — Fix pdf-source frontmatter
-- `Repair translation file` — Re-parse and re-write translation files (triggers V3→V4 migration)
-- `Rebuild PDF-to-translation file map` — Refresh internal map
-- `Clean unused translation files` — Find and delete orphaned files
+## Перед повторной подачей в community plugins
 
-## Settings
-
-The plugin has 14 settings sections:
-
-1. **Provider** — Select and configure your LLM provider (15 providers supported)
-2. **Language** — Source and target languages (auto-detect supported)
-3. **Translation** — Batch size (`maxBatchChars`), concurrency, retry settings, reasoning mode
-4. **Storage** — Where translation files are saved (`.translations.md` V4 format)
-5. **Prompts** — Custom system prompts for translation (single + batch templates, supports `{TEXT}`, `{sourceLang}`, `{targetLang}` placeholders)
-6. **Visual** — Overlay appearance (font size scale, opacity, line height, colors)
-7. **Layout Engine** — Internal vs Python, detection parameters (indent threshold, font tolerance, merge passes, column gap, decoration threshold)
-8. **Watcher** — Auto-translation of dropped PDFs, watched folder path
-9. **OCR** — Vision model configuration + Advanced settings (DPI, image quality, pacing)
-10. **PDF Export** — Python script paths
-11. **UI Behavior** — Context menu, hover behavior, debug mode, layout debug mode
-12. **Copy Formats** — How copied translations are formatted (callout, citation, footnote templates)
-13. **Paragraph Filter** — Skip page numbers, single letters, URLs (configurable rules with regex)
-14. **Advanced** — Debug mode, layout debug mode, cache settings
-
-## License
-
-GLM-3.0 License — see [LICENSE](LICENSE) file for details.
-
-## Bundled Python Scripts
-
-This plugin includes two Python scripts (`layout_engine.py` and `pdf_export.py`) as embedded base64 resources. These are required for the Python layout engine and PDF export features (desktop-only). Both scripts are licensed under the GLM-3.0 License.
-
-## Privacy
-
-- API keys are stored locally in Obsidian's plugin data folder (`data.json`)
-- PDF content is sent to your configured LLM provider for translation
-- No telemetry or analytics are collected by this plugin
-- Translation files (`.translations.md`) are stored in your vault — you own all data
+- Поднять `version` в `manifest.json`, синхронизировать `versions.json`.
+- `isDesktopOnly`: после этой правки PDF-конвейер работает и на мобильных
+  (компилированный код не использует рантайм-`require`), но `child_process`-функции
+  (Python-движок вёрстки, экспорт PDF) остаются desktop-only — они уже обвешаны
+  проверками `window.require`; при сомнениях ставьте `isDesktopOnly: true`.
+- В описание PR включить: pdfjs-dist (lib + worker) бандлится в `main.js`,
+  CDN-fallback удалён; сетевые вызовы — только API провайдеров перевода/OCR через
+  `requestUrl`; `child_process` — опциональный desktop-движок вёрстки, запускается
+  только по команде пользователя.
+- В бандле остаются неиспользуемые в этой конфигурации упоминания `new Worker` и
+  `fetch`/`XMLHttpRequest` внутри кода pdf.js (стандартно для плагинов, бандлящих
+  pdf.js; недостижимы при передаче PDF байтами напрямую и зарегистрированном воркере) —
+  если ревьюер спросит, поясните это.

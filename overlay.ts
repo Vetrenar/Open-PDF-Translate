@@ -220,15 +220,17 @@ export class OverlayRenderer {
             const pageNumber = parseInt(pageElement.dataset.pageNumber || '0');
             // P1-18 (Phase 15): collect appended overlays so we can fit them
             // to their bbox in a single RAF after the append loop. The
-            // previous code relied on `createReflowOverlay` calling
-            // `adjustOverlayForOverflow` internally — but at that point the
-            // element was still detached, so scrollHeight/clientHeight
-            // returned 0 and the fit step was a no-op (P2-64 removes that
-            // dead call). Running the fit in a RAF after `appendChild`
-            // guarantees the element is attached and has a real layout box
-            // when the measurement runs. Batching in one RAF (rather than
-            // scheduling one RAF per overlay) avoids N layout-thrashing
-            // style reads in a tight loop.
+            // previous code relied on `createReflowOverlay` calling the fit
+            // internally — but at that point the element was still detached,
+            // so scrollHeight/clientHeight returned 0 and the fit step was a
+            // no-op (P2-64 removes that dead call). Running the fit in a RAF
+            // after `appendChild` guarantees the element is attached and has a
+            // real layout box when the measurement runs. Batching in one RAF
+            // (rather than scheduling one RAF per overlay) avoids N
+            // layout-thrashing style reads in a tight loop.
+            // BBOX-FIT (2026-09-14): RAF теперь вызывает ПАКЕТНУЮ подгонку
+            // (fitOverlayBatch) — правые пределы от соседей + групповая
+            // унификация шрифта, а не независимая подгонка каждого бокса.
             const appended: { el: HTMLElement; lh: number }[] = [];
             units.forEach((unit, i) => {
                 try {
@@ -236,14 +238,32 @@ export class OverlayRenderer {
                     if (!translatedText.trim()) return;
                     const { rect, fontSizes, fontFamily } = this.plugin.processor.getSpansBbox(unit.originalSpans, pageElement);
                     if (!rect) return;
+                    // FONT-CONTRACT-FIX (FONT-EXP, 2026-09-16): getSpansBbox
+                    // возвращает computed-размеры спанов — уже умноженные на зум
+                    // просмотрщика (pt×S; pdf.js: font-size = calc(var(--scale-
+                    // factor)*Npx)), а createReflowOverlay ожидает БАЗОВЫЕ
+                    // размеры (pt) и сам применяет outputFontSizeScale ×
+                    // lastKnownScale. Передача scaled-размеров давала двойной
+                    // масштаб первого рендера (pt×S²×0.95): заголовки/короткие
+                    // фразы/табличные ячейки рендерились до ×S крупнее
+                    // запрошенного, с вертикальным клипом (real-browser корпус
+                    // при переводе +4% и зуме 1.3333: до 25 клипов на страницу),
+                    // а после save→reload шрифт «прыгал» вниз к правильному
+                    // размеру. Дескейлим свежим чтением --scale-factor — тем же
+                    // источником, что и save-путь (getScaleFactorFromPage);
+                    // reload-пути передают сохранённые pt и не меняются.
+                    const scaleRaw = this.plugin.pdfDom?.getScaleFactorFromPage?.(pageElement);
+                    const descale = Number.isFinite(scaleRaw) && (scaleRaw as number) > 0 ? (scaleRaw as number) : 1;
+                    const baseFontSizes = descale !== 1 ? fontSizes.map(fs => fs / descale) : fontSizes;
                     const originalPlainText = textMemo.get(unit.text) || this.uiRenderer.extractPlainTextFromHtml(unit.text); // Use helper from uiRenderer
                     textMemo.set(unit.text, originalPlainText);
                     // Pass necessary settings to uiRenderer
                     const overlayEl = this.uiRenderer.createReflowOverlay(
-                        rect, translatedText, unit.originalSpans[0], fontSizes, pageNumber, originalPlainText,
+                        rect, translatedText, unit.originalSpans[0], baseFontSizes, pageNumber, originalPlainText,
                         this.plugin.settings.overlayOpacity, this.plugin.settings.outputFontSizeScale,
                         this.plugin.settings.outputLineHeight, this.lastKnownScale, fontFamily
                     );
+                    if (unit.translationStatus) overlayEl.setAttribute('data-translation-status', unit.translationStatus);
                     overlayEl.setAttribute('data-overlay-index', String(i));
                     overlayEl.setAttribute('data-overlay-page', String(pageNumber));
                     container.appendChild(overlayEl);
@@ -252,12 +272,22 @@ export class OverlayRenderer {
                     this.logDebug(`Error rendering unit ${i}:`, unitError);
                 }
             });
-            // P1-18 (Phase 15): fit overlays to bbox after append (when layout is available)
+            // P1-18 (Phase 15): fit overlays to bbox after append (when layout is available).
+            // BBOX-FIT (2026-09-14): один ПАКЕТНЫЙ проход на страницу — правые
+            // пределы от соседей + групповая унификация шрифта (вместо
+            // независимой подгонки каждого бокса). pageWidth — в координатах
+            // style.left оверлеев (page-relative px).
             if (appended.length > 0) {
+                // BBOX-FIT-3: рамка координат оверлеев — padding-box страницы
+                // (clientWidth; border-box шире на --page-border pdf.js 4.x).
+                // jsdom-фолбэк — patched getBoundingClientRect().width.
+                const rectW = pageElement.getBoundingClientRect().width;
+                const pageWidth = pageElement.clientWidth > 0 ? pageElement.clientWidth : rectW;
                 requestAnimationFrame(() => {
-                    for (const { el, lh } of appended) {
-                        if (el.isConnected) this.uiRenderer.adjustOverlayForOverflow(el, lh);
-                    }
+                    this.uiRenderer.fitOverlayBatch(
+                        appended,
+                        Number.isFinite(pageWidth) && pageWidth > 0 ? pageWidth : undefined
+                    );
                 });
             }
             // Mark page as loaded
@@ -1010,7 +1040,9 @@ export class OverlayRenderer {
             `;
             document.body.appendChild(stagingContainer);
 
-            const pageOverlaySets: { pageNumber: number, pageElement: HTMLElement, overlays: HTMLElement[] }[] = [];
+            // BBOX-FIT: pageWidth — ширина страницы в координатах оверлеев
+            // (textLayer-relative px), для пакетной подгонки.
+            const pageOverlaySets: { pageNumber: number, pageElement: HTMLElement, overlays: HTMLElement[], pageWidth: number }[] = [];
 
             // Step 1: prepare overlays for all visible pages in parallel
             await Promise.all(visiblePages.map(async pageElement => {
@@ -1036,15 +1068,23 @@ export class OverlayRenderer {
                 const fallbackRef = (textLayer.querySelector('span') as HTMLSpanElement) || document.createElement('span');
                 const overlays: HTMLElement[] = [];
 
+                // BBOX-FIT-3: дроби textLayer-relative → рамка контейнера
+                // (см. renderSavedOverlay; при совпадающих рамках сдвиг 0).
+                const contRect = overlayContainer.getBoundingClientRect();
+                const frameDx = textLayerRect.left - contRect.left;
+                const frameDy = textLayerRect.top - contRect.top;
+
                 for (const data of pageData) {
                     try {
                         // Saved positions are textLayer-relative fractions.
-                        // Multiply by textLayerRect dimensions to get textLayer-relative pixels.
-                        // The overlay container is page-relative, but in standard PDF.js 4.x
-                        // textLayer covers the entire page (offset = 0), so no shift needed.
+                        // Multiply by textLayerRect dimensions to get textLayer-relative
+                        // pixels, then shift into the overlay-container frame
+                        // (BBOX-FIT-3: no "offset = 0" assumption — the container
+                        // anchors at the page padding box, which in pdf.js 4.x
+                        // differs from the border box by var(--page-border)).
                         const absRect = new DOMRect(
-                            data.relativeRect.left * textLayerRect.width,
-                            data.relativeRect.top * textLayerRect.height,
+                            data.relativeRect.left * textLayerRect.width + frameDx,
+                            data.relativeRect.top * textLayerRect.height + frameDy,
                             data.relativeRect.width * textLayerRect.width,
                             data.relativeRect.height * textLayerRect.height
                         );
@@ -1076,16 +1116,21 @@ export class OverlayRenderer {
                         this.logDebug(`Error staging overlay for page ${pageNumber}`, err);
                     }
                 }
-                pageOverlaySets.push({ pageNumber, pageElement: overlayContainer, overlays });
+                // BBOX-FIT: ширина страницы (координаты textLayer ≈ page) —
+                // для пакетной подгонки; в staging-контейнере closest('.page')
+                // не работает, поэтому передаём явно.
+                pageOverlaySets.push({ pageNumber, pageElement: overlayContainer, overlays, pageWidth: textLayerRect.width });
             }));
 
             // Step 2: batch adjustments in one RAF
+            // BBOX-FIT (2026-09-14): пакетная подгонка постранично (капы от
+            // соседей + групповая унификация шрифта) вместо поэлементной.
             await new Promise<void>(resolve => requestAnimationFrame(() => {
-                for (const { overlays } of pageOverlaySets) {
-                    for (const el of overlays) {
-                        // Pass the current global line height setting to the adjustment function
-                        this.uiRenderer.adjustOverlayForOverflow(el, this.plugin.settings.outputLineHeight);
-                    }
+                for (const { overlays, pageWidth } of pageOverlaySets) {
+                    this.uiRenderer.fitOverlayBatch(
+                        overlays.map(el => ({ el, lh: this.plugin.settings.outputLineHeight })),
+                        pageWidth
+                    );
                 }
                 resolve();
             }));
@@ -1110,7 +1155,13 @@ export class OverlayRenderer {
         const currentPageEl = this.getCurrentPageElement();
         if (!currentPageEl) return;
 
-        const pageRect = currentPageEl.getBoundingClientRect();
+        // BBOX-FIT-3: координаты оверлеев — в padding-box рамке (clientWidth/
+        // clientHeight); border-box (getBoundingClientRect) шире на рамку
+        // страницы pdf.js. jsdom-фолбэк — rect-размеры (синтетические).
+        const rectW = currentPageEl.getBoundingClientRect().width;
+        const rectH = currentPageEl.getBoundingClientRect().height;
+        const maxW = currentPageEl.clientWidth > 0 ? currentPageEl.clientWidth : rectW;
+        const maxH = currentPageEl.clientHeight > 0 ? currentPageEl.clientHeight : rectH;
         currentPageEl.querySelectorAll('.pdf-text-overlay-reflow').forEach(el => {
             const htmlEl = el as HTMLElement;
             let left = parseFloat(htmlEl.style.left || '0');
@@ -1118,8 +1169,8 @@ export class OverlayRenderer {
             const width = parseFloat(htmlEl.style.width || '0');
             const height = parseFloat(htmlEl.style.height || '0');
 
-            left = Math.max(0, Math.min(left, pageRect.width - width));
-            top = Math.max(0, Math.min(top, pageRect.height - height));
+            left = Math.max(0, Math.min(left, maxW - width));
+            top = Math.max(0, Math.min(top, maxH - height));
 
             htmlEl.style.left = `${left}px`;
             htmlEl.style.top = `${top}px`;
@@ -1302,7 +1353,7 @@ export class OverlayRenderer {
         }
     }
 
-    private updateAllOverlayVisibility(): void {
+    public updateAllOverlayVisibility(): void {
         const cacheKey = 'cacheRefresh';
         if (!this.activeLeavesCache || Date.now() - (this.memoCache.get(cacheKey)?.timestamp || 0) > 1000) {
             this.activeLeavesCache = new Set(this.plugin.app.workspace.getLeavesOfType('pdf'));
@@ -1320,7 +1371,9 @@ export class OverlayRenderer {
         });
     }
 
-    // Note: adjustOverlayForOverflow is now handled by uiRenderer and is private there
+    // Note: overflow fitting is handled by uiRenderer (BBOX-FIX: production
+    // paths go through the batch fitter `fitOverlayBatch`; the single-element
+    // `adjustOverlayForOverflow` remains a public compat/manual entry point)
     // Note: setOverlayElementVisibility is now handled by uiRenderer and is private there
 
     // ============================================================
@@ -1474,6 +1527,17 @@ export class OverlayRenderer {
             const overlayContainer = this.preparePageForOverlay(pageElement);
             const fallbackRef = (textLayer.querySelector('span') as HTMLSpanElement) || document.createElement('span');
 
+            // BBOX-FIT-3 (2026-09-14): сохранённые дроби — textLayer-relative.
+            // При воспроизведении переводим их в рамку КОНТЕЙНЕРА оверлеев
+            // (padding-box страницы): добавляем фактический сдвиг textLayer
+            // относительно контейнера. В стандартном pdf.js 4.x оба стоят на
+            // inset:0 → сдвиг 0 (поведение не меняется), но при любом
+            // CSS-переопределении (.page с рамкой/отступами, кастомные темы)
+            // геометрия остаётся верной без допущения «offset = 0».
+            const contRect = overlayContainer.getBoundingClientRect();
+            const frameDx = textLayerRect.left - contRect.left;
+            const frameDy = textLayerRect.top - contRect.top;
+
             // --- Batching optimization ---
             const stagingContainer = document.createElement('div');
             stagingContainer.style.cssText = `
@@ -1493,8 +1557,8 @@ export class OverlayRenderer {
                     const scaleX = textLayerRect.width;
                     const scaleY = textLayerRect.height;
                     const absoluteRect = new DOMRect(
-                        data.relativeRect.left * scaleX,
-                        data.relativeRect.top * scaleY,
+                        data.relativeRect.left * scaleX + frameDx,
+                        data.relativeRect.top * scaleY + frameDy,
                         data.relativeRect.width * scaleX,
                         data.relativeRect.height * scaleY
                     );
@@ -1528,11 +1592,15 @@ export class OverlayRenderer {
             }
 
             // Step 2: Batch measure & adjust for overflow
+            // BBOX-FIT (2026-09-14): пакетная подгонка с явной шириной
+            // страницы — оверлеи ещё в staging-контейнере, closest('.page')
+            // вернул бы null и расширение коротких фраз осталось бы
+            // неограниченным (Infinity-«страница»).
             await new Promise<void>(resolve => requestAnimationFrame(() => {
-                for (const el of overlays) {
-                    // Pass the current global line height setting to the adjustment function
-                    this.uiRenderer.adjustOverlayForOverflow(el, this.plugin.settings.outputLineHeight);
-                }
+                this.uiRenderer.fitOverlayBatch(
+                    overlays.map(el => ({ el, lh: this.plugin.settings.outputLineHeight })),
+                    textLayerRect.width
+                );
                 resolve();
             }));
 
@@ -1734,7 +1802,12 @@ export class OverlayRenderer {
                 return { positionData: [], pageNumber: currentPageNumber, hasData: false };
             }
 
-            const positionData = this.extractPositionDataFrom(textLayer, overlayContainer, textLayerRect);
+            // O-1 fix (2026-09-12): the page number captured at the START of
+            // this method is passed explicitly — extractPositionDataFrom no
+            // longer re-reads the CURRENT page mid-flight. Before, the
+            // returned `pageNumber` and each item's `metadata.page` could
+            // disagree if the user scrolled between capture and extraction.
+            const positionData = this.extractPositionDataFrom(textLayer, overlayContainer, textLayerRect, currentPageNumber);
 
             return {
                 positionData,
@@ -1747,7 +1820,12 @@ export class OverlayRenderer {
         }
     }
 
-    public extractPositionDataFrom(textLayer: HTMLElement, overlayContainer: Element, textLayerRect: DOMRect): OverlayPositionData[] {
+    public extractPositionDataFrom(
+        textLayer: HTMLElement,
+        overlayContainer: Element,
+        textLayerRect: DOMRect,
+        pageNumber: number,
+    ): OverlayPositionData[] {
         if (!textLayer || !overlayContainer) {
             return [];
         }
@@ -1757,14 +1835,22 @@ export class OverlayRenderer {
         // (expanded rect), and on load createReflowOverlay applies bleed AGAIN →
         // double-bleed → overlay shifted and larger than intended.
         const BLEED_X = 4;
-        const BLEED_Y_NORMAL = 2;
+        const BLEED_Y_NORMAL = 3;
         const BLEED_Y_TIGHT = 0;
-
         const positionData: OverlayPositionData[] = [];
         const overlays = Array.from(overlayContainer.querySelectorAll<HTMLElement>('.pdf-text-overlay-reflow'));
-        const pageNumber = this.plugin.getCurrentPageNumber() ?? 0;
+        // O-1 fix (2026-09-12): `pageNumber` is a mandatory parameter. The old
+        // `this.plugin.getCurrentPageNumber()` read the CURRENTLY VISIBLE
+        // page — while the caller writes the result into the bucket of the
+        // page that OWNS `pageElement` (its data-page-number). Scrolling
+        // between the two reads stamped every overlay with a foreign page,
+        // and the storage parser's re-bake (FIX A2) then physically moved
+        // the overlays to that wrong page on the next load. The id below
+        // (generateOverlayId) also becomes stable across save/load cycles
+        // because it is now built from the same page that owns the data.
 
-        const saveScale = this.plugin.pdfDom.getScaleFactorFromPage(textLayer);
+        // FONT-CONTRACT-FIX: saveScale больше не нужен — см. комментарий у
+        // relativeFontSizes ниже (attr хранит pt, дескейл при save убран).
 
         for (const overlay of overlays) {
             try {
@@ -1774,11 +1860,28 @@ export class OverlayRenderer {
                 // tight bbox of the original text. This ensures that on reload,
                 // createReflowOverlay can re-apply the bleed correctly.
                 const isTight = overlay.getAttribute('data-is-tight') === 'true';
-                const bleedY = isTight ? BLEED_Y_TIGHT : BLEED_Y_NORMAL;
+                // BBOX-FIT-3: вертикальный bleed теперь пропорционален размеру
+                // шрифта (см. overlay-ui BLEED_Y_FONT_FRAC) и фиксируется в
+                // data-bleed-y при создании — реверсируем именно сохранённое
+                // значение; константы выше — фолбэк для элементов без атрибута.
+                const bleedYAttr = parseFloat(overlay.getAttribute('data-bleed-y') || '');
+                const bleedY = Number.isFinite(bleedYAttr) && bleedYAttr >= 0
+                    ? bleedYAttr
+                    : (isTight ? BLEED_Y_TIGHT : BLEED_Y_NORMAL);
+                // BBOX-FIT (2026-09-14): реверсируем не только BLEED, но и
+                // авт-расширение ширины коротких фраз (подгонка меняет
+                // style.width; data-initial-width хранит исходную ширину,
+                // установленную createReflowOverlay). Иначе расползшийся бокс
+                // сохранялся в .translations.md расширенным и наползание
+                // воспроизводилось на каждой перезагрузке.
+                const initialWidthAttr = parseFloat(overlay.getAttribute('data-initial-width') || '');
+                const boxWidth = Number.isFinite(initialWidthAttr) && initialWidthAttr > 0
+                    ? initialWidthAttr
+                    : rect.width;
                 const tightRect = {
                     left:   rect.left   + BLEED_X,
                     top:    rect.top    + bleedY,
-                    width:  rect.width  - (BLEED_X * 2),
+                    width:  boxWidth   - (BLEED_X * 2),
                     height: rect.height - (bleedY * 2),
                 };
                 // Clamp to non-negative
@@ -1804,14 +1907,26 @@ export class OverlayRenderer {
                     }
                 }
 
-                const relativeFontSizes: number[] = originalFontSizes.length > 0 && saveScale > 0
-                    ? originalFontSizes.map(fs => fs / saveScale)
-                    : [];
+                // FONT-CONTRACT-FIX (FONT-EXP, 2026-09-16): атрибут
+                // data-original-font-sizes теперь хранит БАЗОВЫЕ (pt) размеры
+                // — renderOverlays дескейлит computed-размеры ПЕРЕД
+                // createReflowOverlay, reload-пути передают сохранённые pt
+                // как есть. Прежнее деление на saveScale предполагало, что в
+                // attr лежат масштабированные px (старый live-контракт), и
+                // после фикса двойной дескейл уменьшал бы шрифт при reload
+                // ровно на saveScale. Формат хранилища НЕ меняется: старые
+                // записи уже содержат pt (старый attr=scaled px ÷ saveScale),
+                // новые пишут pt напрямую. Бонус: правки оверлеев, сделанные
+                // после reload'а, больше не теряют масштаб при смене зума
+                // между save и load (раньше их attr=pt делился на saveScale
+                // ещё раз, и reload на другом зуме давал дрейф S_new/S_old).
+                const relativeFontSizes: number[] = originalFontSizes;
 
                 positionData.push({
                     selector: '',
                     textContent: overlay.getAttribute('data-original-text') || '',
                     translatedText: overlay.querySelector('div')?.innerHTML || overlay.textContent || '',
+                    translationStatus: (overlay.getAttribute('data-translation-status') || overlay.querySelector('div')?.getAttribute('data-translation-status')) === 'fallback' ? 'fallback' : undefined,
                     relativeRect,
                     page: pageNumber,
                     originalFontSizes: relativeFontSizes,
@@ -1853,9 +1968,17 @@ export class OverlayRenderer {
     // the user scrolls/flips pages between translation completion and rAF fire.
     public async saveCurrentPageOverlayForPage(pageElement: HTMLElement): Promise<boolean> {
         try {
-            const activeFile = this.getActivePDFLeaf()?.view?.file;
-            if (!activeFile) {
-                this.logDebug('Cannot save overlay, no active PDF file.');
+            // O-1 fix (2026-09-12, a): the owning file comes from the DOM
+            // ancestry of pageElement (same resolution the render path uses
+            // — FIX H10), NOT from the active leaf. The save can spend up to
+            // EXTRACT_RETRY_INTERVAL × EXTRACT_MAX_RETRIES in the retry loop
+            // below; switching tabs in that window used to redirect page X's
+            // overlays into a DIFFERENT PDF's .translations.md.
+            // Abort (return false) when the owner can't be resolved —
+            // losing one auto-save beats corrupting a foreign file.
+            const ownerFile = this.plugin.pdfDom.getFileFromPageElement(pageElement);
+            if (!ownerFile) {
+                this.logDebug('Owning leaf not found/closed — aborting save (data would be orphaned).');
                 return false;
             }
 
@@ -1876,6 +1999,14 @@ export class OverlayRenderer {
             let textLayerRect = textLayer.getBoundingClientRect();
             let retries = 0;
             while ((textLayerRect.width === 0 || textLayerRect.height === 0) && retries < EXTRACT_MAX_RETRIES) {
+                // O-1 fix (2026-09-12): PDF.js virtualizes pages — if the
+                // textLayer was detached while we waited, its rects are
+                // garbage and the retry is pointless. Abort instead of
+                // persisting nonsense geometry.
+                if (!textLayer.isConnected) {
+                    this.logDebug('Page virtualized away during retry — aborting save.');
+                    return false;
+                }
                 await new Promise(r => setTimeout(r, EXTRACT_RETRY_INTERVAL));
                 retries++;
                 textLayerRect = textLayer.getBoundingClientRect();
@@ -1885,7 +2016,10 @@ export class OverlayRenderer {
                 return false;
             }
 
-            const positionData = this.extractPositionDataFrom(textLayer, overlayContainer, textLayerRect);
+            // O-1 fix (b): the page number comes from pageElement's
+            // data-page-number — the page that OWNS this DOM — and is
+            // stamped on every overlay item (metadata.page) and id.
+            const positionData = this.extractPositionDataFrom(textLayer, overlayContainer, textLayerRect, pageNumber);
             if (positionData.length === 0) {
                 this.logDebug(`No position data extracted from page ${pageNumber}.`);
                 return false;
@@ -1894,7 +2028,7 @@ export class OverlayRenderer {
             this.logDebug(`Saving ${positionData.length} overlays for page ${pageNumber} (captured page element)`);
 
             const pagesToUpdate = { [pageNumber]: positionData };
-            await this.plugin.storage.updatePageOverlaysAndWrite(activeFile, pagesToUpdate);
+            await this.plugin.storage.updatePageOverlaysAndWrite(ownerFile, pagesToUpdate);
 
             // Keep runtime state in sync
             this.pagesWithOverlays.add(pageNumber);

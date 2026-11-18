@@ -299,16 +299,147 @@ export interface LayoutSettings {
    *  Lines whose dominant size differs by > this value are split into separate paragraphs. */
   contourFontSizeTolerance: number;
   // Stage 2.2 (Q6): 3 new layout settings exposed in Settings → Advanced.
-  /** Column gap threshold in pixels — vertical strips wider than this are
-   *  treated as column separators. Default 50. */
+  /** Reading-order FALLBACK threshold in pixels — a horizontal jump in
+   *  paragraph left edges wider than this starts a new column group in
+   *  applyColumnOrder's legacy path (used only when validated column
+   *  boundaries are unavailable; does NOT control column detection).
+   *  Default 50. */
   columnGapThreshold: number;
-  /** Decoration detection threshold — spans with font size < this fraction
-   *  of the line's median size are treated as decorations (superscripts,
-   *  footnote refs) and don't trigger paragraph splits. Default 0.7 (70%). */
+  /** Decoration detection threshold — a FRACTION OF THE LINE'S MEDIAN font
+   *  size (not a text length): spans smaller than this fraction are
+   *  treated as decorations (superscripts, footnote refs) and don't
+   *  trigger paragraph splits. Default 0.7 (70%). */
   decorationThreshold: number;
   /** Maximum merge passes for the iterative paragraph merge step (default 10).
    *  Each pass merges touching islands with the same primary font family. */
   maxMergePasses: number;
+
+  // --- LAYOUT-FIX-8 (P1, 2026-09-17): pipeline kill-switches ─────────
+  // Programmatic A/B flags for the IslandBuilder post-passes. NOT exposed
+  // in the settings UI and NOT present in defaultLayoutSettings — they
+  // default to undefined (JSON.stringify drops them, so the
+  // layoutSettingsHash of an unmodified preset is byte-identical to the
+  // pre-FIX-8 value and .translations.md caches do not mass-invalidate).
+  // Set them at runtime (e.g. plugin.layoutSettings.disableTocRepair =
+  // true) to A/B a specific step; setting one to `true` DOES change the
+  // settings hash, which correctly invalidates the cache for re-layout.
+  /** LAYOUT-FIX: disable column detection + input slicing (legacy single-map pipeline). */
+  disableColumnSlicing?: boolean;
+  /** LAYOUT-FIX-3: disable STEP 8.7 (absorb contained fragments). */
+  disableFragmentAbsorption?: boolean;
+  /** LAYOUT-FIX-3: disable STEP 8.8 (merge sparse figure-label bands). */
+  disableFigureBandMerge?: boolean;
+  /** LAYOUT-FIX-6: disable the style-flow gates (STEP 7.7 + merge flow checks). */
+  disableStyleFlowGuard?: boolean;
+  /** LAYOUT-FIX-6: disable STEP 8.65 (TOC entry repair). */
+  disableTocRepair?: boolean;
+  /** LAYOUT-FIX-8: disable STEP 9.5 (non-adjacency post-validator). */
+  disableNonAdjacentSplit?: boolean;
+  /**
+   * LAYOUT-FIX-9 (P3): disable the ink-geometry feed channels — the queue
+   * Tm-clamp and the DOM Range measurement revert to the DECLARED pdf.js
+   * item widths (pre-FIX-9). Restoring this also disables the slicer's
+   * P4 ink-adjacency drift repair (the feed carries no declRight stamps,
+   * so the legacy declared-overlap repair stays active).
+   */
+  disableInkGeometry?: boolean;
+  /**
+   * LAYOUT-FIX-9 (P2): disable the unified post-detection content filter.
+   * DOM reverts to the pre-detection ctx filter on the feed
+   * (processing.ts), the queue reverts to no filter at all — the pre-FIX-9
+   * asymmetric entry (Infra-2 of the layout bisect).
+   */
+  disableSpanFilterUnification?: boolean;
+  /**
+   * LAYOUT-FIX-10 (A2): disable the cross-page column-layout memory
+   * (column-memory.ts — remembered right-column start anchors + the
+   * weak-candidate rescue in the slicer). The A1 whitespace-channel
+   * boundary refinement is INK-gated, not memory-gated: roll it back via
+   * disableInkGeometry (declared widths → no ink feed → exact v23
+   * boundaries) or disableColumnSlicing. Queue-path only (the DOM path
+   * never opens a memory context).
+   */
+  disableColumnMemory?: boolean;
+  /**
+   * LAYOUT-FIX-13: disable STEP 9.6 (IslandBuilder) — re-attachment of
+   * small fragments torn out of a body paragraph (a 2-line block ending
+   * mid-sentence directly above its same-column, same-size lowercase
+   * continuation). Kill-switch restoring the pre-FIX-13 behavior
+   * byte-for-byte. Default false (enabled) on BOTH paths.
+   */
+  disableFragmentReattach?: boolean;
+  /**
+   * LAYOUT-FIX-15 (2026-09-19): user-facing layout PRESET — the semantic
+   * switch the Settings dropdown writes. Four modes (see ContourSettings.
+   * layoutPreset in IslandBuilder.ts for the full contract):
+   *
+   *   'standard'    — auto-detection as-is (default).
+   *   'paragraphs'  — one column: the slicer never cuts; full-width
+   *                   paragraphs. For single-column documents.
+   *   'two-columns' — the page HAS columns: when auto-validation finds no
+   *                   cut, the slicer re-validates its own start-peak
+   *                   candidates under the reduced gate set (furniture
+   *                   pages: running headers, full-width captions, short
+   *                   column bodies).
+   *   'separate'    — keep blocks separate: cross-block merges OFF, reading
+   *                   order row-major. For tables / forms.
+   *
+   * Optional on purpose (same pattern as the kill-switches): absent →
+   * JSON.stringify drops it → layoutSettingsHash of an untouched
+   * install is byte-identical and .translations.md caches stay valid.
+   * Setting a non-'standard' value DOES change the hash — correctly
+   * invalidating caches for a re-layout under the new preset.
+   */
+  layoutPreset?: 'standard' | 'paragraphs' | 'two-columns' | 'separate' | import('./region-layout').ManualLayoutMode;
+   regionLayouts?: Record<string, import('./region-layout').RegionLayoutRule[]>;
+   activeRegions?: import('./region-layout').RegionLayoutRule[];
+  /**
+   * LAYOUT-FIX-16 (2026-09-19): disable the post-loop caption subtraction
+   * (IslandBuilder) — the second pass that rebuilds the body layout after
+   * the first pass's caption units are taken out of the feed. Kill-switch
+   * restoring the pre-FIX-16 behavior byte-for-byte. Default false
+   * (enabled) on BOTH paths. The loop carries a built-in no-op guarantee:
+   * when the rebuild does not change any unit's span sequence, PASS 1 is
+   * returned verbatim — pages where it fires without repairing stay
+   * byte-identical to the pre-FIX pipeline by construction.
+   */
+  disableCaptionSubtractLoop?: boolean;
+  /**
+   * LAYOUT-FIX-18 (2026-09-19): disable the single-word drift-tail repair
+   * (18a feed shift in ink-geometry + 18b/18c slicer gates). Kill-switch
+   * restoring the pre-FIX-18 behavior byte-for-byte. Default false
+   * (enabled) on BOTH paths. Same opt-in-absence pattern as the other
+   * kill-switches: absent from defaultLayoutSettings → JSON.stringify
+   * drops it → layoutSettingsHash of an untouched install stays
+   * byte-identical and .translations.md caches remain valid.
+   */
+  disableWordDriftRepair?: boolean;
+  /**
+   * LAYOUT-FIX-22 (2026-09-25): disable the STEP 6.9 same-baseline
+   * single-line bridge (IslandBuilder) — the merge that re-unites the
+   * word-fragments of one visual line (headings / justified tails /
+   * caption labels / reference numbers torn into one-word units by
+   * inter-word gaps ≥ cellSize in the occupancy grid). Kill-switch
+   * restoring the pre-FIX-22 behavior byte-for-byte. Default false
+   * (enabled) on BOTH paths; the 'separate' preset disables it by design.
+   * Same opt-in-absence pattern: absent from defaultLayoutSettings →
+   * layoutSettingsHash of an untouched install stays byte-identical.
+   */
+  disableSingleLineBridge?: boolean;
+  /**
+   * LAYOUT-FIX-23 (2026-09-29): disable the STEP 9.65 caption chain
+   * assembly (IslandBuilder) — the post-reading-order pass that re-unites
+   * a figure/table caption's continuation lines with the caption-start
+   * unit (a bold marker span «Fig. 1.» on the first line shifts that
+   * line's primary font family via the tie-break, so the STEP 6 island
+   * merge never sees the marker line and the caption body as one block
+   * and the caption comes out over-separated line-by-line). Kill-switch
+   * restoring the pre-FIX-23 behavior byte-for-byte. Default false
+   * (enabled) on BOTH paths; the 'separate' preset disables it by design.
+   * Same opt-in-absence pattern: absent from defaultLayoutSettings →
+   * layoutSettingsHash of an untouched install stays byte-identical.
+   */
+  disableCaptionAssembly?: boolean;
 }
 
 // Interface for preset data

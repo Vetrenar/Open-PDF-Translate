@@ -1,3 +1,4 @@
+import { RegionLayoutEditor, LAYOUT_LABELS } from './region-layout-editor';
 // settings.ts
 import {
     PluginSettingTab,
@@ -411,6 +412,22 @@ export default class OpenRouterSettingsTab extends PluginSettingTab {
                                 await this.plugin.saveSettings();
                             }));
 
+                    // Phase 5.2 (FileJob paragraph cache): how many pages of
+                    // extracted paragraphs to keep in memory per file (LRU).
+                    // Serves re-translate / scoped-cancel re-enqueue / failed
+                    // page retry without re-running pdfjs extraction.
+                    new Setting(group)
+                        .setName(t('general.translation.paragraphcache.label'))
+                        .setDesc(t('general.translation.paragraphcache.desc'))
+                        .addSlider(s => s
+                            .setLimits(0, 300, 10)
+                            .setValue(this.plugin.settings.paragraphCachePages)
+                            .setDynamicTooltip()
+                            .onChange(async v => {
+                                this.plugin.settings.paragraphCachePages = v;
+                                await this.plugin.saveSettings();
+                            }));
+
                     new Setting(group)
                         .setName(t('general.translation.maxbatch.label'))
                         .setDesc(t('general.translation.maxbatch.desc'))
@@ -638,6 +655,37 @@ export default class OpenRouterSettingsTab extends PluginSettingTab {
                         .setDesc(t('settings.layout.advanced.intro')).setHeading();
 
                     const ls = this.plugin.layoutSettings;
+                    new Setting(group).setName('Layout текущей страницы').setDesc('Предпросмотр, ручные области, колонки и ячейки; правила сохраняются для PDF.')
+                      .addButton(b=>b.setButtonText('Открыть редактор').onClick(()=>{
+                        const file=this.app.workspace.getActiveFile(), page=this.plugin.getCurrentPageNumber();
+                        if(file?.extension==='pdf' && page) new RegionLayoutEditor(this.plugin,file,page,{left:0,top:0,width:1,height:1}).open();
+                        else new Notice('Откройте PDF.');
+                      }));
+
+
+                    // LAYOUT-FIX-15 (2026-09-19): the layout PRESET selector —
+                    // the primary user control over the column/paragraph
+                    // dimension. Writes ls.layoutPreset ('standard' deletes the
+                    // key so the settings hash of a default install is
+                    // byte-identical → caches stay valid).
+                    new Setting(group)
+                        .setName(t('settings.layout.preset.name'))
+                        .setDesc(t('settings.layout.preset.desc'))
+                        .addDropdown(drop => drop
+                            .addOption('standard', t('settings.layout.preset.standard'))
+                            .addOption('single-paragraph', 'Один параграф')
+                            .addOption('explicit-columns', 'Две колонки — явное разделение')
+                            .addOption('table', 'Таблица — явная сетка')
+                            .addOption('separate-paragraphs', 'Разрозненные параграфы')
+                            .addOption('paragraphs', 'Одна колонка, автоматические абзацы')
+                            .addOption('two-columns', 'Авто: предпочтение двух колонок')
+                            .addOption('separate', 'Авто: раздельные блоки')
+                            .setValue(ls.layoutPreset ?? 'standard')
+                            .onChange(async v => {
+                                if (v === 'standard') delete ls.layoutPreset;
+                                else (ls as any).layoutPreset = v;
+                                await this.plugin.saveSettings();
+                            }));
 
                     new Setting(group)
                         .setName(t('settings.layout.cellSize.name'))
@@ -1122,6 +1170,11 @@ export default class OpenRouterSettingsTab extends PluginSettingTab {
                     .setName(t('advanced.layoutdebug.label'))
                     .setDesc(t('advanced.layoutdebug.desc'))
                     .addToggle(tg => tg.setValue(this.plugin.settings.layoutDebugMode).onChange(async v => { this.plugin.settings.layoutDebugMode = v; await this.plugin.saveSettings(); }));
+
+                // REMOVED (W-CLEAN 2026-09-25): 'PDF Worker Mode' dropdown —
+                // the real-Worker engine path was removed entirely; the
+                // main-thread pseudo-worker is the ONLY PDF engine and has
+                // no user-tunable mode.
 
                 // REMOVED (v5 cleanup): 'manualRefinementMode' toggle —
                 // declared but never read. Manual refinement is always

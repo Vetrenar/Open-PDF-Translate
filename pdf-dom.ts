@@ -66,6 +66,43 @@ export class PdfViewerAdapter {
         return f && f.extension === 'pdf' ? f : null;
     }
 
+    /**
+     * O-1 fix (2026-09-12): the file OWNING a rendered page element.
+     *
+     * Canonical DOM-scoped owner resolution (moved here from the private
+     * TextProcessor helper — it is now shared by the render path AND the
+     * overlay save path). Walks up from `pageElement` to its
+     * `.workspace-leaf-content[data-type="pdf"]` container, then matches
+     * that container against every open PDF leaf. The ACTIVE leaf is never
+     * consulted, so switching tabs while an async save is in flight can no
+     * longer redirect page X's overlays into a different PDF's
+     * .translations.md.
+     *
+     * Returns null when the owning leaf cannot be found (closed mid-save,
+     * detached DOM). Callers MUST treat null as "abort the save" — a
+     * fallback to the active file is exactly the corruption this helper
+     * exists to prevent.
+     */
+    getFileFromPageElement(pageElement: HTMLElement): TFile | null {
+        const leafContent = pageElement.closest(
+            '.workspace-leaf-content[data-type="pdf"]',
+        ) as HTMLElement | null;
+        if (!leafContent) {
+            // No leaf container in the ancestry (detached/virtualized DOM) —
+            // do NOT fall back to the active file: that is the O-1 bug.
+            return null;
+        }
+
+        let resultFile: TFile | null = null;
+        this.app.workspace.iterateAllLeaves((leaf: any) => {
+            if (resultFile) return;
+            if (leaf.view?.getViewType?.() === 'pdf' && leaf.view.containerEl === leafContent) {
+                resultFile = leaf.view.file || null;
+            }
+        });
+        return resultFile;
+    }
+
     // ── Containers ──────────────────────────────────────────────────────────
 
     /** The leaf's DOM subtree to scope all queries to. */

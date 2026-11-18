@@ -169,7 +169,8 @@ export function computeLayoutSettingsHash(settings: unknown): string {
     // distinct from any valid JSON (which always starts with `{`, `[`, `"`,
     // a digit, or `null`/`true`/`false`), so there's no collision risk with
     // a real LayoutSettings object.
-    const json = settings === undefined ? 'undefined' : JSON.stringify(settings);
+    // Native geometry/segmentation changes must invalidate old layout caches.
+    const json = 'native-layout-26:' + (settings === undefined ? 'undefined' : JSON.stringify(settings, (key, value) => key === 'regionLayouts' || key === 'activeRegions' ? undefined : value));
     const h1 = (hash32(json, 0)    >>> 0).toString(16).padStart(8, '0');
     const h2 = (hash32(json, 5381) >>> 0).toString(16).padStart(8, '0');
     return h1 + h2;

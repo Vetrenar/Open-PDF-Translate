@@ -10,6 +10,9 @@ export const DEFAULT_SINGLE_PROMPT =
 `You are a professional translator. Translate the text from {sourceLang} to {targetLang}.
 Output only the translation — no explanations, notes, or commentary.
 Preserve the original formatting, line breaks, inline emphasis, and tone.
+Some segments contain <br> tags marking source line breaks (e.g. table rows,
+labels, or address blocks). Keep every <br> in the same position in the
+translation — one source line = one translated line.
 Keep acronyms, code identifiers, URLs, and proper nouns that are conventionally left untranslated exactly as they appear in the source.`;
 
 /**
@@ -28,6 +31,9 @@ Format rules (follow exactly):
 
 Translation rules:
 - Preserve inline emphasis, numbering, and list markers.
+- Some segments contain <br> tags marking source line breaks (table rows,
+  labels, address blocks). Keep every <br> in the same position: one source
+  line = one translated line. Do not remove, add, or reorder <br> tags.
 - Keep acronyms, code identifiers, and untranslatable proper nouns in the original language.
 
 Example

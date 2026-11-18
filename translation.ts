@@ -1,5 +1,6 @@
 // translation.ts
 import { requestUrl, Notice, RequestUrlParam } from 'obsidian';
+import { raceSignal, makeAbortError, isAbortError, abortableDelay } from './job-token';
 import OpenRouterTranslatorPlugin from './main';
 import { AVAILABLE_LANGUAGES, GEMMA_TEMPLATE } from './types';
 import {
@@ -85,23 +86,15 @@ export class TranslationEngine {
         // replacements bypass this special-casing entirely: the return
         // value is inserted verbatim. See providers.ts:870-879 for the
         // same fix applied to custom-template `{apiKey}`/`{model}`/etc.
-        return template
-            // ── Preferred {UPPER_CASE} form ─────────────────────────────
-            .replace(/{SOURCE_LANG}/g, () => sourceLangName)
-            .replace(/{TARGET_LANG}/g, () => targetLangName)
-            .replace(/{SOURCE_CODE}/g, () => sourceLangCode)
-            .replace(/{TARGET_CODE}/g, () => targetLangCode)
-            .replace(/{LINE_COUNT}/g, () => lineCountStr)
-            .replace(/{TEXT}/g, () => textContent)
-
-            // ── Lowercase aliases (backward compat) ─────────────────────
-            // Stage 1.1 (Q3): old custom templates may use {sourceLang} /
-            // {targetLang} / {lineCount} / {inputText}. Preserve them so
-            // user-edited templates don't silently break.
-            .replace(/{sourceLang}/g, () => sourceLangName)
-            .replace(/{targetLang}/g, () => targetLangName)
-            .replace(/{lineCount}/g, () => lineCountStr)
-            .replace(/{inputText}/g, () => textContent);
+        const values: Record<string, string> = {
+            SOURCE_LANG: sourceLangName, sourceLang: sourceLangName,
+            TARGET_LANG: targetLangName, targetLang: targetLangName,
+            SOURCE_CODE: sourceLangCode, TARGET_CODE: targetLangCode,
+            LINE_COUNT: lineCountStr, lineCount: lineCountStr,
+            TEXT: textContent, inputText: textContent,
+        };
+        return template.replace(/\{(SOURCE_LANG|sourceLang|TARGET_LANG|targetLang|SOURCE_CODE|TARGET_CODE|LINE_COUNT|lineCount|TEXT|inputText)\}/g,
+            (_, key: string) => values[key]);
     }
 
     // === High-Level Translation Methods ===
@@ -118,7 +111,7 @@ export class TranslationEngine {
      * Note: If using Gemma Template, we must inject numbering instructions, 
      * otherwise the Overlay will fail to parse the response.
      */
-    async translateBatch(originalText: string, expectedLineCount: number): Promise<string> {
+    async translateBatch(originalText: string, expectedLineCount: number, opts?: { signal?: AbortSignal }): Promise<string> {
         let finalSystemPrompt: string;
         
         // Check for the setting (casting to any in case types.ts isn't updated yet)
@@ -170,13 +163,13 @@ Do NOT translate the [#N] markers. Maintain the list structure. No extra comment
         // (`systemPrompt.includes(originalText.substring(0, 50))`) was
         // unreliable for short text and false-positive-prone when the same
         // prefix appeared inside a templated example.
-        return await this.makeApiCall(finalSystemPrompt, originalText, true, true);
+        return await this.makeApiCall(finalSystemPrompt, originalText, true, true, opts);
     }
 
     /**
      * Translates a single piece of text (Sequential Mode).
      */
-    async translateWithOpenRouter(text: string): Promise<string> {
+    async translateWithOpenRouter(text: string, opts?: { signal?: AbortSignal }): Promise<string> {
         let finalSystemPrompt: string;
         const useGemma = (this.plugin.settings as any).useGemmaPrompt;
 
@@ -194,7 +187,7 @@ Do NOT translate the [#N] markers. Maintain the list structure. No extra comment
         }
 
         // P2-35: textBakedIn is explicit (see translateBatch for rationale).
-        return await this.makeApiCall(finalSystemPrompt, text, false, true);
+        return await this.makeApiCall(finalSystemPrompt, text, false, true, opts);
     }
 
     // === Low-Level API Communication ===
@@ -261,7 +254,7 @@ Do NOT translate the [#N] markers. Maintain the list structure. No extra comment
         };
     }
 
-    async makeApiCall(systemPrompt: string, originalText: string, isBatch: boolean, textBakedIn: boolean): Promise<string> {
+    async makeApiCall(systemPrompt: string, originalText: string, isBatch: boolean, textBakedIn: boolean, opts?: { signal?: AbortSignal }): Promise<string> {
         const providerId = this.plugin.settings.apiProvider;
         const providerSettings = this.plugin.settings.providerSettings[providerId] || {};
         const def = getProvider(providerId);
@@ -272,12 +265,15 @@ Do NOT translate the [#N] markers. Maintain the list structure. No extra comment
             this.warnedAboutQwen = true;
         }
 
+        const signal = opts?.signal;
+        if (signal?.aborted) throw makeAbortError();
+        const { options } = this.getRequestConfig(systemPrompt, originalText, textBakedIn, this.computeMaxTokens(systemPrompt, originalText, isBatch, textBakedIn));
         const MAX_RETRIES = 3;
         const BASE_DELAY = 1000;
 
         for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
             try {
-                const { url, options } = this.getRequestConfig(systemPrompt, originalText, textBakedIn, this.computeMaxTokens(systemPrompt, originalText, isBatch, textBakedIn));
+                if (signal?.aborted) throw makeAbortError();
 
                 // requestUrl ignores AbortSignal, so we race it against a real timeout instead.
                 // Local servers (ollama) tend to be slower; cloud providers default to 45s.
@@ -285,7 +281,7 @@ Do NOT translate the [#N] markers. Maintain the list structure. No extra comment
                 const isGemini = def?.protocol === 'gemini';
                 const timeoutMs = isGemini ? 60000 : (isLocal ? 120000 : 45000);
 
-                const response = await this.withTimeout(requestUrl(options), timeoutMs);
+                const response = await this.withTimeout(raceSignal(requestUrl(options), signal), timeoutMs);
 
                 // DIAGNOSTIC: Log the full response if debug mode is enabled
                 if (this.plugin.settings.debugMode) {
@@ -300,56 +296,11 @@ Do NOT translate the [#N] markers. Maintain the list structure. No extra comment
                     const customPath = def?.protocol === 'custom' ? providerSettings.responsePath : undefined;
                     const translatedText = extractResponseContent(providerId, response.json, customPath);
 
-                    // FIX: detect truncated responses. Reasoning models often hit
-                    // max_tokens mid-translation — the response is technically valid
-                    // (200 OK) but incomplete. Log a warning so the user can diagnose
-                    // (reduce maxBatchChars or increase maxTokens).
-                    // P2-32: per-provider truncation signals. OpenAI/OpenRouter/Mistral/
-                    // DashScope use choices[0].finish_reason='length'. Gemini uses
-                    // candidates[0].finishReason='MAX_TOKENS'. Anthropic uses
-                    // stop_reason='max_tokens'. Ollama uses done_reason='length'.
-                    const finishReason = response.json?.choices?.[0]?.finish_reason;
-                    if (finishReason === 'length' || finishReason === 'MAX_TOKENS') {
-                        const reasoningTokens = response.json?.usage?.completion_tokens_details?.reasoning_tokens ?? 0;
-                        const completionTokens = response.json?.usage?.completion_tokens ?? 0;
-                        console.warn(
-                            `[makeApiCall] Response truncated (finish_reason: ${finishReason}). ` +
-                            `Model used ${reasoningTokens} reasoning tokens out of ${completionTokens} completion tokens. ` +
-                            `Translation may be incomplete. Consider: ` +
-                            `(1) reduce maxBatchChars, (2) disable reasoning for this model, ` +
-                            `(3) use a non-reasoning model. ` +
-                            `Content preview: ${(translatedText || '').substring(0, 100)}...`
-                        );
-                    }
-                    const geminiFinishReason = response.json?.candidates?.[0]?.finishReason;
-                    if (geminiFinishReason === 'MAX_TOKENS') {
-                        console.warn(
-                            `[makeApiCall] Response truncated (Gemini finishReason: MAX_TOKENS). ` +
-                            `Translation may be incomplete. Consider: ` +
-                            `(1) reduce maxBatchChars, (2) increase provider maxOutputTokens, ` +
-                            `(3) use a model with a larger output budget. ` +
-                            `Content preview: ${(translatedText || '').substring(0, 100)}...`
-                        );
-                    }
-                    const anthropicStopReason = response.json?.stop_reason;
-                    if (anthropicStopReason === 'max_tokens') {
-                        console.warn(
-                            `[makeApiCall] Response truncated (Anthropic stop_reason: max_tokens). ` +
-                            `Translation may be incomplete. Consider: ` +
-                            `(1) reduce maxBatchChars, (2) increase provider maxOutputTokens, ` +
-                            `(3) if thinking is enabled, lower thinking.budget_tokens to leave more room for output. ` +
-                            `Content preview: ${(translatedText || '').substring(0, 100)}...`
-                        );
-                    }
-                    const ollamaDoneReason = response.json?.done_reason;
-                    if (ollamaDoneReason === 'length') {
-                        console.warn(
-                            `[makeApiCall] Response truncated (Ollama done_reason: length). ` +
-                            `Translation may be incomplete. Consider: ` +
-                            `(1) reduce maxBatchChars, (2) increase num_predict in Ollama options, ` +
-                            `(3) use a model with a larger context window. ` +
-                            `Content preview: ${(translatedText || '').substring(0, 100)}...`
-                        );
+                    const data = response.json;
+                    if (['length', 'MAX_TOKENS'].includes(data?.choices?.[0]?.finish_reason) ||
+                        data?.candidates?.[0]?.finishReason === 'MAX_TOKENS' ||
+                        data?.stop_reason === 'max_tokens' || data?.done_reason === 'length') {
+                        throw Object.assign(new Error('Translation response truncated: reduce batch size or increase output budget'), { nonRetryable: true });
                     }
 
                     // FIX: distinguish null (path not found / malformed response) from
@@ -412,7 +363,7 @@ Do NOT translate the [#N] markers. Maintain the list structure. No extra comment
                     }
                     delay = Math.min(delay, 300000); // Cap at 5 min (P2-31)
                     console.debug(`Rate limit hit. Retrying in ${delay}ms...`);
-                    await this.sleep(delay);
+                    await abortableDelay(delay, signal);
                     continue;
                 }
                 
@@ -425,7 +376,7 @@ Do NOT translate the [#N] markers. Maintain the list structure. No extra comment
                 // (~7 seconds of exponential backoff) before seeing the
                 // failure. Only 429 (rate limit), 408 (Request Timeout),
                 // and 5xx (provider error) deserve a retry.
-                let nonRetryable = false;
+                let nonRetryable = response.status >= 400 && response.status < 500 && ![408,429].includes(response.status);
                 if (response.status === 400) {
                     userFriendlyError += ': Bad request - check your model selection and API key';
                     nonRetryable = true;
@@ -449,6 +400,7 @@ Do NOT translate the [#N] markers. Maintain the list structure. No extra comment
                 throw err;
 
             } catch (err: any) {
+                if (signal?.aborted || isAbortError(err)) throw makeAbortError();
                 // P1-1: 4xx (except 429) — fail fast, no retry.
                 if (err?.nonRetryable) {
                     new Notice(`⚠ ${err.message}`, 5000);
@@ -460,7 +412,7 @@ Do NOT translate the [#N] markers. Maintain the list structure. No extra comment
                         // P1-1 (also flagged as T-7 in audit): add a short
                         // delay before retrying after a timeout, otherwise
                         // we hammer an already-slow server.
-                        await this.sleep(BASE_DELAY);
+                        await abortableDelay(BASE_DELAY, signal);
                         continue;
                     }
                     throw new Error('Request timed out. The model may be slow or overloaded.');
@@ -476,7 +428,7 @@ Do NOT translate the [#N] markers. Maintain the list structure. No extra comment
                 // requests fail simultaneously (e.g., network blip affecting 10 pages).
                 const delay = BASE_DELAY * Math.pow(2, attempt - 1) + Math.random() * 500;
                 console.debug(`Attempt ${attempt} failed, retrying in ${delay}ms...`, err);
-                await this.sleep(delay);
+                await abortableDelay(delay, signal);
             }
         }
 

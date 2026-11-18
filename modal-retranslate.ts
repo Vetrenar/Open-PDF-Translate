@@ -1,3 +1,4 @@
+import { fallbackIndices } from './translation-result';
 // modal-retranslate.ts
 import { App, Modal, Notice, Setting, TFile } from 'obsidian';
 import OpenRouterTranslatorPlugin from './main';
@@ -7,6 +8,7 @@ import { SavedOverlay, OverlayPositionData } from './types';
 import { SingletonModal } from './modal-base';
 // Phase 17 (F-D4-1): i18n for the modal title.
 import { t } from './i18n';
+import { JobToken, isAbortError } from './job-token';
 
 export class RetranslateUsingOverlaysModal extends SingletonModal<RetranslateUsingOverlaysModal> {
   private plugin: OpenRouterTranslatorPlugin;
@@ -26,6 +28,7 @@ export class RetranslateUsingOverlaysModal extends SingletonModal<RetranslateUsi
   // loop and before the final disk write so we don't persist a partial
   // retranslation that the user explicitly abandoned.
   private cancelled: boolean = false;
+  private job: JobToken | null = null;
 
   constructor(app: App, plugin: OpenRouterTranslatorPlugin, file: TFile) {
     super(app);
@@ -157,6 +160,7 @@ export class RetranslateUsingOverlaysModal extends SingletonModal<RetranslateUsi
     // The runRetranslation loop checks this flag on every iteration and
     // before the final disk write.
     this.cancelled = true;
+    this.job?.cancel();
     this.contentEl.empty();
     // Stage 0.5 (Q22): MUST call super.onClose() so SingletonModal can
     // remove us from the per-subclass instances Map.
@@ -164,6 +168,9 @@ export class RetranslateUsingOverlaysModal extends SingletonModal<RetranslateUsi
   }
 
   private async runRetranslation(): Promise<void> {
+    this.cancelled = false;
+    const token = new JobToken('modal', 'retranslate saved overlays');
+    this.job = token;
     // Ensure we have an active page (for default selection and rendering)
     const currentPage = this.plugin.getCurrentPageNumber();
     if (currentPage == null) {
@@ -241,48 +248,23 @@ export class RetranslateUsingOverlaysModal extends SingletonModal<RetranslateUsi
       if (this.cancelled) break;
       const texts = job.targetIndexes.map(idx => job.pageItems[idx]?.textContent || '');
 
-      let translated: string[] = [];
+      let translated: string[];
       try {
-        if (this.plugin.settings.useBatchTranslation && texts.length > 1) {
-          const numbered = texts.map((t, idx) => `${idx + 1}. ${t}`).join('\n');
-          const maxChars = this.plugin.settings.maxBatchChars;
-          if (numbered.length > maxChars) {
-            translated = [];
-            for (const t of texts) {
-              translated.push(await this.plugin.translation.translateWithOpenRouter(t));
-            }
-          } else {
-            const raw = await this.plugin.translation.translateBatch(numbered, texts.length);
-            // Fix: extractNumberedLines is async (returns Promise<string[]>).
-            // Without `await`, `translated` is the Promise object, and
-            // `translated[i]` is undefined — every translated entry would
-            // fall back to the original text, silently defeating the
-            // batch path.
-            translated = await this.plugin.processor.extractNumberedLines(raw, texts.length, texts);
-          }
-        } else {
-          // Sequential
-          translated = [];
-          for (const t of texts) {
-            try {
-              const out = await this.plugin.translation.translateWithOpenRouter(t);
-              translated.push(out);
-            } catch (e) {
-              console.error('Sequential translate failed:', e);
-              translated.push(t); // fallback
-            }
-          }
-        }
+        translated = await this.plugin.processor.executeTranslation(
+          texts.map(text => ({text, originalSpans:[]} as any)), {signal:token.signal},
+        );
       } catch (e) {
-        console.error('Retranslation error on page', job.page, e);
-        translated = texts.slice(); // fallback: keep original
+        if (isAbortError(e)) return;
+        throw e;
       }
+      if (this.cancelled || token.cancelled) return;
 
       // Update saved overlay data
       job.targetIndexes.forEach((itemIndex, i) => {
         const item = job.pageItems[itemIndex];
         if (!item) return;
         item.translatedText = translated[i] || item.textContent || '';
+        item.translationStatus = fallbackIndices(translated).has(i) ? 'fallback' : undefined;
       });
 
       // Preserve full page array; only targeted entries are updated.
@@ -302,34 +284,11 @@ export class RetranslateUsingOverlaysModal extends SingletonModal<RetranslateUsi
       return;
     }
 
-    // P0-8: previously called `this.app.vault.modify(translationFile, newMd)`
-    // directly — bypassing `storage.updatePageOverlaysAndWrite`. Consequences:
-    //   1. No `markSelfWrite()` — the metadataCache 'changed' event fired,
-    //      `isSelfWrite` returned false, `debouncedBuildMap` rebuilt the
-    //      entire `pdfToMdMap` (noticeable lag on large vaults).
-    //   2. `overlay.cachedOverlayData` was NOT updated in-place — only the
-    //      current page was refreshed via `refreshPageOverlayFromSaved`;
-    //      other cached pages became stale until next navigation.
-    //   3. No per-file write lock — race with background `PdfLayoutQueue`
-    //      worker that could be writing the same file simultaneously.
-    // Going through `updatePageOverlaysAndWrite` fixes all three. We must
-    // convert the keys from string (YAML-style) to number to match the
-    // expected `Record<number, OverlayPositionData[]>` signature.
-    //
-    // Phase 4 (P0-9): pass `replace: true` so retranslated pages REPLACE
-    // the existing page arrays directly (no merge-by-rect-overlap). The
-    // `saved` object was built by selectively replacing items the user
-    // chose to retranslate — the resulting per-page array is the
-    // authoritative new state and any items it omits must be considered
-    // intentionally removed.
+    // Persist only changed entries. Replacing the entire loaded snapshot
+    // could overwrite pages/entries saved concurrently by the background queue.
     const overlaysByPage: Record<number, OverlayPositionData[]> = {};
-    for (const [k, v] of Object.entries(saved.pageOverlays)) {
-      const pageNum = Number(k);
-      if (Number.isFinite(pageNum)) {
-        overlaysByPage[pageNum] = v as OverlayPositionData[];
-      }
-    }
-    await this.plugin.storage.updatePageOverlaysAndWrite(this.file, overlaysByPage, { replace: true });
+    for (const job of jobs) overlaysByPage[job.page] = job.targetIndexes.map(i => job.pageItems[i]);
+    await this.plugin.storage.updatePageOverlaysAndWrite(this.file, overlaysByPage);
 
     // Re-render current visible page if applicable
     const pageToRefresh = this.onlyCurrentPage ? currentPage : this.plugin.getCurrentPageNumber();
@@ -337,7 +296,8 @@ export class RetranslateUsingOverlaysModal extends SingletonModal<RetranslateUsi
       await this.refreshPageOverlayFromSaved(saved, pageToRefresh);
     }
 
-    new Notice(t('modal.retranslate.complete'));
+    const fallbacks = Object.values(overlaysByPage).flat().filter(item => item.translationStatus === 'fallback').length;
+    new Notice(fallbacks ? `${fallbacks} segment(s) kept as original text; retry available.` : t('modal.retranslate.complete'));
   }
 
   private buildPageRange(): number[] {

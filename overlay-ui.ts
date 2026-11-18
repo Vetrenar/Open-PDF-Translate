@@ -1,7 +1,9 @@
+import { RegionLayoutEditor } from './region-layout-editor';
+import { fallbackIndices } from './translation-result';
 // overlay-ui.ts
 // Extracted UI and Rendering logic for PDF Translation Overlays
 
-import { Menu, Notice } from 'obsidian';
+import { Menu, Notice, FileView } from 'obsidian';
 import type OpenRouterTranslatorPlugin from './main';
 import { RetranslateUsingOverlaysModal } from './modal-retranslate';
 import { EditSpecificTranslationModal } from './modal-edit-translation';
@@ -12,11 +14,12 @@ import type { LayoutSettings } from './layout-modal';
 // tags, no attributes) so even if a malicious or buggy translation backend
 // returns `<img onerror=...>` or `<a href="javascript:...">`, the payload
 // is stripped at the boundary instead of being rendered.
-import DOMPurify from 'dompurify';
+import DOMPurify, { type Config } from 'dompurify';
 // Phase 16 (C17): i18n shim for the context-menu strings. Falls back to the
 // key itself when no translation is registered, so the plugin stays
 // functional in English even without a translation file.
 import { t } from './i18n';
+import { buildSpanFilterCtx } from './table-keep';
 
 // ============================================================
 // Constants & Configuration
@@ -28,17 +31,26 @@ const LINE_HEIGHT_STEP = 0.05;
 
 // --- Visual Tweaks & Overlap Prevention ---
 const BLEED_X = 4;
-const BLEED_Y_NORMAL = 2;
+// BBOX-FIT-3: пол 3px — перезагружаемый путь считает bleed от дескейленного
+// размера шрифта (см. ниже) и на serif-книгах (try.pdf p2: асцендеры до
+// 2.94px выше спанов при fs 13.5px) упирался в 2.69px < 2.94 — срез
+// верхушек возвращался после перезагрузки. Пол 3px покрывает оба пути.
+const BLEED_Y_NORMAL = 3;
 const BLEED_Y_TIGHT = 0;
+// BBOX-FIT-3: вертикальный запас подбирается под размер шрифта — pdf.js
+// позиционирует спаны по ascent, измеренному measureText() подставленного
+// глифового шрифта, и для ряда шрифтов (serif-книги) фактические чернила
+// доходят до ~0.22×fs выше спана (замер на try.pdf p2: 2.94px при fs 13.5px).
+// Фиксированные 2px оставляли срез верхушек глифов; кап 4px держит footprint.
+const BLEED_Y_FONT_FRAC = 0.22;
+const BLEED_Y_MAX = 4;
 const TIGHT_LINE_HEIGHT_THRESHOLD = 24;
 
 const DEFAULT_BG = '#ffffff';
 
 // --- Safeguard Constants for Short Phrases/Headings ---
 const SHORT_PHRASE_WORD_LIMIT = 4;
-const SHORT_PHRASE_WIDTH_SAFETY_MARGIN_PX = 10;
 const SHORT_PHRASE_PADDING_RIGHT_EM = 0.2;
-const WIDTH_EXPANSION_LIMIT = 1.35;
 
 // --- Auto-fit constants ---
 const MIN_FONT_SIZE_PX = 6;
@@ -46,17 +58,51 @@ const FONT_SHRINK_FACTOR = 0.95;
 const MAX_SHRINK_ITERATIONS = 40; // more iterations = finer fit
 const MIN_LINE_HEIGHT_SHRINK = 0.85;
 
+// BBOX-FIT (2026-09-14): подгонка перевода в ИСХОДНЫЙ bbox.
+// Баланс трёх требований: (1) переведённый бокс занимает то же место, что
+// исходный; (2) текст помещается полностью, без обрезки; (3) текст одной
+// группы (например, body) — одного размера. Конфликт разрешается так:
+// короткие фразы расширяются ТОЛЬКО в свободное пространство до соседа
+// (и не более чем на SHORT_PHRASE_MAX_EXPANSION), дальше — ужимка шрифта;
+// длинный текст не меняет бокс вовсе — двоичный поиск шрифта по каждому
+// боксу, затем ГРУППОВАЯ унификация (единый размер = минимум по группе,
+// но не ниже GROUP_SHRINK_FLOOR — иначе патологический абзац утопит всю
+// страницу; остаток дожимается line-height'ом и scroll-фолбэком).
+const NEIGHBOR_GAP_PX = 2;               // минимальный визуальный зазор до соседа справа
+const RIGHT_PAGE_MARGIN_PX = 4;          // отступ от правого края страницы
+const SHORT_PHRASE_MAX_EXPANSION = 1.3;  // короткая фраза расширяется не более чем на 30% исходной ширины
+const GROUP_SHRINK_FLOOR = 0.70;         // единый шрифт группы не ниже 70% исходного размера
+const GROUP_BUCKET_STEP = 0.5;           // шаг группировки исходных размеров (px)
+
+// BBOX-FIT-2 (2026-09-14, round 2): РЕМОНТ ИСХОДНОЙ ГЕОМЕТРИИ.
+// Реальный прогон в Obsidian (EN→RU, книга Tumors in Domestic Animals)
+// показал: ИСХОДНЫЕ боксы параграфов сами пересекаются — (а) pdfjs теряет
+// TJ-корректировки пробелов InDesign → правые края строк ЛЕВОЙ колонки
+// дрейфуют до +22pt и залезают на правую колонку (задокументировано в
+// layout-стадии); (б) IslandBuilder иногда оставляет строку-фрагмент
+// ОТДЕЛЬНЫМ юнитом, чей бокс лежит ВНУТРИ бокса большого абзаца. Инвариант
+// v1 «бокс длинного текста не меняется» честно сохранял эти дефекты —
+// непрозрачные белые боксы наползали друг на друга (то, что видел
+// пользователь). Правило v2: пара боксов не может перекрываться; исходный
+// footprint сохраняется ТОЧНО, пока геометрия не конфликтует — конфликт
+// разрешается минимальной правкой (клип раздутого края / слияние фрагмента).
+const SRC_CONTAIN_TOL_PX = 3;        // допуск «B целиком внутри A» (px)
+const SRC_CONTAIN_AREA_FRAC = 0.55;  // B < 55% площади A → фрагмент, а не равный сосед
+const SRC_CLIP_MAX_PX = 60;          // максимум отрезаемого перекрытия (больше — не дрейф, а слом макета)
+const SRC_MIN_KEEP_PX = 24;          // минимальная ширина бокса после клипа
+
 // Phase 7 (C4): DOMPurify whitelist. Only inline-formatting tags survive —
 // no `<a>`, no `<img>`, no `<script>`, no attributes (so no `style=`,
 // no `onerror=`, no `href="javascript:"`). `KEEP_CONTENT: true` means
 // disallowed tags are unwrapped (their text content is preserved) instead
 // of being dropped wholesale, so a translation that arrives wrapped in a
 // `<span>` still renders its text.
-const PURIFY_CONFIG: DOMPurify.Config = {
+const PURIFY_CONFIG = {
     ALLOWED_TAGS: ['b', 'i', 'em', 'strong', 'br', 'sup', 'sub', 'u'],
     ALLOWED_ATTR: [],
     KEEP_CONTENT: true,
-};
+    RETURN_TRUSTED_TYPE: false,
+} satisfies Config;
 
 // Types for internal state
 type OverlayHandlers = {
@@ -64,6 +110,15 @@ type OverlayHandlers = {
     clickHandler?: EventListener;
     bringToTopHandler?: EventListener;
     resetZIndexHandler?: EventListener;
+};
+
+// BBOX-FIT-2: снапшот геометрии одного оверлея для пакетного ремонта/подгонки.
+type SourceBoxRec = {
+    el: HTMLElement;
+    left: number;
+    top: number;
+    width: number;
+    height: number;
 };
 
 /**
@@ -478,7 +533,7 @@ export class OverlayUIRenderer {
         // the engine is absent (V3 file rendered from disk without V4
         // migration), the attribute is omitted entirely, matching the
         // `data-translation-id` policy.
-        overlayData?: { id?: string; engine?: string } | OverlayPositionData
+        overlayData?: { id?: string; engine?: string; translationStatus?: 'fallback' } | OverlayPositionData
     ): HTMLElement {
         if (!rect || rect.width <= 0 || rect.height <= 0) {
             return document.createElement('div');
@@ -487,11 +542,14 @@ export class OverlayUIRenderer {
         // --- 1. Short-phrase analysis ---
         const plainText = this.extractPlainTextFromHtml(htmlText).trim();
         const wordCount = plainText.split(/\s+/).filter(Boolean).length; // FIX: filter empty tokens
-        const isShortPhrase = wordCount <= SHORT_PHRASE_WORD_LIMIT;
+        // TABLE-KEEP: построчный (табличный) текст НЕ короткая фраза, даже если
+        // слов <= 4 — nowrap-путь (fitShortPhraseToBox + estimateTextWidth)
+        // не понимает <br> и разъезжается; такие боксы идут по длинному пути
+        // (двоичный поиск реальной геометрии, scrollWidth = широчайшая строка).
+        const isShortPhrase = wordCount <= SHORT_PHRASE_WORD_LIMIT && !/<br\s*\/?>/i.test(htmlText || '');
 
         // --- 2. Tight-line detection ---
         const isTightLine = rect.height < TIGHT_LINE_HEIGHT_THRESHOLD;
-        const currentBleedY = isTightLine ? BLEED_Y_TIGHT : BLEED_Y_NORMAL;
 
         const el = document.createElement('div');
         el.className = 'pdf-text-overlay-reflow';
@@ -540,6 +598,14 @@ export class OverlayUIRenderer {
             startLH = 1.2;
         }
 
+        // BBOX-FIT-3: вертикальный bleed пропорционален экранному размеру
+        // шрифта (0.22×fs, пол 2px, кап 4px) — см. константы выше. Значение
+        // фиксируется в data-bleed-y: extractPositionDataFrom реверсирует
+        // именно его при save (иначе дроби в .translations.md несут сдвиг).
+        const currentBleedY = isTightLine
+            ? BLEED_Y_TIGHT
+            : Math.min(BLEED_Y_MAX, Math.max(BLEED_Y_NORMAL, currentFontSize * BLEED_Y_FONT_FRAC));
+
         // --- 4. Positioning & dimensions ---
         // BLEED expands the bbox slightly to cover original text edges.
         // No lineHeightCompensation — getBoundingClientRect() already includes
@@ -572,6 +638,7 @@ export class OverlayUIRenderer {
         el.setAttribute('data-initial-width',  `${adjustedWidth}`);
         el.setAttribute('data-initial-left',   `${adjustedLeft}`);
         el.setAttribute('data-is-tight',        isTightLine ? 'true' : 'false');
+        el.setAttribute('data-bleed-y',         `${currentBleedY}`);
         el.setAttribute('data-original-font-size', `${currentFontSize}`);
 
         el.style.setProperty('--overlay-opacity', `${overlayOpacity}`);
@@ -614,7 +681,11 @@ export class OverlayUIRenderer {
         // (including event-handler attributes and `<script>`/`<img>`) is
         // stripped. An empty/whitespace-only translation falls back to an
         // ellipsis so the box doesn't visually collapse.
-        const sanitized = DOMPurify.sanitize((htmlText || '').trim() || '…', PURIFY_CONFIG);
+        // TABLE-KEEP: единый маркер перевода строки — <br>. Сырые \n (старые
+        // .translations.md, edit-модаль) в white-space:normal рендерятся
+        // пробелом — конвертируем ДО санитайза (br в белом списке).
+        const htmlNormalized = String(htmlText ?? '').replace(/\r?\n/g, '<br>');
+        const sanitized = DOMPurify.sanitize(htmlNormalized.trim() || '…', PURIFY_CONFIG);
         // eslint-disable-next-line no-unsanitized/property -- DOMPurify-sanitized with a strict whitelist (inline formatting only; no script/img/event handlers); required to render translation HTML
         inner.innerHTML = sanitized;
         // Phase 11 (C8) + Phase 7 (P1-12): stamp the overlay's stable ID onto
@@ -641,6 +712,7 @@ export class OverlayUIRenderer {
         // whether the overlay was produced by an actual LLM (`engine:
         // 'provider/model'`) or by the originals-only path (`engine:
         // 'originals-only'`), and the V4 stamp would be lost on save.
+        if (overlayData?.translationStatus === 'fallback') inner.dataset.translationStatus = 'fallback';
         if (overlayData?.engine) {
             inner.dataset.engine = overlayData.engine;
         }
@@ -731,84 +803,288 @@ export class OverlayUIRenderer {
     }
 
     // ============================================================
-    // Public API: Post-Processing Overlap Fixer
+    // BBOX-FIT (2026-09-14): Sizing Logic (Overflow & Fit)
     // ============================================================
+    // Продакшн-вход — пакетная подгонка СТРАНИЦЫ (см. fitOverlayBatch):
+    // все три рендер-пути (renderOverlays / renderSavedOverlay /
+    // rerenderVisibleOverlaysInner) собирают оверлеи страницы и зовут
+    // ОДИН пакетный проход. Одиночный вход (adjustOverlayForOverflow)
+    // сохранён для ручных/внешних путей и тестов.
+    //
+    // Инварианты подгонки:
+    //   1. Бокс длинного текста НЕ меняется ни по ширине, ни по высоте
+    //      (перевод обязан поместиться в исходное пространство).
+    //   2. Короткая фраза может занять свободное пространство справа —
+    //      но не далее чем до соседнего бокса (минус NEIGHBOR_GAP_PX) и
+    //      не шире SHORT_PHRASE_MAX_EXPANSION от исходной ширины; что не
+    //      влезло — ужимается шрифтом.
+    //   3. Шрифт длинного текста един в группе исходных размеров
+    //      (bucket GROUP_BUCKET_STEP): target = min(fitted) по группе,
+    //      но не ниже GROUP_SHRINK_FLOOR. Остаток — line-height, затем
+    //      scroll-фолбэк (текст всегда доступен целиком, обрезки нет).
 
-    /**
-     * Resolves vertical overlaps between overlay elements after they are all placed.
+    /** Пакетная подгонка оверлеев одной страницы.
      *
-     * FIX: The original only compared each element to the *immediately next* sorted
-     *      element. If two non-adjacent boxes overlapped (e.g., a tall box spanning
-     *      several short ones), those were silently skipped.
-     *      Now each box is checked against ALL subsequent boxes, not just index i+1.
-     *
-     * FIX: parseFloat(el.style.top) returns NaN when top is not set inline.
-     *      Falls back to getBoundingClientRect() for robustness.
+     *  @param entries  оверлеи страницы + исходный line-height настройки
+     *                  (используется как fallback при дожатии line-height).
+     *  @param pageWidth ширина страницы в координатах style.left оверлеев
+     *                  (page-relative px). Обязателен для staging-путей, где
+     *                  `closest('.page')` недоступен; иначе берётся из DOM.
      */
-    public fixVerticalOverlaps(overlays: HTMLElement[]): void {
-        if (!overlays || overlays.length < 2) return;
+    public fitOverlayBatch(entries: { el: HTMLElement; lh: number }[], pageWidth?: number): void {
+        const live = (entries || []).filter(e => e && e.el && e.el.isConnected);
+        if (live.length === 0) return;
 
-        const getTop    = (el: HTMLElement) => parseFloat(el.style.top)    || el.getBoundingClientRect().top;
-        const getHeight = (el: HTMLElement) => parseFloat(el.style.height) || el.getBoundingClientRect().height;
+        // 1. Снапшот исходной геометрии ДО любых мутаций (координаты
+        //    контейнера/страницы, уже запечённые в style.left/top/width/height).
+        let boxes = live.map(({ el }) => ({
+            el,
+            left: parseFloat(el.style.left) || 0,
+            top: parseFloat(el.style.top) || 0,
+            width: parseFloat(el.style.width) || 0,
+            height: parseFloat(el.style.height) || 0,
+        }));
 
-        const sorted = [...overlays].sort((a, b) => getTop(a) - getTop(b));
+        // 1.5 BBOX-FIT-2: РЕМОНТ ИСХОДНОЙ ГЕОМЕТРИИ. Исходные боксы сами
+        //     могут пересекаться (pdfjs-дрейф правых краёв левой колонки;
+        //     фрагмент-строки отдельными юнитами внутри большого абзаца) —
+        //     «наползания», которые видел пользователь в Obsidian. Инвариант
+        //     v1 «бокс не меняется» их сохранял; v2 чинит ДО подгонки:
+        //       (a) фрагмент внутри абзаца → текст фрагмента вливается в
+        //           абзац (бокс фрагмента убирается с рендера);
+        //       (b) поперечное перекрытие ≤ SRC_CLIP_MAX_PX → клип
+        //           раздутого правого края до зазора перед соседом.
+        //     Страница без конфликтов → ремонт не меняет НИЧЕГО (байт-
+        //     идентичное поведение v1).
+        const repair = this.repairSourceOverlaps(boxes);
+        boxes = repair.boxes;
 
-        for (let i = 0; i < sorted.length - 1; i++) {
-            const current = sorted[i];
-            if (current.style.display === 'none') continue;
-
-            const currentTop    = getTop(current);
-            const currentHeight = getHeight(current);
-            let   currentBottom = currentTop + currentHeight;
-
-            // FIX: check against ALL subsequent boxes, not just i+1
-            for (let j = i + 1; j < sorted.length; j++) {
-                const next = sorted[j];
-                if (next.style.display === 'none') continue;
-
-                const nextTop = getTop(next);
-                if (currentBottom <= nextTop - 1) break; // sorted — no further collisions possible
-
-                const newBottom = nextTop - 1;
-                const newHeight = newBottom - currentTop;
-
-                if (newHeight > 8) {
-                    current.style.height = `${newHeight}px`;
-                    currentBottom = newBottom; // update for subsequent checks
-
-                    const innerEl = current.querySelector('div') as HTMLDivElement | null;
-                    const lh = innerEl ? parseFloat(innerEl.style.lineHeight) || 1.1 : 1.1;
-                    this.adjustOverlayForOverflow(current, lh);
+        // 2. Правые пределы: край страницы → ближайший сосед по вертикали.
+        //    Сосед — бокс, чей y-диапазон перекрывает мой (строгая проверка
+        //    отсекает касания bleed'ом и диагональные пары).
+        const caps: number[] = boxes.map(b => {
+            let cap = Number.isFinite(pageWidth as number) ? (pageWidth as number) : this.pageWidthOf(b.el);
+            if (!Number.isFinite(cap) || cap <= 0) cap = Infinity;
+            return cap - b.left - RIGHT_PAGE_MARGIN_PX;
+        });
+        for (let i = 0; i < boxes.length; i++) {
+            for (let j = 0; j < boxes.length; j++) {
+                if (i === j) continue;
+                const a = boxes[i];
+                const b = boxes[j];
+                const yOver = Math.min(a.top + a.height, b.top + b.height) - Math.max(a.top, b.top);
+                if (!(yOver > 4 && yOver > 0.2 * Math.min(a.height, b.height))) continue;
+                if (b.left >= a.left + a.width - 0.5) {
+                    caps[i] = Math.min(caps[i], b.left - a.left - NEIGHBOR_GAP_PX);
                 }
-                break; // once we've resolved the first collision, stop (box is now smaller)
             }
+        }
+
+        // 3. Индивидуальная подгонка. Длинный текст — ТОЛЬКО Strategy 1
+        //    (двоичный поиск шрифта): дожатие line-height/scroll отложено
+        //    до группового прохода, чтобы не бороться с самим собой.
+        const longs: { el: HTMLElement; base: number; fitted: number }[] = [];
+        boxes.forEach((box, idx) => {
+            const el = box.el;
+            const isShort = el.getAttribute('data-is-short-phrase') === 'true';
+            el.classList.remove('is-scrollable');
+            el.setCssStyles({ overflow: 'hidden' });
+            if (isShort) {
+                this.fitShortPhraseToBox(el, caps[idx]);
+            } else {
+                const fitted = this.fitLongTextFontSize(el);
+                const base = parseFloat(el.getAttribute('data-original-font-size') || '0') || fitted;
+                longs.push({ el, base, fitted });
+            }
+        });
+
+        // 4. Групповая унификация шрифта длинного текста: bucket = исходный
+        //    размер (шаг 0.5px). Единый target = min(fitted) по группе,
+        //    зажатый снизу GROUP_SHRINK_FLOOR (патологический абзац не топит
+        //    всю страницу — ему достанется scroll-фолбэк на шаге 5).
+        const groups = new Map<number, { el: HTMLElement; base: number; fitted: number }[]>();
+        for (const rec of longs) {
+            const bucket = Math.round(rec.base / GROUP_BUCKET_STEP) * GROUP_BUCKET_STEP;
+            if (!groups.has(bucket)) groups.set(bucket, []);
+            groups.get(bucket)!.push(rec);
+        }
+        for (const recs of groups.values()) {
+            if (recs.length < 2) continue;
+            const minFitted = Math.min(...recs.map(r => r.fitted));
+            const floor = Math.max(MIN_FONT_SIZE_PX, recs[0].base * GROUP_SHRINK_FLOOR);
+            const target = Math.min(Math.max(minFitted, floor), recs[0].base);
+            for (const rec of recs) {
+                const cur = parseFloat(rec.el.style.fontSize);
+                if (Number.isFinite(cur) && Math.abs(cur - target) > 0.01) {
+                    rec.el.style.fontSize = `${target}px`;
+                }
+            }
+        }
+
+        // 5. Дожатие остатков: line-height → scroll (единый путь для всех
+        //    длинных, включая одиночные bucket'ы и «поднятые полом» члены).
+        //    ВАЖНО: без бампа к 9px — иначе члены со scroll получают размер
+        //    больше группового target и униформа рушится.
+        for (const rec of longs) {
+            const inner = rec.el.querySelector('div') as HTMLDivElement | null;
+            if (!inner) continue;
+            if (this.isLongTextOverflowing(rec.el, inner)) this.shrinkLineHeightTo(inner);
+            if (this.isLongTextOverflowing(rec.el, inner)) this.enableScrollFallback(rec.el, false);
         }
     }
 
-    // ============================================================
-    // Sizing Logic (Overflow & Fit)
-    // ============================================================
+    // ── BBOX-FIT-2: строительные блоки ремонта исходной геометрии ────────
 
     /**
-     * Fits text inside the bounding box using a shrink-first, then line-height-reduce,
-     * then scroll fallback strategy.
+     * Ремонт перекрытий ИСХОДНЫХ боксов (см. константы SRC_*).
      *
-     * CORE FIXES:
-     *  1. Short-phrase detection now reads `data-is-short-phrase` instead of the CSS
-     *     class `force-top-align` — prevents misclassification when the class is
-     *     toggled externally.
-     *  2. Short-phrase branch: width expansion is tried first; if the box is already
-     *     wide enough we skip it. Font shrink loop is retained as a safety net.
-     *     `overflow:visible` is no longer set on the outer element.
-     *  3. Long-text branch: after font shrink, we now *also* reset font size if the
-     *     content fits at a *larger* size (i.e., it was shrunk in a previous call but
-     *     the box was later enlarged by fixVerticalOverlaps — previously it would stay
-     *     tiny forever).
-     *  4. Removed the `el.style.overflow = 'auto'` line in Strategy 3; this is now
-     *     handled exclusively by the `is-scrollable` CSS class to avoid inline style
-     *     vs. class conflicts.
+     * Порядок: (a) слияние фрагментов (до фикспоинта, ≤3 прохода — фрагмент
+     * может сам содержать фрагмент); (b) поперечный клип остатков.
+     * Вертикальные касания bleed'ом (≤5px, белое на белом) НЕ чинятся —
+     * визуально неотличимы, а правка высоты ломала бы «footprint точь-в-точь».
+     *
+     * Мутирует style.width/minWidth/data-initial-width (клип) и innerHTML
+     * (слияние) + УДАЛЯЕТ элементы-фрагменты из DOM. Возвращает пост-ремонтный
+     * список боксов (без слитых).
      */
-    public adjustOverlayForOverflow(el: HTMLElement, outputLineHeight: number): void {
+    private repairSourceOverlaps(boxes: SourceBoxRec[]): { boxes: SourceBoxRec[]; fused: number; clipped: number } {
+        let fused = 0;
+        let clipped = 0;
+        const alive: SourceBoxRec[] = [...boxes];
+
+        // (a) Слияние фрагментов: B целиком внутри A (допуск SRC_CONTAIN_TOL_PX)
+        //     и B заметно меньше (площадь < SRC_CONTAIN_AREA_FRAC) → B это
+        //     строка-фрагмент, выпавшая из абзаца A при layout-анализе.
+        //     Текст фрагмента дописывается в конец текста абзаца (фрагменты
+        //     одного абзаца — по порядку сверху-вниз), бокс фрагмента
+        //     снимается с рендера (его запись в .translations.md будет
+        //     поглощена при merge-by-overlap на ближайшем save).
+        for (let pass = 0; pass < 3; pass++) {
+            const fragsByBig = new Map<SourceBoxRec, SourceBoxRec[]>();
+            for (let i = 0; i < alive.length; i++) {
+                for (let j = 0; j < alive.length; j++) {
+                    if (i === j) continue;
+                    const A = alive[i], B = alive[j];
+                    if (!this.boxContains(A, B)) continue;
+                    if (B.width * B.height > SRC_CONTAIN_AREA_FRAC * A.width * A.height) continue;
+                    if (!fragsByBig.has(A)) fragsByBig.set(A, []);
+                    if (!fragsByBig.get(A)!.includes(B)) fragsByBig.get(A)!.push(B);
+                }
+            }
+            if (fragsByBig.size === 0) break;
+            for (const [big, frags] of fragsByBig) {
+                frags.sort((p, q) => (p.top - q.top) || (p.left - q.left));
+                for (const frag of frags) {
+                    this.fuseFragmentInto(big, frag);
+                    const k = alive.indexOf(frag);
+                    if (k >= 0) alive.splice(k, 1);
+                    fused++;
+                }
+            }
+        }
+
+        // (b) Поперечный клип: пара с x-перекрытием ≤ SRC_CLIP_MAX_PX и
+        //     < половины более узкого бокса (то есть ДРЕЙФ края, а не
+        //     вертикальная стопка в одной колонке, где xo ≈ ширине колонки).
+        //     Режем ПРАВЫЙ край ЛЕВОГО бокса до зазора перед соседом:
+        //     левые якоря (Tm первых строк) точны, раздувается именно правый
+        //     край. Если клип оставляет < SRC_MIN_KEEP_PX — делим перекрытие
+        //     пополам (крайний случай, оба якоря теряют по чуть-чуть).
+        for (let i = 0; i < alive.length; i++) {
+            for (let j = 0; j < alive.length; j++) {
+                if (i === j) continue;
+                const A = alive[i], B = alive[j];
+                const xo = Math.min(A.left + A.width, B.left + B.width) - Math.max(A.left, B.left);
+                const yo = Math.min(A.top + A.height, B.top + B.height) - Math.max(A.top, B.top);
+                if (xo <= 1 || yo <= 1) continue;
+                if (xo > SRC_CLIP_MAX_PX || xo > 0.5 * Math.min(A.width, B.width)) continue;
+                // A должен быть левым (режем ЕГО правый край); при равных
+                // left режем более широкий.
+                const aIsLeft = A.left < B.left - 0.5 || (Math.abs(A.left - B.left) <= 0.5 && A.width >= B.width);
+                const L = aIsLeft ? A : B;
+                const R = aIsLeft ? B : A;
+                if (L.left + L.width <= R.left + 0.5) continue; // уже не перекрываются
+                const newWidth = R.left - L.left - NEIGHBOR_GAP_PX;
+                if (newWidth >= Math.max(SRC_MIN_KEEP_PX, 0.3 * L.width)) {
+                    this.applyBoxWidth(L, newWidth);
+                    clipped++;
+                } else {
+                    // Крайний случай: сосед почти вплотную к левому якорю —
+                    // делим перекрытие пополам, зазор NEIGHBOR_GAP_PX/2 каждому.
+                    const mid = (R.left + L.left + L.width) / 2;
+                    const cutL = L.left + L.width - (mid - NEIGHBOR_GAP_PX / 2);
+                    const cutR = (mid + NEIGHBOR_GAP_PX / 2) - R.left;
+                    if (cutL > 0) this.applyBoxWidth(L, L.width - cutL);
+                    if (cutR > 0) {
+                        R.el.style.left = `${R.left + cutR}px`;
+                        R.el.setAttribute('data-initial-left', `${R.left + cutR}`);
+                        this.applyBoxWidth(R, R.width - cutR);
+                        R.left += cutR; R.width -= cutR;
+                    }
+                    clipped++;
+                }
+            }
+        }
+
+        if ((fused > 0 || clipped > 0) && this.plugin.settings.debugMode) {
+            console.debug(`[OverlayUIRenderer] Source-geometry repair: fused=${fused}, clipped=${clipped}`);
+        }
+        return { boxes: alive, fused, clipped };
+    }
+
+    /** B (с допуском SRC_CONTAIN_TOL_PX) целиком внутри A? */
+    private boxContains(A: SourceBoxRec, B: SourceBoxRec): boolean {
+        return A.left - SRC_CONTAIN_TOL_PX <= B.left
+            && A.top - SRC_CONTAIN_TOL_PX <= B.top
+            && A.left + A.width + SRC_CONTAIN_TOL_PX >= B.left + B.width
+            && A.top + A.height + SRC_CONTAIN_TOL_PX >= B.top + B.height;
+    }
+
+    /** Вливает текст фрагмента в конец текста абзаца; бокс фрагмента убирает. */
+    private fuseFragmentInto(big: SourceBoxRec, frag: SourceBoxRec): void {
+        const bigInner = big.el.querySelector('div') as HTMLDivElement | null;
+        const fragInner = frag.el.querySelector('div') as HTMLDivElement | null;
+        try {
+            if (bigInner && fragInner) {
+                const add = (fragInner.innerHTML || '').trim();
+                if (add) {
+                    const cur = (bigInner.innerHTML || '').trim();
+                    bigInner.innerHTML = cur ? `${cur} ${add}` : add;
+                }
+            }
+        } catch (e) {
+            console.debug('[OverlayUIRenderer] fuseFragmentInto failed:', e);
+        }
+        // Снять оверлей с рендера (вызывает ripple на WeakMap-хендлеры —
+        // teardown идёт через общий destroy, здесь достаточно remove()).
+        frag.el.remove();
+    }
+
+    /** Применяет новую ширину к боксу: style.width + minWidth + data-initial-width
+     *  (атрибут читают save-реверс и fitShortPhraseToBox — клип обязан
+     *  доехать и туда, иначе расползание вернётся после перезагрузки). */
+    private applyBoxWidth(box: SourceBoxRec, newWidth: number): void {
+        if (!(newWidth > 0)) return;
+        box.width = newWidth;
+        box.el.style.width = `${newWidth}px`;
+        if (box.el.style.minWidth) box.el.style.minWidth = `${newWidth}px`;
+        box.el.setAttribute('data-initial-width', `${newWidth}`);
+    }
+
+    /**
+     * Одиночная подгонка одного оверлея (внешние/ручные пути, тесты).
+     *
+     * Длинный текст: шрифт (двоичный поиск) → line-height → scroll.
+     * Короткая фраза: расширение до предела (кап/страница) → ужимка шрифта.
+     * Если бокс уже вмещает текст — мягкое восстановление размера к
+     * исходному (grow-back, как в исходной версии).
+     *
+     * @param rightCapPx необязательный правый предел ШИРИНЫ (px, в
+     *        координатах style.left). Без него — край страницы через
+     *        `closest('.page')` (старое поведение).
+     */
+    public adjustOverlayForOverflow(el: HTMLElement, outputLineHeight: number, rightCapPx?: number): void {
+        void outputLineHeight; // line-height читается из inner.style (см. shrinkLineHeightTo)
         const inner = el.querySelector('div') as HTMLDivElement | null;
         if (!inner) return;
 
@@ -818,95 +1094,24 @@ export class OverlayUIRenderer {
         el.classList.remove('is-scrollable');
         el.setCssStyles({ overflow: 'hidden' });
 
-        // ----------------------------------------------------------------
-        // SHORT PHRASE — adapt text to bbox, expand bbox only if needed
-        // ----------------------------------------------------------------
-        // RULES (per user spec):
-        //   1. Bbox must NEVER be smaller than the original text bbox.
-        //   2. If translation fits in original bbox → keep bbox as-is.
-        //   3. If translation is LONGER than original bbox → expand bbox
-        //      (but only to fit the translation, no arbitrary +35% reserve).
-        //   4. If translation overflows after expansion → shrink font to fit.
-        // ----------------------------------------------------------------
         if (isShortPhrase) {
-            inner.setCssStyles({ whiteSpace: 'nowrap', overflow: 'visible' });
-
-            const currentFontSize = parseFloat(el.style.fontSize) || 12;
-            const fontFamily      = el.style.fontFamily || 'sans-serif';
-            const plainText       = inner.textContent || '';
-            if (!plainText.trim()) return;
-
-            const originalWidth = parseFloat(el.getAttribute('data-initial-width') || '0')
-                               || parseFloat(el.style.width)
-                               || el.offsetWidth;
-            const paddingRightPx = this.pxFromEm(SHORT_PHRASE_PADDING_RIGHT_EM, currentFontSize);
-            const requiredWidth   = this.estimateTextWidth(plainText, currentFontSize, fontFamily)
-                                  + paddingRightPx + 2; // +2px safety (was 10)
-
-            // Step 1: If translation fits in original bbox → keep bbox as-is.
-            //         Do NOT expand. The bbox stays at original text boundaries.
-            if (requiredWidth <= originalWidth) {
-                // Text fits — no width change needed.
-                // But check if font needs shrinking (rare for short phrases that fit).
-                if (inner.scrollWidth > el.clientWidth + 1) {
-                    let fs = parseFloat(el.style.fontSize);
-                    let iter = 0;
-                    while (inner.scrollWidth > el.clientWidth + 1 && fs > MIN_FONT_SIZE_PX && iter < MAX_SHRINK_ITERATIONS) {
-                        fs *= FONT_SHRINK_FACTOR;
-                        el.style.fontSize = `${fs}px`;
-                        iter++;
-                    }
-                }
-                return;
-            }
-
-            // Step 2: Translation is LONGER than original bbox.
-            //         Expand bbox to fit the translation (but not beyond page width).
-            //         Use the ACTUAL required width, not initialWidth × 1.35.
-            const pageEl = el.closest('.page') as HTMLElement;
-            const pageWidth = pageEl ? pageEl.getBoundingClientRect().width : Infinity;
-            const currentLeft = parseFloat(el.style.left) || 0;
-            const maxAllowedWidth = pageWidth - currentLeft - 4; // 4px right margin
-
-            const newWidth = Math.min(requiredWidth, maxAllowedWidth);
-            if (newWidth > originalWidth) {
-                el.style.width = `${newWidth}px`;
-                el.style.minWidth = `${newWidth}px`;
-            }
-
-            // Step 3: If text still overflows after expansion → shrink font
-            if (inner.scrollWidth > el.clientWidth + 1) {
-                let fs = parseFloat(el.style.fontSize);
-                let iter = 0;
-                while (inner.scrollWidth > el.clientWidth + 1 && fs > MIN_FONT_SIZE_PX && iter < MAX_SHRINK_ITERATIONS) {
-                    fs *= FONT_SHRINK_FACTOR;
-                    el.style.fontSize = `${fs}px`;
-                    iter++;
-                }
-            }
-
+            this.fitShortPhraseToBox(el, rightCapPx);
             return;
         }
 
         // ----------------------------------------------------------------
-        // LONG TEXT — shrink font → shrink line-height → scroll fallback
+        // LONG TEXT — shrink font → recover → shrink line-height → scroll
         // ----------------------------------------------------------------
-
-        const isOverflowing = () =>
-            inner.scrollHeight > el.clientHeight + 1 ||
-            inner.scrollWidth  > el.clientWidth  + 1;
-
-        if (!isOverflowing()) {
-            // FIX: box may have been grown (e.g. after fixVerticalOverlaps re-runs this).
-            // Try to recover font size up toward original if there's now spare room.
-            // (This is a mild upward-fit — only a few steps to avoid expensive loops.)
+        if (!this.isLongTextOverflowing(el, inner)) {
+            // Бокс мог вырасти (или текст стал короче) — пробуем вернуть
+            // шрифт к исходному, пока помещается (мягкий grow-back).
             const originalFontSize = parseFloat(el.getAttribute('data-original-font-size') || '0');
             if (originalFontSize > 0) {
                 let fs = parseFloat(el.style.fontSize);
                 let attempts = 0;
-                while (!isOverflowing() && fs < originalFontSize && attempts < 10) {
+                while (!this.isLongTextOverflowing(el, inner) && fs < originalFontSize && attempts < 10) {
                     el.style.fontSize = `${Math.min(fs / FONT_SHRINK_FACTOR, originalFontSize)}px`;
-                    if (isOverflowing()) { el.style.fontSize = `${fs}px`; break; }
+                    if (this.isLongTextOverflowing(el, inner)) { el.style.fontSize = `${fs}px`; break; }
                     fs = parseFloat(el.style.fontSize);
                     attempts++;
                 }
@@ -914,70 +1119,199 @@ export class OverlayUIRenderer {
             return;
         }
 
-        // Strategy 1 — Shrink font size (BINARY SEARCH, v5 optimization)
-        // FIX (v5): replaced linear shrink (×0.95 per iteration, up to 40 iters)
-        // with binary search (~6 iterations for same precision). This is 6×
-        // faster on complex pages with many overlays, and produces a more
-        // precise fit (no over-shrink).
-        // P2-63 (Phase 15): cap iterations at 6 and stop once the search
-        // range narrows below 1px (was 12 iters / 0.5px). For text fitting
-        // 1px of font-size precision is invisible to the user — the extra
-        // 6 iterations of the old cap bought no visible improvement but
-        // doubled the layout-thrash cost on pages with many overflowing
-        // overlays. Each iteration forces a reflow (read of
-        // `inner.scrollHeight` after a style mutation), so cutting the cap
-        // in half cuts the worst-case fit cost in half too.
+        // Strategy 1 — Shrink font size (binary search, v5/P2-63)
+        this.fitLongTextFontSize(el);
+
+        // Strategy 2 — Shrink line height
+        if (this.isLongTextOverflowing(el, inner)) this.shrinkLineHeightTo(inner);
+
+        // Strategy 3 — Scrollable fallback
+        if (this.isLongTextOverflowing(el, inner)) this.enableScrollFallback(el);
+    }
+
+    // ── Приватные строительные блоки подгонки ──────────────────────────
+
+    /** Ширина страницы в координатах style.left оверлея (или Infinity). */
+    private pageWidthOf(el: HTMLElement): number {
+        const pageEl = el.closest ? (el.closest('.page') as HTMLElement | null) : null;
+        if (!pageEl) return Infinity;
+        // BBOX-FIT-3: padding-box (clientWidth) — рамка координат оверлеев;
+        // border-box шире на --page-border pdf.js 4.x. jsdom-фолбэк — rect.
+        const cw = pageEl.clientWidth;
+        if (cw > 0) return cw;
+        const w = pageEl.getBoundingClientRect().width;
+        return Number.isFinite(w) && w > 0 ? w : Infinity;
+    }
+
+    /** Длинный текст не помещается в бокс (по вертикали или горизонтали)? */
+    private isLongTextOverflowing(el: HTMLElement, inner: HTMLDivElement): boolean {
+        return inner.scrollHeight > el.clientHeight + 1 ||
+               inner.scrollWidth > el.clientWidth + 1;
+    }
+
+    /**
+     * Strategy 1: двоичный поиск НАИБОЛЬШЕГО шрифта, при котором длинный
+     * текст помещается в бокс. Применяет найденный размер и возвращает его.
+     * Аттрибут data-original-font-size фиксирует исходный размер (первый
+     * вызов), чтобы повторные подгонки не «ползли» вниз от уже ужатого.
+     */
+    private fitLongTextFontSize(el: HTMLElement): number {
+        const inner = el.querySelector('div') as HTMLDivElement | null;
+        const currentFs = parseFloat(el.style.fontSize) || 12;
+        if (!inner) return currentFs;
+
         if (!el.getAttribute('data-original-font-size')) {
             el.setAttribute('data-original-font-size', el.style.fontSize);
         }
-
         const originalFs = parseFloat(el.getAttribute('data-original-font-size') || '12');
         let lo = MIN_FONT_SIZE_PX;
         let hi = originalFs;
-        let currentFontSize: number;
-        // Check if it already fits at original size — no shrink needed
+        // Уже помещается при исходном размере — не трогаем.
         el.style.fontSize = `${hi}px`;
-        if (!isOverflowing()) {
-            // Fits at original — done
-            currentFontSize = hi;
-        } else {
-            // Binary search for the largest font size that fits
-            // P2-63 (Phase 15): cap at 6 iterations (0.5px precision overkill for text fitting)
-            for (let iter = 0; iter < 6 && hi - lo > 1; iter++) {
-                const mid = (lo + hi) / 2;
-                el.style.fontSize = `${mid}px`;
-                if (isOverflowing()) {
-                    hi = mid;
-                } else {
-                    lo = mid;
+        if (!this.isLongTextOverflowing(el, inner)) return hi;
+        // P2-63 (Phase 15): 6 итераций, точность 1px — визуально достаточно.
+        for (let iter = 0; iter < 6 && hi - lo > 1; iter++) {
+            const mid = (lo + hi) / 2;
+            el.style.fontSize = `${mid}px`;
+            if (this.isLongTextOverflowing(el, inner)) hi = mid;
+            else lo = mid;
+        }
+        el.style.fontSize = `${lo}px`;
+        return lo;
+    }
+
+    /**
+     * Strategy 2: дожимает line-height шагами 0.05 до MIN_LINE_HEIGHT_SHRINK.
+     * Стартует с ТЕКУЩЕГО line-height inner-элемента (создание могло дать
+     * 1.1 для tight-строк — стартовать с 1.2 настройки значило бы УВЕЛИЧИТЬ
+     * межстрочный интервал tight-бокса).
+     */
+    private shrinkLineHeightTo(inner: HTMLDivElement): void {
+        const el = inner.parentElement as HTMLElement | null;
+        if (!el) return;
+        const cur = parseFloat(inner.style.lineHeight);
+        let lh = Number.isFinite(cur) ? cur : (this.plugin.settings.outputLineHeight || 1.2);
+        let iterations = 0;
+        while (lh > MIN_LINE_HEIGHT_SHRINK && this.isLongTextOverflowing(el, inner) && iterations < 10) {
+            lh -= 0.05;
+            this.applyLineHeight(inner, lh);
+            iterations++;
+        }
+    }
+
+    /**
+     * Strategy 3: scroll-фолбэк (текст доступен целиком).
+     * @param bumpToReadable одиночный путь бампает шрифт к 9px для
+     *        читаемости (легаси-поведение); пакетный путь НЕ бампает —
+     *        бамп разрушает групповую униформу размеров.
+     */
+    private enableScrollFallback(el: HTMLElement, bumpToReadable = true): void {
+        const fs = parseFloat(el.style.fontSize);
+        if (bumpToReadable && Number.isFinite(fs) && fs < 9) {
+            el.setCssStyles({ fontSize: '9px' });
+        }
+        // BBOX-FIT-2: класса `is-scrollable` НЕТ в CSS плагина (styles.css
+        // отсутствует, все стили инлайн) — реальный Chromium подтвердил
+        // эмуляцией: overflow оставался hidden и текст просто ОБРЕЗАЛСЯ.
+        // Ставим инлайн-стиль напрямую; класс сохранён для совместимости
+        // с существующими проверками/селекторами.
+        el.classList.add('is-scrollable');
+        el.setCssStyles({ overflow: 'auto' });
+        if (this.plugin.settings.debugMode) {
+            const inner = el.querySelector('div');
+            console.debug('[OverlayUIRenderer] Fallback scroll enabled for:', inner?.textContent?.substring(0, 30));
+        }
+    }
+
+    /**
+     * Короткая фраза (≤4 слов, nowrap): адаптировать текст к боксу.
+     *
+     * ПРАВИЛА:
+     *   1. Бокс никогда не уже исходного.
+     *   2. Перевод длиннее бокса → расширение В СВОБОДНОЕ пространство:
+     *      не далее соседа справа (rightCapPx, минус NEIGHBOR_GAP_PX) и не
+     *      шире SHORT_PHRASE_MAX_EXPANSION. Раньше пределом был только
+     *      край страницы — в 2-колоночном layout'e фразы заползали на
+     *      правую колонку и соседние ячейки таблиц.
+     *   3. Дальше — ужимка шрифта (пол MIN_FONT_SIZE_PX).
+     */
+    private fitShortPhraseToBox(el: HTMLElement, rightCapPx?: number): void {
+        const inner = el.querySelector('div') as HTMLDivElement | null;
+        if (!inner) return;
+        inner.setCssStyles({ whiteSpace: 'nowrap', overflow: 'visible' });
+
+        const currentFontSize = parseFloat(el.style.fontSize) || 12;
+        const fontFamily = el.style.fontFamily || 'sans-serif';
+        const plainText = inner.textContent || '';
+        if (!plainText.trim()) return;
+
+        const originalWidth = parseFloat(el.getAttribute('data-initial-width') || '0')
+                           || parseFloat(el.style.width)
+                           || el.offsetWidth;
+        // BBOX-FIT-2: измерение ЧЕРЕЗ estimateTextWidth, а не inner.scrollWidth.
+        // В реальном Chromium scrollWidth элемента с overflow:visible НЕ
+        // включает выходящий за границы контент (подтверждено real-browser
+        // эмуляцией) — прежние ужимки коротких фраз были НО-ОПами и текст
+        // молча обрезался. estimateTextWidth меряет настоящий глифовый
+        // advance скрытым span'ом — тот же механизм, что в Step 1/2.
+        const textNeeds = (fs: number): number =>
+            this.estimateTextWidth(plainText, fs, fontFamily)
+            + this.pxFromEm(SHORT_PHRASE_PADDING_RIGHT_EM, fs) + 2; // +2px safety
+        const paddingRightPx = this.pxFromEm(SHORT_PHRASE_PADDING_RIGHT_EM, currentFontSize);
+        const requiredWidth = textNeeds(currentFontSize);
+
+        // Step 1: помещается в исходный бокс — не расширяем.
+        if (requiredWidth <= originalWidth) {
+            if (textNeeds(parseFloat(el.style.fontSize) || currentFontSize) > el.clientWidth + 0.5) {
+                let fs = parseFloat(el.style.fontSize) || currentFontSize;
+                let iter = 0;
+                while (textNeeds(fs) > el.clientWidth + 0.5 && fs > MIN_FONT_SIZE_PX && iter < MAX_SHRINK_ITERATIONS) {
+                    fs *= FONT_SHRINK_FACTOR;
+                    el.style.fontSize = `${fs}px`;
+                    iter++;
                 }
             }
-            el.style.fontSize = `${lo}px`;
-            currentFontSize = lo;
+            return;
         }
 
-        // Strategy 2 — Shrink line height
-        if (isOverflowing()) {
-            let currentLineHeight = outputLineHeight;
-            let lhIterations = 0;
-            while (currentLineHeight > MIN_LINE_HEIGHT_SHRINK && isOverflowing() && lhIterations < 10) {
-                currentLineHeight -= 0.05;
-                this.applyLineHeight(inner, currentLineHeight);
-                lhIterations++;
+        // Step 2: правый предел — сосед/страница, и не шире 1.3× исходного.
+        let maxAllowed: number;
+        if (rightCapPx !== undefined && Number.isFinite(rightCapPx)) {
+            maxAllowed = rightCapPx;
+        } else {
+            const pageWidth = this.pageWidthOf(el);
+            const currentLeft = parseFloat(el.style.left) || 0;
+            maxAllowed = pageWidth - currentLeft - RIGHT_PAGE_MARGIN_PX;
+        }
+        maxAllowed = Math.min(maxAllowed, originalWidth * SHORT_PHRASE_MAX_EXPANSION);
+
+        const newWidth = Math.min(requiredWidth, maxAllowed);
+        if (newWidth > originalWidth) {
+            el.style.width = `${newWidth}px`;
+            el.style.minWidth = `${newWidth}px`;
+        }
+
+        // Step 3: не влезло и после расширения — ужимка шрифта.
+        if (textNeeds(parseFloat(el.style.fontSize) || currentFontSize) > el.clientWidth + 0.5) {
+            let fs = parseFloat(el.style.fontSize) || currentFontSize;
+            let iter = 0;
+            while (textNeeds(fs) > el.clientWidth + 0.5 && fs > MIN_FONT_SIZE_PX && iter < MAX_SHRINK_ITERATIONS) {
+                fs *= FONT_SHRINK_FACTOR;
+                el.style.fontSize = `${fs}px`;
+                iter++;
             }
         }
 
-        // Strategy 3 — Scrollable fallback
-        if (isOverflowing()) {
-            // Ensure a minimum readable size before enabling scroll
-            if (currentFontSize < 9) {
-                el.setCssStyles({ fontSize: '9px' });
-            }
-            // FIX: don't set overflow:auto inline — let CSS class handle it
-            el.classList.add('is-scrollable');
-            if (this.plugin.settings.debugMode) {
-                console.debug('[OverlayUIRenderer] Fallback scroll enabled for:', inner.textContent?.substring(0, 30));
-            }
+        // Step 4 (BBOX-FIT): упёрлись в пол шрифта при nowrap, а текст всё
+        // ещё шире бокса — раньше он просто ОБРЕЗАЛСЬ (overflow hidden).
+        // Включаем перенос строк и подгоняем как длинный текст: повторный
+        // поиск шрифта под переносный layout → line-height → scroll.
+        // Инвариант: перевод всегда доступен целиком, бокс не меняется.
+        if (textNeeds(parseFloat(el.style.fontSize) || currentFontSize) > el.clientWidth + 0.5) {
+            inner.setCssStyles({ whiteSpace: 'normal', overflow: 'hidden' });
+            this.fitLongTextFontSize(el);
+            if (this.isLongTextOverflowing(el, inner)) this.shrinkLineHeightTo(inner);
+            if (this.isLongTextOverflowing(el, inner)) this.enableScrollFallback(el, false);
         }
     }
 
@@ -1275,44 +1609,7 @@ export class OverlayUIRenderer {
         mode: 'paragraphs' | 'block',
         base: LayoutSettings
     ): LayoutSettings {
-        if (mode === 'paragraphs') {
-            return {
-                ...base,
-                useModeEnsemble: false,
-                minStripConfidence: Math.min(base.minStripConfidence, 0.5),
-                minStripWidthPx: Math.min(base.minStripWidthPx, 2.5),
-                maxIterMerges: Math.min(base.maxIterMerges, 6),
-                gapMinGapWidthPx: Math.min(base.gapMinGapWidthPx, 1.2),
-                gapBandStepFactor: Math.min(base.gapBandStepFactor, 0.6),
-                gapMinStripHeightFactor: Math.min(base.gapMinStripHeightFactor, 1.1),
-                gridMinHorizontalGapLineHeightMultiplier: Math.min(base.gridMinHorizontalGapLineHeightMultiplier, 1.1),
-                gridMinVerticalGapLineHeightMultiplier: Math.min(base.gridMinVerticalGapLineHeightMultiplier, 0.55),
-                gridProjectionProfileThreshold: Math.min(base.gridProjectionProfileThreshold, 0.6),
-                pmMinStripConfidenceSplit: Math.min(base.pmMinStripConfidenceSplit, 0.5),
-                pmMinStripWidthPx: Math.min(base.pmMinStripWidthPx, 2),
-                pmGeneralMergeVerticalGapMultiplier: Math.min(base.pmGeneralMergeVerticalGapMultiplier, 0.95),
-                pmGeneralMergeVerticalGapMaxMultiplier: Math.min(base.pmGeneralMergeVerticalGapMaxMultiplier, 1.5),
-                pmStackedMergeVerticalGapMultiplier: Math.min(base.pmStackedMergeVerticalGapMultiplier, 0.95),
-                pmStackedMergeVerticalGapMaxMultiplier: Math.min(base.pmStackedMergeVerticalGapMaxMultiplier, 1.5),
-                pmSplitBoundaryDedupTol: Math.min(base.pmSplitBoundaryDedupTol, 0.18),
-                pmSplitInterWordGapTol: Math.min(base.pmSplitInterWordGapTol, 0.85),
-                pmSplitColumnGapTol: Math.min(base.pmSplitColumnGapTol, 1.8),
-                profileRegionFlowCostBias: Math.min(base.profileRegionFlowCostBias, 0.05),
-            };
-        }
-
-        // mode === 'block'
-        return {
-            ...base,
-            useModeEnsemble: false,
-            pmForceLinearMerge: true,
-            minStripConfidence: Math.max(base.minStripConfidence, 0.75),
-            pmMinStripConfidenceSplit: Math.max(base.pmMinStripConfidenceSplit, 0.75),
-            maxIterMerges: Math.max(base.maxIterMerges, 12),
-            pmGeneralMergeVerticalGapMultiplier: Math.max(base.pmGeneralMergeVerticalGapMultiplier, 1.6),
-            pmGeneralMergeVerticalGapMaxMultiplier: Math.max(base.pmGeneralMergeVerticalGapMaxMultiplier, 2.8),
-            profileRegionFlowCostBias: Math.min(base.profileRegionFlowCostBias, -0.25),
-        };
+        return {...base, layoutPreset: mode === 'block' ? 'single-paragraph' : base.layoutPreset};
     }
 
     private getSelectedSpanPool(
@@ -1321,21 +1618,28 @@ export class OverlayUIRenderer {
         pageEl: HTMLElement,
         textLayer: HTMLElement
     ): HTMLSpanElement[] {
-        const pageRect = pageEl.getBoundingClientRect();
+        // BBOX-FIT-3: сохранённые дроби — textLayer-relative: обратное
+        // преобразование должно идти через рамку textLayer (раньше — border-box
+        // .page, что при --page-border pdf.js 4.x давало +9px и +2.2% масштаба).
+        const tlRect = textLayer.getBoundingClientRect();
         const selectedRects = selectedIndices
             .map(i => pageItems[i]?.relativeRect)
             .filter((r): r is OverlayPositionData['relativeRect'] => !!r)
             .map(r => ({
-                left: pageRect.left + r.left * pageRect.width,
-                top: pageRect.top + r.top * pageRect.height,
-                right: pageRect.left + (r.left + r.width) * pageRect.width,
-                bottom: pageRect.top + (r.top + r.height) * pageRect.height,
+                left: tlRect.left + r.left * tlRect.width,
+                top: tlRect.top + r.top * tlRect.height,
+                right: tlRect.left + (r.left + r.width) * tlRect.width,
+                bottom: tlRect.top + (r.top + r.height) * tlRect.height,
             }));
 
         if (!selectedRects.length) return [];
 
-        const spans = Array.from(textLayer.querySelectorAll<HTMLSpanElement>('span'))
-            .filter(span => this.plugin.processor.isValidSpan(span))
+        const allPoolSpans = Array.from(textLayer.querySelectorAll<HTMLSpanElement>('span'));
+        // TABLE-KEEP: контекст спан-фильтра — числовые ячейки таблиц выживают
+        // (не в колонтитуле и не суперскрипт), номера страниц гибнут как прежде.
+        const spanFilterCtx = buildSpanFilterCtx(allPoolSpans, pageEl);
+        const spans = allPoolSpans
+            .filter(span => this.plugin.processor.isValidSpan(span, spanFilterCtx))
             .filter(span => {
                 const r = span.getBoundingClientRect();
                 return selectedRects.some(s =>
@@ -1451,12 +1755,14 @@ export class OverlayUIRenderer {
             if (!bbox.rect) {
                 return this.retranslateSelection(pageItems, selectedIndices, mode);
             }
-            const pageRect = pageEl.getBoundingClientRect();
+            // BBOX-FIT-3: дроби — textLayer-relative (как у save/reload);
+            // делим на размеры textLayer, а не border-box .page.
+            const tlRectB = textLayer.getBoundingClientRect();
             const blockRect = {
-                left: bbox.rect.left / pageRect.width,
-                top: bbox.rect.top / pageRect.height,
-                width: bbox.rect.width / pageRect.width,
-                height: bbox.rect.height / pageRect.height,
+                left: bbox.rect.left / tlRectB.width,
+                top: bbox.rect.top / tlRectB.height,
+                width: bbox.rect.width / tlRectB.width,
+                height: bbox.rect.height / tlRectB.height,
             };
             if (!isFinite(blockRect.left) || !isFinite(blockRect.top) || !isFinite(blockRect.width) || !isFinite(blockRect.height)) {
                 return this.retranslateSelection(pageItems, selectedIndices, mode);
@@ -1487,7 +1793,8 @@ export class OverlayUIRenderer {
 
         // mode === 'paragraphs' — translate each layout-detected unit.
         const translated = await this.plugin.processor.executeTranslation(units);
-        const pageRect = pageEl.getBoundingClientRect();
+        // BBOX-FIT-3: дроби — textLayer-relative (см. block-режим выше).
+        const tlRectP = textLayer.getBoundingClientRect();
         const replacementItems: OverlayPositionData[] = [];
 
         for (let i = 0; i < units.length; i++) {
@@ -1496,10 +1803,10 @@ export class OverlayUIRenderer {
             if (!bbox.rect) continue;
 
             const relativeRect = {
-                left: bbox.rect.left / pageRect.width,
-                top: bbox.rect.top / pageRect.height,
-                width: bbox.rect.width / pageRect.width,
-                height: bbox.rect.height / pageRect.height,
+                left: bbox.rect.left / tlRectP.width,
+                top: bbox.rect.top / tlRectP.height,
+                width: bbox.rect.width / tlRectP.width,
+                height: bbox.rect.height / tlRectP.height,
             };
             if (!isFinite(relativeRect.left) || !isFinite(relativeRect.top) || !isFinite(relativeRect.width) || !isFinite(relativeRect.height)) {
                 continue;
@@ -1508,6 +1815,7 @@ export class OverlayUIRenderer {
             replacementItems.push({
                 selector: '',
                 textContent: unit.text,
+                translationStatus: fallbackIndices(translated).has(i) ? 'fallback' : undefined,
                 translatedText: translated[i] || unit.text,
                 relativeRect,
                 page: pageNumber,
@@ -1563,7 +1871,7 @@ export class OverlayUIRenderer {
         pageNumberOverride?: number | null
     ): Promise<void> {
         const activeLeaf = this.plugin.app.workspace.activeLeaf;
-        const activeFile = activeLeaf?.view?.file;
+        const activeFile = activeLeaf?.view instanceof FileView ? activeLeaf.view.file : null;
         const pageNumber = pageNumberOverride ?? this.plugin.getCurrentPageNumber();
         if (!activeFile || activeFile.extension !== 'pdf' || pageNumber === null) {
             new Notice('PDF context is missing.');
@@ -1679,7 +1987,7 @@ export class OverlayUIRenderer {
         }
 
         const activeLeaf = this.plugin.app.workspace.activeLeaf;
-        const activeFile = activeLeaf?.view?.file;
+        const activeFile = activeLeaf?.view instanceof FileView ? activeLeaf.view.file : null;
         // P1-10 (Phase 13): capture `pageNumber` at menu-open time from
         // the overlay element (stamped by `createReflowOverlay` as
         // `data-overlay-page`). Falls back to the nearest `.page` ancestor's
@@ -1737,6 +2045,20 @@ export class OverlayUIRenderer {
             // etc.) that the contour pipeline ignores. They have been removed.
             // The operations below work with the current pipeline:
 
+            addItem('Layout выделенной области…', 'columns', () => {
+                if (!activeFile || pageNumber == null) return;
+                const selected=this.getSelectionForAction(targetOverlay);
+                const pageEl=targetOverlay.closest('.page');
+                const frame=pageEl?.querySelector('.textLayer')?.getBoundingClientRect();
+                if(!frame || !selected.length) return;
+                const boxes=selected.map(el=>el.getBoundingClientRect());
+                const left=Math.max(0,(Math.min(...boxes.map(b=>b.left))-frame.left)/frame.width);
+                const top=Math.max(0,(Math.min(...boxes.map(b=>b.top))-frame.top)/frame.height);
+                const right=Math.min(1,(Math.max(...boxes.map(b=>b.right))-frame.left)/frame.width);
+                const bottom=Math.min(1,(Math.max(...boxes.map(b=>b.bottom))-frame.top)/frame.height);
+                const rotation=pageEl?.querySelector('.textLayer')?.getAttribute('data-main-rotation');
+                new RegionLayoutEditor(this.plugin,activeFile,pageNumber,{left,top,width:right-left,height:bottom-top},rotation==null?undefined:Number(rotation)).open();
+            });
             addItem(t('overlay.menu.retranslateSelected'), 'refresh-cw', () => {
                 // P2-28 (Phase 15): check if target overlay is still attached
                 if (!targetOverlay.isConnected) {
@@ -1985,8 +2307,13 @@ export class OverlayUIRenderer {
         // strings to innerHTML unsanitized. If a future code change ever
         // appends this tempDiv to the DOM (or reads its innerHTML), the
         // sanitize call here ensures the content is already safe.
+        // TABLE-KEEP: <br> в textContent исчезает БЕЗ следа ("a<br>b" → "ab",
+        // одно слово!) — ломает wordCount для isShortPhrase. Замена ПОСЛЕ
+        // чтения textContent была мёртвой (тег к тому моменту уже стал
+        // DOM-элементом и выпал из текста). Заменяем на пробел ДО
+        // sanitize/innerHTML, чтобы построчный текст считался словами корректно.
         // eslint-disable-next-line no-unsanitized/property -- DOMPurify-sanitized with a strict whitelist (PURIFY_CONFIG); this detached tempDiv is only used to strip tags and read back plain text
-        this.tempDiv.innerHTML = DOMPurify.sanitize(html, PURIFY_CONFIG);
+        this.tempDiv.innerHTML = DOMPurify.sanitize((html || '').replace(/<br\s*\/?>/gi, ' '), PURIFY_CONFIG);
         return this.tempDiv.textContent || this.tempDiv.innerText || '';
     }
 }

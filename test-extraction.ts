@@ -6,8 +6,14 @@
 //
 // Proves, on THIS machine, that the whole overhaul still holds:
 //   1. pdfjs-dist is bundled and loadable (literal dynamic import);
-//   2. the bundled worker is registered (globalThis.pdfjsWorker, PATH A —
-//      no network, no <script> tag);
+//   2. [W-PSEUDO/W-CLEAN] the process global
+//      `globalThis.pdfjsWorker` stays UNDEFINED and extraction still works
+//      through the MAIN-THREAD PSEUDO-WORKER (the ONLY engine — bundled
+//      worker module under the UMD guard; the old assertion required the
+//      global to be set — i.e. it pinned the very mechanism that crashed
+//      Obsidian's PDF.js viewer);
+//   2b. [W-CLEAN] the extractor reports workerEngine === 'pseudo-worker'
+//      and raises ZERO Notices (the engine is canonical, not degraded);
 //   3. the pdfjs compliance patches did not break anything (extraction with
 //      isEvalSupported:false works — fonts go through the interpreter path);
 //   4. the paragraph pipeline produces the expected text at the expected
@@ -40,6 +46,8 @@ async function main(): Promise<void> {
 
     // Minimal fake plugin surface — readBinary feeds the extractor,
     // vault.on('modify') is registered defensively (ignored).
+    // W-CLEAN (2026-09-25): no worker-mode setting exists anymore — the
+    // main-thread pseudo-worker is the only engine.
     const fakePlugin: any = {
         settings: { debugMode: false },
         app: {
@@ -59,8 +67,15 @@ async function main(): Promise<void> {
 
     const result = await extractor.extractPage(file, 1);
 
+    // NEW-1 (2026-09-12) / W-CLEAN (2026-09-25): the global must NEVER be
+    // written — this is the viewer-crash root cause. The engine contract
+    // is: the MAIN-THREAD PSEUDO-WORKER (the ONLY engine) runs the bundled
+    // worker module under the pdfjsWorker guard.
     const worker = (globalThis as any).pdfjsWorker;
-    check('bundled worker registered (globalThis.pdfjsWorker)', !!worker?.WorkerMessageHandler);
+    check('process global NOT poisoned (globalThis.pdfjsWorker undefined)', worker === undefined);
+
+    // W-CLEAN: the one and only engine — silent by design.
+    check(`pseudo-worker engine engaged (got "${extractor.workerEngine}")`, extractor.workerEngine === 'pseudo-worker');
 
     check(`1 paragraph extracted (got ${result.paragraphs.length})`, result.paragraphs.length === 1);
 

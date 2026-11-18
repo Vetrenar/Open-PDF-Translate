@@ -37,6 +37,9 @@ import { Setting, Notice, ButtonComponent, TFile } from 'obsidian';
 import { t } from './i18n';
 import OpenRouterTranslatorPlugin from './main';
 import { SingletonModal } from './modal-base';
+// Phase 5.1 (W-2b): modal-owned job token — a watcher stop/cancel cannot
+// kill this translation; closing the modal still does NOT cancel it.
+import { JobToken } from './job-token';
 
 export class TranslateMultiplePagesModal extends SingletonModal<TranslateMultiplePagesModal> {
     plugin: OpenRouterTranslatorPlugin;
@@ -50,6 +53,7 @@ export class TranslateMultiplePagesModal extends SingletonModal<TranslateMultipl
     // UI state
     private progressEl: HTMLElement | null = null;
     private unsubQueue: (() => void) | null = null;
+    private activeToken: JobToken | null = null;
 
     // Phase 14.3: holds references to the Start / Close buttons so they can
     // be disabled during the async `startWorkerTranslation()` call. Prevents
@@ -259,7 +263,9 @@ export class TranslateMultiplePagesModal extends SingletonModal<TranslateMultipl
             .setWarning()
             .onClick(() => {
                 if (queue) {
-                    queue.cancel();
+                    // 5.1 (rider, 5.4): scoped — management-view Cancel kills
+                    // the modal-scoped jobs only (see startWorkerTranslation).
+                    queue.cancelScope('modal');
                     new Notice(
                         t('modal.translate.translationCancelled'),
                         6000,
@@ -376,13 +382,7 @@ export class TranslateMultiplePagesModal extends SingletonModal<TranslateMultipl
 
                 try {
                     await this.startWorkerTranslation();
-                    // FIX: after enqueue, show immediate feedback so user knows
-                    // the process started. Without this, there's a delay between
-                    // clicking Start and the first progress update from queue.onChange.
-                    this.updateProgress(t('modal.translate.starting'));
-                    // Bug fix (bg-queue audit): show Cancel button now that translation
-                    // is running, so user can stop it without closing the modal.
-                    this.cancelBtn?.setDisabled(false);
+
                 } catch (err: any) {
                     new Notice(t('modal.translate.failedToStart', { error: err.message }), 7000);
                     console.error('Worker translation failed to start:', err);
@@ -407,7 +407,11 @@ export class TranslateMultiplePagesModal extends SingletonModal<TranslateMultipl
             .onClick(() => {
                 const queue = this.plugin.pdfLayoutQueue;
                 if (queue) {
-                    queue.cancel();
+                    // 5.1 (rider, 5.4): scoped cancel — this modal's own
+                    // job (JobToken('modal', ...) from startWorkerTranslation)
+                    // and nothing else. The old global cancel() killed
+                    // watcher jobs and other files' translations too.
+                    if (this.activeToken) queue.cancelJob(this.activeToken);
                     new Notice(t('modal.translate.translationCancelled'), 6000);
                     this.updateProgress(t('modal.translate.translationCancelled'));
                 }
@@ -443,30 +447,34 @@ export class TranslateMultiplePagesModal extends SingletonModal<TranslateMultipl
             this.unsubQueue();
             this.unsubQueue = null;
         }
+        let enqueued = false;
         this.unsubQueue = queue.onChange(() => {
-            this.updateProgressFromQueue(queue, fileKey);
+            if (enqueued) this.updateProgressFromQueue(queue, fileKey);
         });
 
         try {
-            const count = await queue.enqueuePageRange(this.file, this.startPage, this.endPage);
+            // 5.1 (W-2b): modal-owned job — a watcher stop/cancel elsewhere
+            // cannot kill this translation (and vice versa). Closing the
+            // modal still does NOT cancel it: the queue finishes in the
+            // background, exactly as before.
+            const token = new JobToken(
+                'modal',
+                `${this.file.basename} p${this.startPage}-${this.endPage}`,
+            );
+            this.activeToken = token;
+            const count = await queue.enqueuePageRange(this.file, this.startPage, this.endPage, { token });
 
-            if (count === 0) {
-                new Notice(
-                    t('modal.translate.allCached', { start: String(this.startPage), end: String(this.endPage) }),
-                    5000,
-                );
-                this.updateProgress(t('modal.translate.allCachedNothing'));
+            enqueued = true;
+            const tasks = [...(queue.getFileJob(fileKey)?.tasks.values() ?? [])]
+                .filter(task => task.pageNum >= this.startPage && task.pageNum <= this.endPage);
+            if (!tasks.length) {
+                this.updateProgress('No pages queued: check the selected range.');
                 this.cleanup();
                 return;
             }
-
-            this.updateProgress(
-                t('modal.translate.queued', { count: String(count), start: String(this.startPage), end: String(this.endPage) })
-            );
-            new Notice(
-                t('modal.translate.started', { count: String(count), file: this.file.basename }),
-                4000,
-            );
+            this.cancelBtn?.setDisabled(false);
+            this.updateProgressFromQueue(queue, fileKey);
+            if (count > 0) new Notice(t('modal.translate.started', { count: String(count), file: this.file.basename }), 4000);
 
             // Don't close the modal — show live progress until done.
             // The user can close manually; the queue continues in background.
@@ -489,11 +497,18 @@ export class TranslateMultiplePagesModal extends SingletonModal<TranslateMultipl
         const fileState = state.files.find((f: any) => f.file.path === fileKey);
         if (!fileState) return;
 
-        const tasks = [...fileState.tasks.values()];
+        const tasks = [...fileState.tasks.values()].filter((task: any) =>
+            task.pageNum >= this.startPage && task.pageNum <= this.endPage);
+        if (!tasks.length) return;
+        if (this.activeToken?.cancelled) {
+            this.updateProgress(t('modal.translate.translationCancelled'));
+            this.cleanup();
+            return;
+        }
         const done = tasks.filter((t: any) => t.status === 'done').length;
         const err = tasks.filter((t: any) => t.status === 'error').length;
         const pend = tasks.filter((t: any) => t.status === 'pending' || t.status === 'running').length;
-        const total = fileState.totalPages || tasks.length;
+        const total = tasks.length;
 
         const status = err > 0
             ? t('modal.translate.progressWithError', { done: String(done), total: String(total), pend: String(pend), err: String(err) })
@@ -528,6 +543,8 @@ export class TranslateMultiplePagesModal extends SingletonModal<TranslateMultipl
     }
 
     private cleanup() {
+        this.startBtn?.setDisabled(false);
+        this.cancelBtn?.setDisabled(true);
         if (this.unsubQueue) {
             this.unsubQueue();
             this.unsubQueue = null;
@@ -552,7 +569,11 @@ export class TranslateMultiplePagesModal extends SingletonModal<TranslateMultipl
     static cancelCurrentTranslation(plugin: OpenRouterTranslatorPlugin): boolean {
         const queue = plugin.pdfLayoutQueue;
         if (queue && (queue.isRunning() || queue.getState().totalPending > 0)) {
-            queue.cancel();
+            // 5.1 (rider, 5.4): scoped like the button handlers above — a
+            // static helper named "cancel the translation this modal owns"
+            // must not murder unrelated watcher/command jobs. (No live
+            // callers today; kept consistent for future use.)
+            queue.cancelScope('modal');
             return true;
         }
         return false;
